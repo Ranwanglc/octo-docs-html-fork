@@ -1,0 +1,110 @@
+# octo-doc — one-command self-host: `docker compose -f deploy/docker-compose.yml up -d`
+#
+# The stack is PostgreSQL (metadata) + MinIO (S3-compatible blobs) + the app,
+# fronted by Caddy with automatic TLS. PostgreSQL and MinIO are required — there
+# is no embedded storage fallback.
+
+name: octo-doc
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ghcr.io/lml2468/octo-doc:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      BASE_URL: ${BASE_URL:-}
+      WRITE_TOKEN: ${WRITE_TOKEN:-}
+      ALLOW_BOOTSTRAP: ${ALLOW_BOOTSTRAP:-true}
+      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-'none'}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://${PG_USER:-octo}:${PG_PASSWORD:-octo}@postgres:5432/${PG_DB:-octodoc}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-octo-doc}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_FORCE_PATH_STYLE: "1"
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/app/octo-doc", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-octo}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-octo}
+      POSTGRES_DB: ${PG_DB:-octodoc}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-octo}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the bucket, then exit. The app waits on this.
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-minioadmin} ${S3_SECRET_ACCESS_KEY:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET:-octo-doc}
+      "
+
+volumes:
+  caddy-data:
+  caddy-config:
+  pg-data:
+  minio-data:

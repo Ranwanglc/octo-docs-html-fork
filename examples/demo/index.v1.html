@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>octo-doc — documents you can talk to</title>
+<style>
+  /* Scoped to the demo body only. The octo-doc overlay injects its own chrome
+     (toolbar, comment column, FAB) around this — so we keep type readable and
+     leave the right margin alone; the overlay reserves the comment column. */
+  .doc { max-width: 760px; margin: 0 auto; padding: 8px 4px 40px;
+    font: 17px/1.7 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: #1a1a1a; }
+  .doc .hero { padding: 8px 0 4px; }
+  .doc .eyebrow { display: inline-block; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase; color: #1652f0;
+    background: #e8eeff; padding: 4px 10px; border-radius: 999px; margin: 0 0 16px; }
+  .doc h1 { font-size: 40px; line-height: 1.1; letter-spacing: -0.03em;
+    font-weight: 800; margin: 0 0 12px; }
+  .doc .lede { font-size: 20px; line-height: 1.5; color: #444; margin: 0 0 8px; }
+  .doc h2 { font-size: 26px; letter-spacing: -0.015em; font-weight: 700;
+    margin: 48px 0 14px; }
+  .doc h3 { font-size: 19px; font-weight: 700; margin: 28px 0 8px; }
+  .doc p { margin: 0 0 16px; }
+  .doc a { color: #1652f0; text-decoration: underline; text-underline-offset: 2px; }
+  .doc strong { font-weight: 700; }
+  .doc .callout { display: flex; gap: 12px; background: #f5f6f8;
+    border: 1px solid #e5e5e7; border-left: 3px solid #1652f0;
+    border-radius: 10px; padding: 14px 16px; margin: 20px 0; font-size: 15px; }
+  .doc .callout .ico { font-size: 18px; line-height: 1.4; }
+  .doc blockquote { margin: 22px 0; padding: 2px 0 2px 20px;
+    border-left: 3px solid #d9d8d3; color: #6b6a66; font-size: 18px; font-style: italic; }
+  .doc code { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.86em; background: #f0f0ee; padding: 2px 6px; border-radius: 6px; }
+  .doc pre { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13.5px; line-height: 1.6; background: #0f1117; color: #e6e8ef;
+    border-radius: 10px; padding: 16px 18px; margin: 20px 0; overflow-x: auto; }
+  .doc pre code { background: transparent; padding: 0; color: inherit; }
+  .doc pre .tok-cmd { color: #7ee0b8; }
+  .doc pre .tok-flag { color: #9db4ff; }
+  .doc pre .tok-str { color: #ffd88a; }
+  .doc table { border-collapse: collapse; width: 100%; margin: 8px 0 20px;
+    font-size: 15px; }
+  .doc th, .doc td { text-align: left; padding: 11px 14px; border-bottom: 1px solid #e5e5e7; }
+  .doc thead th { font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em; color: #888; border-bottom: 1.5px solid #d9d8d3; }
+  .doc tbody tr:last-child td { border-bottom: 0; }
+  .doc tbody tr:hover { background: #f5f6f8; }
+  .doc td .yes { color: #1a7340; font-weight: 600; }
+  .doc ul.checks { list-style: none; padding: 0; margin: 8px 0 20px; }
+  .doc ul.checks li { position: relative; padding-left: 30px; margin: 10px 0; }
+  .doc ul.checks li::before { content: "✓"; position: absolute; left: 0; top: -1px;
+    width: 20px; height: 20px; border-radius: 50%; background: #1652f0; color: #fff;
+    font-size: 12px; font-weight: 700; display: inline-flex; align-items: center;
+    justify-content: center; }
+
+  /* Interactive artifact: adoption chart. data-odoc-artifact makes the whole
+     figure a single stampable/commentable unit in octo-doc. */
+  .doc .chart-card { border: 1px solid #e5e5e7; border-radius: 14px;
+    padding: 20px; margin: 16px 0 24px; background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .doc .chart-head { display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .doc .chart-title { font-weight: 700; font-size: 15px; }
+  .doc .chart-toggle { display: inline-flex; background: #f0f1f4; border-radius: 999px; padding: 3px; }
+  .doc .chart-toggle button { border: none; background: transparent; cursor: pointer;
+    font: 600 13px system-ui; color: #555; padding: 5px 14px; border-radius: 999px; }
+  .doc .chart-toggle button.active { background: #fff; color: #1652f0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+  .doc svg .bar { transition: height 0.4s cubic-bezier(.4,0,.2,1), y 0.4s cubic-bezier(.4,0,.2,1); }
+  .doc svg .lbl { font: 11px system-ui; fill: #888; }
+  .doc svg .val { font: 700 11px system-ui; fill: #1a1a1a; }
+  .doc .chart-note { font-size: 13px; color: #888; margin: 10px 0 0; }
+  .doc .foot { margin-top: 48px; padding-top: 20px; border-top: 1px solid #ececec;
+    font-size: 14px; color: #888; }
+</style>
+</head>
+<body>
+<div class="doc">
+
+  <div class="hero">
+    <span class="eyebrow">Interactive demo</span>
+    <h1>octo-doc — documents you can talk to.</h1>
+    <p class="lede">This page <em>is</em> an octo-doc document. Select any sentence
+      to leave an anchored comment, watch an agent reply inline, and switch between
+      immutable versions — all without leaving the page.</p>
+  </div>
+
+  <h2>What it is</h2>
+  <p>octo-doc is a self-hosted way to publish <strong>prompt-native
+    interactive HTML documents</strong> and collaborate on them. You publish a plain
+    HTML file; octo-doc renders it, injects a thin review overlay, and gives every
+    version a permanent URL.</p>
+  <p>It is one Go binary backed by PostgreSQL and any S3-compatible store — no
+    vendor lock-in, no build step for your documents, and no JavaScript framework
+    to learn. If it renders in a browser, it publishes.</p>
+
+  <h2>How anchoring works</h2>
+  <p>Comments in octo-doc are <strong>anchored to the text or artifact they refer
+    to</strong>, not dumped in a flat thread at the bottom. Highlight a phrase and
+    the comment sticks to those exact words. When you publish a new version, octo-doc
+    re-anchors each comment to the same content — and clearly flags any comment whose
+    text has changed so nothing silently drifts.</p>
+  <div class="callout">
+    <span class="ico">🔗</span>
+    <span>Try it: select the sentence above about <strong>re-anchoring</strong> and
+      leave a comment. Then open version 2 from the toolbar and watch the comment
+      follow the text.</span>
+  </div>
+
+  <h2>Interactive artifacts</h2>
+  <p>Documents aren't just prose. This adoption chart is a live, self-contained SVG
+    artifact — the toggle redraws it with no page reload, and the whole figure is a
+    single unit you can comment on.</p>
+
+  <figure class="chart-card" data-odoc-artifact>
+    <div class="chart-head">
+      <span class="chart-title">Weekly active reviewers</span>
+      <span class="chart-toggle" role="group" aria-label="Chart mode">
+        <button id="mode-monthly" class="active" type="button">Monthly</button>
+        <button id="mode-cumulative" type="button">Cumulative</button>
+      </span>
+    </div>
+    <svg id="chart" viewBox="0 0 560 220" width="100%" height="220" role="img"
+      aria-label="Bar chart of weekly active reviewers"></svg>
+    <p class="chart-note" id="chart-note">Monthly new reviewers across the first six months.</p>
+  </figure>
+
+  <h2>Why teams choose it</h2>
+  <table>
+    <thead><tr><th>Capability</th><th>octo-doc</th><th>A flat doc + chat</th></tr></thead>
+    <tbody>
+      <tr><td>Anchored, inline comments</td><td class="yes">Yes</td><td>No</td></tr>
+      <tr><td>Immutable versioned URLs</td><td class="yes">Yes</td><td>No</td></tr>
+      <tr><td>Agent replies with verdicts</td><td class="yes">Yes</td><td>No</td></tr>
+      <tr><td>Interactive HTML artifacts</td><td class="yes">Yes</td><td>No</td></tr>
+      <tr><td>Self-hosted, no vendor lock-in</td><td class="yes">Yes</td><td>Varies</td></tr>
+    </tbody>
+  </table>
+
+  <blockquote>Prompt-native means the document, its history, and its conversation
+    all live in one place an agent can read and act on.</blockquote>
+
+  <h2>Publish in one call</h2>
+  <p>Any HTML file becomes a living document with a single request:</p>
+  <pre><code><span class="tok-cmd">curl</span> -X POST <span class="tok-str">"$OCTO/v1/docs"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-str">"Authorization: Bearer $TOKEN"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-str">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-str">'{"slug":"my-doc","title":"My Doc","html":"&lt;h1&gt;Hi&lt;/h1&gt;"}'</span>
+<span style="color:#6b7280"># → { "data": { "version": 1, "url": ".../d/my-doc/v/1" } }</span></code></pre>
+
+  <h3>What you get out of the box</h3>
+  <ul class="checks">
+    <li>A permanent, shareable URL for every version</li>
+    <li>Anchored comments that survive re-publishing</li>
+    <li>Agent replies that mark each comment applied, partial, or a question</li>
+    <li>A distraction-free reading view with a review overlay on top</li>
+  </ul>
+
+  <p class="foot">This document is served by octo-doc itself — you're looking at the
+    product. Powered by octo-doc · v1.</p>
+
+</div>
+
+<script>
+  // Self-contained chart. No dependencies, no network — CSP-safe inline JS.
+  (function () {
+    var monthly = [8, 14, 19, 27, 33, 41];
+    var labels = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    var svg = document.getElementById('chart');
+    if (!svg) return;
+    var W = 560, H = 220, padL = 34, padB = 28, padT = 12, padR = 10;
+    var mode = 'monthly';
+
+    function series() {
+      if (mode === 'monthly') return monthly.slice();
+      var acc = [], sum = 0;
+      for (var i = 0; i < monthly.length; i++) { sum += monthly[i]; acc.push(sum); }
+      return acc;
+    }
+    function draw() {
+      var data = series();
+      var max = Math.max.apply(null, data) * 1.15;
+      var n = data.length;
+      var plotW = W - padL - padR, plotH = H - padT - padB;
+      var gap = 14, bw = (plotW - gap * (n - 1)) / n;
+      var parts = [];
+      // baseline
+      parts.push('<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (W - padR) +
+        '" y2="' + (padT + plotH) + '" stroke="#e5e5e7" stroke-width="1"/>');
+      for (var i = 0; i < n; i++) {
+        var v = data[i];
+        var h = Math.round((v / max) * plotH);
+        var x = padL + i * (bw + gap);
+        var y = padT + plotH - h;
+        parts.push('<rect class="bar" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) +
+          '" width="' + bw.toFixed(1) + '" height="' + h + '" rx="5" fill="#1652f0"/>');
+        parts.push('<text class="val" x="' + (x + bw / 2).toFixed(1) + '" y="' +
+          (y - 5).toFixed(1) + '" text-anchor="middle">' + v + '</text>');
+        parts.push('<text class="lbl" x="' + (x + bw / 2).toFixed(1) + '" y="' +
+          (padT + plotH + 18) + '" text-anchor="middle">' + labels[i] + '</text>');
+      }
+      svg.innerHTML = parts.join('');
+    }
+    function setMode(m) {
+      mode = m;
+      document.getElementById('mode-monthly').classList.toggle('active', m === 'monthly');
+      document.getElementById('mode-cumulative').classList.toggle('active', m === 'cumulative');
+      document.getElementById('chart-note').textContent = m === 'monthly'
+        ? 'Monthly new reviewers across the first six months.'
+        : 'Cumulative reviewers — total reach over the first six months.';
+      draw();
+    }
+    document.getElementById('mode-monthly').addEventListener('click', function () { setMode('monthly'); });
+    document.getElementById('mode-cumulative').addEventListener('click', function () { setMode('cumulative'); });
+    draw();
+  })();
+</script>
+</body>
+</html>

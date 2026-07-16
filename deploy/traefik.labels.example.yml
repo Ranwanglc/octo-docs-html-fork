@@ -1,0 +1,25 @@
+# Reference Traefik v3 labels for octo-doc — add these to the `app` service in
+# docker-compose.yml when you run Traefik as your edge proxy instead of Caddy.
+# Traefik handles ACME/Let's Encrypt via its own resolver config (not shown).
+#
+# services:
+#   app:
+#     labels:
+#       - "traefik.enable=true"
+#       - "traefik.http.routers.octodoc.rule=Host(`docs.example.com`)"
+#       - "traefik.http.routers.octodoc.entrypoints=websecure"
+#       - "traefik.http.routers.octodoc.tls.certresolver=le"
+#       - "traefik.http.services.octodoc.loadbalancer.server.port=8080"
+#       # Forward the real client IP (Traefik does this by default via
+#       # X-Forwarded-For; the app reads it for rate limiting).
+#
+# Traefik static config (traefik.yml) sketch:
+#   entryPoints:
+#     web: { address: ":80" }
+#     websecure: { address: ":443" }
+#   certificatesResolvers:
+#     le:
+#       acme:
+#         email: you@example.com
+#         storage: /letsencrypt/acme.json
+#         httpChallenge: { entryPoint: web }

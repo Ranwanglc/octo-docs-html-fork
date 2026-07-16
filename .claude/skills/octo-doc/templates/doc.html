@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    /* The overlay injects a complete default template (system fonts, sizes,
+       spacing, tables, code). DO NOT re-style headings/paragraphs/etc here.
+       Add CSS only for doc-specific widgets, and scope it tightly:
+         .my-widget { ... }   NOT   body p { ... }
+       Always set an explicit background; light mode only. */
+    body { background: #fff; }
+  </style>
+</head>
+<body>
+  <!-- Required: one container with class .wrap (preferred) | main | article |
+       .content | .container. Do NOT add `margin: 0 auto` — the overlay manages
+       the article's margins around the comment column. -->
+  <div class="wrap">
+    <h1>{title}</h1>
+    <p class="meta">{subtitle or attribution}</p>
+
+    <!-- Content using plain <h2>, <h3>, <p>, <ul>, <pre>, <table>, etc.
+         Tag author-composed composite blocks (cards, panels) with
+         data-odoc-artifact to make them commentable as a unit. -->
+  </div>
+
+  <script>
+    /* Any interactivity, inline. No external scripts unless the user asks. */
+  </script>
+</body>
+</html>

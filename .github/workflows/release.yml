@@ -1,0 +1,38 @@
+name: release
+
+# Cross-compile the octo-doc server for the supported platforms and attach the
+# binaries + SHA256SUMS to a GitHub Release when a version tag is pushed.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Resolve version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+      - name: Cross-compile + checksums
+        run: make release VERSION=${{ steps.ver.outputs.version }}
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          files: |
+            bin/dist/octo-doc_*
+            bin/dist/SHA256SUMS
+          generate_release_notes: true

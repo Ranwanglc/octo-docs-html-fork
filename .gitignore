@@ -1,0 +1,29 @@
+# Build artifacts
+/bin/
+
+# Test / coverage
+coverage.out
+*.test
+
+# Local env + data
+.env
+data/
+*.log
+
+# OS / editor
+.DS_Store
+.claude/
+# …but the committed agent skill is tracked. Re-include only octo-doc's path
+# chain; every other local-only skill under .claude/ stays ignored.
+!.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/octo-doc/
+deploy/docker-compose.local.yml
+
+# Browser tooling output
+.playwright-mcp/
+deploy/Dockerfile.local
+deploy/docker-compose.fusion.local.yml
+deploy/.env.fusion

@@ -1,0 +1,116 @@
+# octo-doc — Fusion (OCT-130) deployment overlay
+#
+# Base:      deploy/docker-compose.yml (upstream self-host stack: app + Caddy + PG + MinIO)
+# Overrides: everything OCT-135 requires to plug octo-doc into the octo fusion
+#            identity bridge as a first-class member service — the base compose
+#            is fine for a stand-alone doc host, but the fusion contract adds
+#            octo-side env (LOGIN_ENABLED, OWNER; identity flows via reverse-proxy trust headers, OCT-145 方案 C), flips
+#            the bootstrap default to the production-safe value, and gives PG a
+#            dedicated container name / DB / volume so it can coexist with the
+#            other octo services already sharing this host.
+#
+# Usage (staging / prod):
+#   cp deploy/.env.fusion.example deploy/.env.fusion
+#   # edit deploy/.env.fusion — fill FRAME_ANCESTORS / OWNER / secrets
+#   docker compose \
+#     --env-file deploy/.env.fusion \
+#     -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.fusion.yml \
+#     up -d
+#
+# What this overlay changes vs. the base compose:
+#   - app: adds LOGIN_ENABLED / OWNER; forces ALLOW_BOOTSTRAP
+#     to default false (production-safe — see docs/AUTH.md); wires DATABASE_URL
+#     to the dedicated `octodoc-pg` container below; rebinds the exposed app
+#     port to 127.0.0.1 so external traffic must go through Caddy (CSP/TLS).
+#   - postgres: renamed to `octodoc-pg`, DB name `octodoc_fusion`, dedicated
+#     volume `octodoc-pg-data`, unique host port 5433 to avoid clashing with any
+#     other PG the host already runs (per OCT-130: octo-doc gets its own PG).
+#   - minio / minio-setup / caddy: left as-is from the base compose (fusion does
+#     not need to move blob storage or the reverse proxy).
+
+name: octo-doc-fusion
+
+services:
+  app:
+    depends_on: !reset
+      octodoc-pg:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    environment:
+      # ── Fusion identity bridge (OCT-135 env contract) ──────────────────────
+      # 默认 false 是 SILENT FAIL-SOFT：app 照启、每次登录静悄悄回落到 lobster
+      # 鉴权；打错字没有报错日志，只有"为什么 octo 登不了"。融合部署必须显式 true。
+      LOGIN_ENABLED: ${LOGIN_ENABLED:-false}
+      # OCT-145 方案 C：doc 只信反代注入的 X-Octo-Uid/Name/Role 三个信任头，不再
+      # 拉 userinfo。OCTO_OPENAPI_URL / OCTO_USERINFO_URL 方案 C 后废弃，从这里
+      # 移除以免部署时误配。
+      # 逗号分隔的 octo login，提权到 CapAuthor。空 = 复用 octo superAdmin via role
+      # (internal/service/auth.go)。OCT-130 定的融合默认行为。
+      OWNER: ${OWNER:-}
+
+      # ── Auth toggles: overridden to production-safe defaults ───────────────
+      # base compose 默认 true 图开发方便；融合是共享服务，公网开着 bootstrap 就是
+      # 首个 write token 抢占赛。默认 false；只在一次性 bootstrap 窗口临时翻 true。
+      ALLOW_BOOTSTRAP: ${ALLOW_BOOTSTRAP:-false}
+      # CSP frame-ancestors —— 允许哪些 origin iframe 渲染后的 doc。octo-web 面板
+      # 嵌入必须列它的 origin，缺就是 CSP 拦、面板空白（浏览器 console 才有报错）。
+      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-'none'}
+
+      # ── Overrides: point at the dedicated fusion PG container ──────────────
+      # pgx 默认 sslmode=prefer，容器内网无 TLS 会静默降级；显式 disable 让失败模式
+      # 明确，也避免不同驱动版本行为漂移。
+      DATABASE_URL: "postgres://${PG_USER:-octodoc}:${PG_PASSWORD:-octodoc}@octodoc-pg:5432/${PG_DB:-octodoc_fusion}?sslmode=disable"
+    ports: !override
+      # base compose 把 8080 绑到 0.0.0.0，融合场景走 Caddy 反代 —— 直接暴露公网
+      # 会绕过 Caddy 的 FRAME_ANCESTORS / TLS / CSP 一整套。只留本机运维口。
+      - "127.0.0.1:8080:8080"
+
+  # 重命名 PG 服务，避免与同主机另一个 `postgres` 容器/compose project 撞名。
+  octodoc-pg:
+    image: postgres:16-alpine
+    container_name: octodoc-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-octodoc}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-octodoc}
+      POSTGRES_DB: ${PG_DB:-octodoc_fusion}
+    ports:
+      - "${PG_HOST_PORT:-5433}:5432"
+    volumes:
+      - octodoc-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-octodoc} -d ${PG_DB:-octodoc_fusion}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 把 base 的 `postgres` service 收进 disabled profile —— compose 只 merge 不删，
+  # profile 让它默认不被调度。
+  postgres:
+    profiles: ["disabled"]
+
+  # 一次性 migrate：跑 `octo-doc migrate` 后退出。加 `--profile migrate` 显式启用，
+  # 或用 `docker compose ... run --rm migrate` 按需触发。
+  migrate:
+    profiles: ["migrate"]
+    image: ghcr.io/lml2468/octo-doc:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      octodoc-pg:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://${PG_USER:-octodoc}:${PG_PASSWORD:-octodoc}@octodoc-pg:5432/${PG_DB:-octodoc_fusion}?sslmode=disable"
+      S3_BUCKET: ${S3_BUCKET:-octo-doc}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ENDPOINT: http://minio:9000
+      S3_FORCE_PATH_STYLE: "1"
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    command: ["migrate"]
+
+volumes:
+  octodoc-pg-data:

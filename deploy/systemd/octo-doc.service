@@ -1,0 +1,40 @@
+# systemd unit for octo-doc — FUSION deployment (OCT-135)
+# See install steps + env template in the same directory.
+
+[Unit]
+Description=octo-doc HTML doc service (fusion)
+Documentation=https://github.com/Ranwanglc/octo-docs-html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=octodoc
+Group=octodoc
+
+EnvironmentFile=/etc/octo-doc/octo-doc.env
+
+ExecStart=/usr/local/bin/octo-doc serve
+Restart=on-failure
+RestartSec=3s
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/octo-doc /var/log/octo-doc
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+
+StandardOutput=append:/var/log/octo-doc/octo-doc.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

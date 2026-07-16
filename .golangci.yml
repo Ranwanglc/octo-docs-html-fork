@@ -1,0 +1,42 @@
+# golangci-lint v2 configuration. Tuned for a small, strict service codebase.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose      # HTTP response bodies must be closed
+    - errcheck       # unchecked errors
+    - govet
+    - ineffassign
+    - misspell
+    - revive         # style / naming
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+  exclusions:
+    generated: lax
+    rules:
+      # Test files may ignore some errcheck/bodyclose noise for brevity.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+      # The in-memory store's tiny itoa/atoi helpers are intentionally manual.
+      - path: internal/storage/memory/memory\.go
+        linters:
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

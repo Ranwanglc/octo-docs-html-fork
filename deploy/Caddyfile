@@ -1,0 +1,40 @@
+# Caddy reverse proxy for octo-doc — automatic HTTPS via Let's Encrypt.
+#
+# {$DOMAIN} comes from the compose environment:
+#   • set DOMAIN=docs.example.com  → Caddy provisions a TLS cert automatically
+#   • leave DOMAIN unset (=":80")  → plain HTTP for local testing
+#
+# SECURITY (failure mode "用户 HTML 与 API 同源 → cookie 泄露"): for production
+# you should serve rendered docs from a SEPARATE subdomain than any trusted
+# panel/app, so a doc's inline JS lives on its own origin and cannot read your
+# session cookies. See the two-site block at the bottom for that layout.
+
+{$DOMAIN} {
+	encode gzip zstd
+
+	# Pass the real client IP through so the app's rate limiter keys correctly.
+	reverse_proxy app:8080 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# Defense-in-depth headers (the app also sets CSP on /d/* responses).
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+	}
+}
+
+# ── Recommended production layout: separate doc origin ────────────────────────
+# Uncomment and set both hostnames. Docs render on d.example.com (untrusted
+# user HTML, its own cookie jar); the write API / catalog stay on the app
+# origin. Both proxy to the same container; isolation is by origin, not routing.
+#
+# app.example.com {
+# 	reverse_proxy app:8080
+# }
+# d.example.com {
+# 	reverse_proxy app:8080
+# }
