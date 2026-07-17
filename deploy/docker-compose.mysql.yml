@@ -96,7 +96,7 @@ services:
   # One-shot MySQL migrate: `docker compose ... --profile migrate run --rm migrate`.
   migrate:
     profiles: ["migrate"]
-    image: ghcr.io/lml2468/octo-doc:latest
+    image: ${APP_IMAGE:-octo-docs-html:local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
