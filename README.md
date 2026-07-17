@@ -151,6 +151,7 @@ agent element get/replace).
 | `STORAGE_DRIVER` | `postgres` | metadata backend — `postgres` or `mysql` |
 | `DATABASE_URL` | _(required)_ | database connection string |
 | `S3_BUCKET` / `S3_ENDPOINT` | `octo-doc` / _(AWS)_ | blob store — for MinIO/R2 set the endpoint + `S3_FORCE_PATH_STYLE=1` |
+| `S3_PREFIX` | _(empty)_ | optional key namespace prepended to every object key, so one bucket can isolate environments (e.g. `docs-html-test` / `docs-html-prod`). Empty keeps the legacy bare `docs/` layout (no migration). |
 | `ASSET_SIGNING_SECRET` | _(falls back to `WRITE_TOKEN`)_ | HMAC key for signed inline-asset URLs |
 | `PG_POOL_MAX` | `10` | max connections **per pool**; the app keeps two (queries + advisory locks) |
 | `FRAME_ANCESTORS` | `'none'` | CSP embedding policy for rendered docs; also derives the postMessage sender allowlist |
