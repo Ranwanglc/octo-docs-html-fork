@@ -95,7 +95,7 @@ services:
   # 或用 `docker compose ... run --rm migrate` 按需触发。
   migrate:
     profiles: ["migrate"]
-    image: ghcr.io/lml2468/octo-doc:latest
+    image: ${APP_IMAGE:-octo-docs-html:local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

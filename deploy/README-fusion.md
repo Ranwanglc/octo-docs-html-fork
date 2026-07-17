@@ -27,8 +27,12 @@ Three compose paths ship in `deploy/`, layered on the base
    # edit deploy/.env — fill MYSQL_* + secrets (+ OCTO_SERVER_BASE_URL / DOCS_BACKEND_* if used)
    docker compose --env-file deploy/.env \
      -f deploy/docker-compose.yml \
-     -f deploy/docker-compose.mysql.yml up -d
+     -f deploy/docker-compose.mysql.yml up -d --build
    ```
+   `--build` compiles the app image from this repo's `deploy/Dockerfile` (the
+   source supports MySQL). The compose `image:` defaults to a local tag
+   `octo-docs-html:local`; once a MySQL-capable image is published, set
+   `APP_IMAGE=<image>` in the env file to pull it instead of building.
    Env-key reference: `deploy/.env.example`. The rest of *this* file documents
    the PostgreSQL fusion path (mode 2).
 

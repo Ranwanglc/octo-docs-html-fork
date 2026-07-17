@@ -11,7 +11,12 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: ghcr.io/lml2468/octo-doc:latest
+    # Default to a locally-built tag so `docker compose up` builds from THIS repo
+    # (the source here supports both postgres and mysql). The old pinned
+    # ghcr.io/lml2468/octo-doc:latest predates MySQL support and ignores
+    # STORAGE_DRIVER, so a fresh env pulling it fails against MySQL. Override with
+    # APP_IMAGE=<published-image> once a MySQL-capable image is published.
+    image: ${APP_IMAGE:-octo-docs-html:local}
     restart: unless-stopped
     depends_on:
       postgres:
