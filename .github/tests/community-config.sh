@@ -120,6 +120,24 @@ if ! grep -Fq '* @Mininglamp-OSS/maintainers' .github/CODEOWNERS; then
   exit 1
 fi
 
+if grep -Fq 'github.com/lml2468/' SECURITY.md CODE_OF_CONDUCT.md; then
+  echo 'community security links must not reference the former repository owner' >&2
+  exit 1
+fi
+
+if ! grep -Fq 'https://github.com/Mininglamp-OSS/octo-docs-html/releases' SECURITY.md; then
+  echo 'security policy must link to releases in the current repository' >&2
+  exit 1
+fi
+
+private_report_url='https://github.com/Mininglamp-OSS/octo-docs-html/security/advisories/new'
+for path in SECURITY.md CODE_OF_CONDUCT.md; do
+  if ! grep -Fq "$private_report_url" "$path"; then
+    echo "missing current private vulnerability report URL in $path" >&2
+    exit 1
+  fi
+done
+
 if ! grep -Fq 'bash .github/tests/community-config.sh' .github/workflows/community-config.yml; then
   echo 'community config contract must run in CI' >&2
   exit 1

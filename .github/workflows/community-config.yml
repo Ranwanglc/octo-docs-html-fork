@@ -5,10 +5,14 @@ on:
     branches: [main]
     paths:
       - '.github/**'
+      - 'CODE_OF_CONDUCT.md'
+      - 'SECURITY.md'
   push:
     branches: [main]
     paths:
       - '.github/**'
+      - 'CODE_OF_CONDUCT.md'
+      - 'SECURITY.md'
 
 permissions:
   contents: read

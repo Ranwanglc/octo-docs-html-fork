@@ -59,10 +59,9 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement privately through
-GitHub's [Report a vulnerability / private report](https://github.com/lml2468/octo-doc/security/advisories/new)
-form, or by contacting the repository owner ([@lml2468](https://github.com/lml2468))
-directly. All complaints will be reviewed and investigated promptly and fairly.
+reported to the community leaders responsible for enforcement through GitHub's
+[private vulnerability reporting form](https://github.com/Mininglamp-OSS/octo-docs-html/security/advisories/new).
+All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

@@ -3,7 +3,7 @@
 ## Supported versions
 
 octo-doc is pre-1.0; only the **latest release** receives security fixes. Please
-upgrade to the most recent [release](https://github.com/lml2468/octo-doc/releases)
+upgrade to the most recent [release](https://github.com/Mininglamp-OSS/octo-docs-html/releases)
 before reporting.
 
 | Version | Supported |
@@ -16,7 +16,7 @@ before reporting.
 **Please do not open a public issue for security vulnerabilities.**
 
 Report privately through GitHub's
-[**Report a vulnerability**](https://github.com/lml2468/octo-doc/security/advisories/new)
+[**Report a vulnerability**](https://github.com/Mininglamp-OSS/octo-docs-html/security/advisories/new)
 form (Security → Advisories). This opens a private advisory visible only to the
 maintainers.
 
