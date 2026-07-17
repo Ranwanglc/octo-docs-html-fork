@@ -5,7 +5,7 @@ From nothing to a live, TLS-secured doc server in ~15 minutes on a $5 VPS.
 ## TL;DR
 
 ```bash
-git clone https://github.com/Mininglamp-OSS/octo-docs-html && cd octo-doc
+git clone https://github.com/Mininglamp-OSS/octo-docs-html && cd octo-docs-html
 DOMAIN=docs.example.com docker compose -f deploy/docker-compose.yml up -d --wait
 TOKEN=$(curl -sX POST http://localhost:8080/v1/admin/bootstrap | jq -r .data.token)
 # Publish a doc:
@@ -34,7 +34,7 @@ curl -fsSL https://get.docker.com | sh
 
 ```bash
 git clone https://github.com/Mininglamp-OSS/octo-docs-html
-cd octo-doc
+cd octo-docs-html
 # DOMAIN drives Caddy's automatic Let's Encrypt cert.
 DOMAIN=docs.example.com docker compose -f deploy/docker-compose.yml up -d --wait
 ```

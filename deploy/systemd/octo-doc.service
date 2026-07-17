@@ -3,7 +3,7 @@
 
 [Unit]
 Description=octo-doc HTML doc service (fusion)
-Documentation=https://github.com/Ranwanglc/octo-docs-html
+Documentation=https://github.com/Mininglamp-OSS/octo-docs-html
 After=network-online.target
 Wants=network-online.target
 

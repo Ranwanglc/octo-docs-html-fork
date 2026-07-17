@@ -64,7 +64,7 @@ sidebar, and push comment events back to Octo IM.
 Bring up the full stack and publish a document:
 
 ```bash
-git clone https://github.com/Ranwanglc/octo-docs-html && cd octo-docs-html
+git clone https://github.com/Mininglamp-OSS/octo-docs-html && cd octo-docs-html
 
 # App + database + MinIO (+ reverse proxy) — see deploy/ for compose files:
 docker compose -f deploy/docker-compose.yml up -d --wait
