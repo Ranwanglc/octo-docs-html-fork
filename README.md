@@ -29,7 +29,8 @@ docs are owned by their **creator's Octo identity**, register into the web-docs
 sidebar, and push comment events back to Octo IM.
 
 > **Heritage.** This is the Octo-integrated build. It descends from the upstream
-> `octo-doc` project (module path and binary name remain `octo-doc`) and layers
+> `octo-doc` project (the binary name remains `octo-doc`; the Go module path is
+> now `github.com/Mininglamp-OSS/octo-docs-html`) and layers
 > Octo identity, per-uid grants, MySQL storage, doc-binding, docs-backend
 > registration, and comment-event webhooks on top.
 
