@@ -10,7 +10,7 @@
 #            other octo services already sharing this host.
 #
 # Usage (staging / prod):
-#   cp deploy/.env.fusion.example deploy/.env.fusion
+#   cp deploy/.env.example deploy/.env.fusion
 #   # edit deploy/.env.fusion — fill FRAME_ANCESTORS / OWNER / secrets
 #   docker compose \
 #     --env-file deploy/.env.fusion \
