@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/service/octoidentity"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // verifyUserToken fills an octo session from a raw user token when the reverse

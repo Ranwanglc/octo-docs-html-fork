@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/service/octoidentity"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 )
 
 // stub server: routes verify/user based on path; per-case handler injected via

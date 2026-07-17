@@ -807,7 +807,7 @@
   // no public catalog; the owner reaches their doc list via the profile
   // chip menu instead.
   document.getElementById('odoc-bar-mark').onclick = () =>
-    window.open('https://github.com/lml2468/octo-doc', '_blank', 'noopener');
+    window.open('https://github.com/Mininglamp-OSS/octo-docs-html', '_blank', 'noopener');
 
   // Fork: opens the renderable /fork view in a new tab AND triggers a download
   // (one click, both happen). We use a hidden iframe to fire the download so
@@ -915,7 +915,7 @@
     b.onclick = (e) => {
       e.stopPropagation();
       secMenu.classList.remove('open');
-      if (b.dataset.action === 'repo') window.open('https://github.com/lml2468/octo-doc', '_blank', 'noopener');
+      if (b.dataset.action === 'repo') window.open('https://github.com/Mininglamp-OSS/octo-docs-html', '_blank', 'noopener');
       if (b.dataset.action === 'fork') forkAndDownload();
       if (b.dataset.action === 'share') showShareModal();
       if (b.dataset.action === 'publish') { isDraft ? showPromoteModal() : showPublishModal(); }
@@ -1023,7 +1023,7 @@
   footer.className = 'odoc-footer';
   footer.innerHTML =
     '<div class="odoc-footer-row">' +
-      '<span>Powered by <a href="https://github.com/lml2468/octo-doc" target="_blank" rel="noopener">octo-doc</a></span>' +
+      '<span>Powered by <a href="https://github.com/Mininglamp-OSS/octo-docs-html" target="_blank" rel="noopener">octo-doc</a></span>' +
     '</div>';
   document.body.appendChild(footer);
 

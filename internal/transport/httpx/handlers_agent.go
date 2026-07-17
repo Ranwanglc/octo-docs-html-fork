@@ -3,8 +3,8 @@ package httpx
 import (
 	"net/http"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 )
 
 // handleAgentReply lets an agent post a reply + verdict (applied/partial/

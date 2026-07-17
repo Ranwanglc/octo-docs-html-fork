@@ -9,8 +9,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/lml2468/octo-doc/internal/config"
-	"github.com/lml2468/octo-doc/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 )
 
 // Server holds the dependencies shared by all handlers.

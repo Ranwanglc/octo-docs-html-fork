@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/service/docsbackend"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // DocService handles publish, render-data, version listing, and deletion of

@@ -5,7 +5,7 @@ From nothing to a live, TLS-secured doc server in ~15 minutes on a $5 VPS.
 ## TL;DR
 
 ```bash
-git clone https://github.com/lml2468/octo-doc && cd octo-doc
+git clone https://github.com/Mininglamp-OSS/octo-docs-html && cd octo-docs-html
 DOMAIN=docs.example.com docker compose -f deploy/docker-compose.yml up -d --wait
 TOKEN=$(curl -sX POST http://localhost:8080/v1/admin/bootstrap | jq -r .data.token)
 # Publish a doc:
@@ -33,8 +33,8 @@ curl -fsSL https://get.docker.com | sh
 ### 3. Clone and launch
 
 ```bash
-git clone https://github.com/lml2468/octo-doc
-cd octo-doc
+git clone https://github.com/Mininglamp-OSS/octo-docs-html
+cd octo-docs-html
 # DOMAIN drives Caddy's automatic Let's Encrypt cert.
 DOMAIN=docs.example.com docker compose -f deploy/docker-compose.yml up -d --wait
 ```
@@ -86,7 +86,7 @@ still need a PostgreSQL instance and an S3-compatible bucket reachable from it
 (a managed Postgres + an S3/MinIO/R2-compatible bucket, or self-hosted).
 
 Grab a prebuilt binary for linux/macOS (amd64/arm64) from the
-[latest release](https://github.com/lml2468/octo-doc/releases/latest) — each is
+[latest release](https://github.com/Mininglamp-OSS/octo-docs-html/releases/latest) — each is
 listed in `SHA256SUMS` — or build from source:
 
 ```bash

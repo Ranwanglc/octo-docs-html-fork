@@ -31,10 +31,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over stripped content), so golden parity holds.
 - Removed all Cloudflare/Workers framing from docs and comments — octo-doc is
   described on its own terms (self-hosted, PostgreSQL + S3).
-- Repository home is `github.com/lml2468/octo-doc`: the Go module path, imports,
+- Repository home is `github.com/Mininglamp-OSS/octo-docs-html`: the Go module path, imports,
   `octo update` release repo, `REPO_URL` default, and the ghcr image
-  (`ghcr.io/lml2468/octo-doc`) all point there. (Historical: `go install
-  github.com/lml2468/octo-doc/cmd/octo@latest` installed the client CLI at the
+  (`ghcr.io/mininglamp-oss/octo-docs-html`) all point there. (Historical: `go install
+  github.com/Mininglamp-OSS/octo-docs-html/cmd/octo@latest` installed the client CLI at the
   time of this release; the `octo` CLI has since been removed from this repo —
   see the Unreleased section.)
 

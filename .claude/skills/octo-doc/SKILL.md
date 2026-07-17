@@ -115,7 +115,7 @@ belongs in the `Authorization: Bearer` header, never in a URL or a shared log.
   Never drafts, publishing, or deletion.
 - no credential → the server returns **404** (a private doc never confirms it
   exists). Full model:
-  [docs/AUTH.md](https://github.com/lml2468/octo-doc/blob/main/docs/AUTH.md).
+  [docs/AUTH.md](https://github.com/Mininglamp-OSS/octo-docs-html/blob/main/docs/AUTH.md).
 
 ## Setup check
 

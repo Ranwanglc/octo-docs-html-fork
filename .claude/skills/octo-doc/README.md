@@ -1,6 +1,6 @@
 # octo-doc skill
 
-The agent authoring skill for [octo-doc](https://github.com/lml2468/octo-doc) — an
+The agent authoring skill for [octo-doc](https://github.com/Mininglamp-OSS/octo-docs-html) — an
 API-first skill that turns a prompt into a self-contained interactive HTML
 document, publishes it to your self-hosted octo-doc server over the `/v1` HTTP
 API, shares it with text- and artifact-anchored inline commenting, and iterates it

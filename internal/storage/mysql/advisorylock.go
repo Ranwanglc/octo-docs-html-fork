@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 )
 
 type advisoryLocker struct {

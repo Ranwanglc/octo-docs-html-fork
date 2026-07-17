@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 )
 
 // gifBytes is a valid GIF89a header — http.DetectContentType classifies it as

@@ -6,13 +6,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/config"
-	"github.com/lml2468/octo-doc/internal/platform/log"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/service"
-	"github.com/lml2468/octo-doc/internal/storage"
-	"github.com/lml2468/octo-doc/internal/storage/memory"
-	"github.com/lml2468/octo-doc/internal/transport/httpx"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
 )
 
 // 方案 i acceptance: author is owned by the USER behind a bot (OwnerUID), so a

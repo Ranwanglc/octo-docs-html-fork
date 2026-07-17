@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/service/eventwebhook"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/eventwebhook"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // CommentService is the serialized owner of per-slug comment mutations. All

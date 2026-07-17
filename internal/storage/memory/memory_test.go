@@ -3,8 +3,8 @@ package memory_test
 import (
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/storage/memory"
-	"github.com/lml2468/octo-doc/internal/storage/storagetest"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/storagetest"
 )
 
 func TestMemoryMetadataContract(t *testing.T) {

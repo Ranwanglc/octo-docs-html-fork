@@ -130,7 +130,7 @@ func Load() (*Config, error) {
 		Port:    envInt("PORT", 8080),
 		Host:    env("HOST", "0.0.0.0"),
 		BaseURL: strings.TrimRight(env("BASE_URL", ""), "/"),
-		RepoURL: env("REPO_URL", "https://github.com/lml2468/octo-doc"),
+		RepoURL: env("REPO_URL", "https://github.com/Mininglamp-OSS/octo-docs-html"),
 
 		StorageDriver:    strings.ToLower(strings.TrimSpace(env("STORAGE_DRIVER", "postgres"))),
 		DatabaseURL:      env("DATABASE_URL", env("PG_URL", "")),
