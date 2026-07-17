@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/storage/postgres"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/postgres"
 )
 
 // TestAdvisoryLockerSerializes verifies the PostgreSQL advisory locker actually

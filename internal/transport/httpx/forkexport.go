@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 )
 
 // forkExportInput is the input to buildForkExport.

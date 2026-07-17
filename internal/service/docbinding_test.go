@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 )
 
 // stubBinding is a table-driven fetcher: (token,slug) → info/err. Counts every

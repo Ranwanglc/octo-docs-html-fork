@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // Schema is the canonical MySQL DDL, applied at open and by the migrate command.

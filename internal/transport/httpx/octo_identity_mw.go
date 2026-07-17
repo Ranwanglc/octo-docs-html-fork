@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // Identity sources on a doc request (in priority order at bestCred time):

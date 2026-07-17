@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 )
 
 // Media assets: per-doc, content-addressed binary resources (images, video, …)

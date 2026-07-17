@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/config"
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // sessionTTLSeconds is the viewer session lifetime (30 days).

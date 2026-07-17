@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // Store implements both storage.MetadataStore and storage.BlobStore in memory.

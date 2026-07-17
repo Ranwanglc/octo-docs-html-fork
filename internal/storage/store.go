@@ -9,7 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 
-	"github.com/lml2468/octo-doc/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 )
 
 // DocMeta is the metadata persisted per slug.

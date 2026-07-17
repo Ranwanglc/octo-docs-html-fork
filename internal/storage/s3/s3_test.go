@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	s3store "github.com/lml2468/octo-doc/internal/storage/s3"
-	"github.com/lml2468/octo-doc/internal/storage/storagetest"
+	s3store "github.com/Mininglamp-OSS/octo-docs-html/internal/storage/s3"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/storagetest"
 )
 
 // TestS3Contract runs the blob contract against a real S3-compatible store when

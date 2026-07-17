@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/service/octoidentity"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // botSessionCtxKey marks sessions verified by BotAuth, separate from trust-header

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/config"
-	"github.com/lml2468/octo-doc/internal/service/octoidentity"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 )
 
 // stubIdentity is a hand-injected octoidentity.Identity for exercising the

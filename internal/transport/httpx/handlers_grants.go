@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 )
 
 // grantDTO is one row of the grants listing. It mirrors the rich-doc members

@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/storage/postgres"
-	"github.com/lml2468/octo-doc/internal/storage/storagetest"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/postgres"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/storagetest"
 )
 
 // TestPostgresContract runs the storage contract against a real PostgreSQL when

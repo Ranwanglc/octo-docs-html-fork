@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/lml2468/octo-doc/internal/config"
-	"github.com/lml2468/octo-doc/internal/platform/log"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 )
 
 // version is the build version, stamped at release time via

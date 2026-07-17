@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
-	"github.com/lml2468/octo-doc/internal/service"
-	"github.com/lml2468/octo-doc/internal/service/eventwebhook"
-	"github.com/lml2468/octo-doc/internal/storage"
-	"github.com/lml2468/octo-doc/internal/storage/memory"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/eventwebhook"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 )
 
 // getMetaCounter wraps MetadataStore to count GetMeta calls. Everything else

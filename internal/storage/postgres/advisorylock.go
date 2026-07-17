@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/lml2468/octo-doc/internal/platform/sluglock"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 )
 
 // advisoryLocker is a sluglock.Locker backed by PostgreSQL advisory locks, so

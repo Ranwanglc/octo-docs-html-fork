@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
-	"github.com/lml2468/octo-doc/internal/service/octoidentity"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 )
 
 func (s *Server) handlePing(w http.ResponseWriter, _ *http.Request) {

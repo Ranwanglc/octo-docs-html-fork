@@ -7,8 +7,8 @@ import (
 	"maps"
 	"time"
 
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // Capability is a viewer's access level for a specific document.

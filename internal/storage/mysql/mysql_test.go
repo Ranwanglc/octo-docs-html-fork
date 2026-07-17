@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/storage"
-	"github.com/lml2468/octo-doc/internal/storage/mysql"
-	"github.com/lml2468/octo-doc/internal/storage/storagetest"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/mysql"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/storagetest"
 )
 
 // TestMySQLContract runs the storage contract against a real MySQL when

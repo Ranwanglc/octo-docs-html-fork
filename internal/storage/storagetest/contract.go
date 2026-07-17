@@ -9,8 +9,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // RunMetadata exercises the MetadataStore contract. The store must be empty.

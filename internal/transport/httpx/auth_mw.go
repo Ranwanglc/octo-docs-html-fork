@@ -3,7 +3,7 @@ package httpx
 import (
 	"net/http"
 
-	"github.com/lml2468/octo-doc/internal/platform/apperr"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 )
 
 // requireWriteOrBotOwnerAuth gates publish, whose slug is in the request body.

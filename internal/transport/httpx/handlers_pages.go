@@ -5,9 +5,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/lml2468/octo-doc/internal/core"
-	"github.com/lml2468/octo-doc/internal/service"
-	"github.com/lml2468/octo-doc/internal/storage"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 func (s *Server) handleLanding(w http.ResponseWriter, _ *http.Request) {
