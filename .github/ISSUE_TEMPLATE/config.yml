@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: OCTO Discussions
+    url: https://github.com/orgs/Mininglamp-OSS/discussions
+    about: Ask questions, share ideas, or get help from the community.
+  - name: Security vulnerabilities
+    url: https://github.com/Mininglamp-OSS/octo-docs-html/security/policy
+    about: Report security issues privately instead of opening a public issue.

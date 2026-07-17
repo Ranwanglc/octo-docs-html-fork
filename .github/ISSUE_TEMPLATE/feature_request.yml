@@ -1,0 +1,51 @@
+name: Feature Request
+description: Propose an improvement to octo-doc
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What use case is not supported today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior and user experience.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: component
+    attributes:
+      label: Related component
+      options:
+        - HTTP API or authentication
+        - Document rendering or overlay
+        - PostgreSQL or MySQL metadata storage
+        - S3-compatible object storage
+        - Docker or self-hosted deployment
+        - Agent skill or integration
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: technical
+    attributes:
+      label: Technical approach
+      description: Optional notes about APIs, storage, compatibility, or migration.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

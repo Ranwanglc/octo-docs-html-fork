@@ -1,0 +1,82 @@
+name: Bug Report
+description: Report a reproducible problem in octo-doc
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve octo-doc. Please redact credentials and private document content.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Description
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start octo-doc with ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - HTTP API or authentication
+        - Document rendering or overlay
+        - PostgreSQL or MySQL metadata storage
+        - S3-compatible object storage
+        - Docker or self-hosted deployment
+        - Agent skill or integration
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - P0 - Service unavailable, security incident, or data loss
+        - P1 - Core workflow broken
+        - P2 - Non-core functionality impaired
+        - P3 - Minor or usability issue
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, database, object store, deployment method, and relevant versions
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or screenshots
+      description: Do not include tokens, credentials, share codes, or private document content.
+    validations:
+      required: false
