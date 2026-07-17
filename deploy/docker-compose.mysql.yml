@@ -1,0 +1,112 @@
+# octo-docs-html — MySQL deployment overlay (self-contained, zero-external-deps)
+#
+# Base:      deploy/docker-compose.yml (upstream self-host stack: app + Caddy + PG + MinIO)
+# This overlay swaps the metadata store from PostgreSQL to a self-contained
+# MySQL 8 container and injects the full env contract the app needs (storage
+# driver, octo-server identity, asset signing, docs-backend registration,
+# doc_binding). It mirrors the MySQL deployment already proven on the maintainer's
+# host, but bundles its OWN MySQL + MinIO so a brand-new environment comes up with
+# one command and no pre-existing octo services.
+#
+# Usage (fresh environment, one command):
+#   cp deploy/.env.example deploy/.env
+#   # edit deploy/.env — fill secrets + OCTO_SERVER_BASE_URL / DOCS_BACKEND_* if used
+#   docker compose \
+#     --env-file deploy/.env \
+#     -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.mysql.yml \
+#     up -d
+#
+# What this overlay changes vs. the base compose:
+#   - app: STORAGE_DRIVER=mysql; DATABASE_URL points at the bundled `mysql`
+#     container in go-sql-driver DSN form; injects LOGIN_ENABLED / BOT_AUTH_ENABLED
+#     / ASSET_SIGNING_SECRET / FRAME_ANCESTORS / DOCS_BACKEND_* / OCTO_DOC_BINDING_URL
+#     / OCTO_SERVER_BASE_URL so `--env-file` values actually reach the container
+#     (an env-file only supplies interpolation; keys must be listed here to pass through).
+#   - postgres: pushed into the `disabled` profile so it is not scheduled.
+#   - mysql: new MySQL 8 service with its own volume + healthcheck; app waits on it.
+#   - minio / minio-setup / caddy: unchanged from base — bundled blob storage stays.
+
+name: octo-docs-html-mysql
+
+services:
+  app:
+    depends_on: !reset
+      mysql:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    environment:
+      # ── Storage: MySQL instead of the base PostgreSQL ──────────────────────
+      # STORAGE_DRIVER defaults to "postgres" in code; MySQL deploys MUST set it.
+      STORAGE_DRIVER: mysql
+      # go-sql-driver DSN (not a postgres:// URL). Points at the bundled mysql svc.
+      DATABASE_URL: "${MYSQL_USER:-octo_docs}:${MYSQL_PASSWORD:-octo_docs_pw}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo_docs}?charset=utf8mb4&parseTime=true&loc=Local"
+
+      # ── Identity bridge (terminal auth: author = creator, reverse-proxy removed) ──
+      # Silent fail-soft: default false ⇒ logins quietly fall back, no error log.
+      LOGIN_ENABLED: ${LOGIN_ENABLED:-true}
+      # octo-server origin; doc calls its /v1/auth/verify(-bot) directly.
+      OCTO_SERVER_BASE_URL: ${OCTO_SERVER_BASE_URL:-}
+      # Bot-token auth; needs OCTO_SERVER_BASE_URL to have a verify provider.
+      BOT_AUTH_ENABLED: ${BOT_AUTH_ENABLED:-true}
+      # doc_binding channel (per-slug authorization). Empty ⇒ falls back to
+      # trust-header identity + share-code semantics.
+      OCTO_DOC_BINDING_URL: ${OCTO_DOC_BINDING_URL:-}
+
+      # ── Inline asset signing ───────────────────────────────────────────────
+      # HMAC key for inline <img>/asset URLs. Empty ⇒ falls back to WRITE_TOKEN;
+      # in terminal auth WRITE_TOKEN is also unset ⇒ signing key empty ⇒ every
+      # inline image 404s. Server-side secret; the frontend does NOT set this.
+      ASSET_SIGNING_SECRET: ${ASSET_SIGNING_SECRET:-}
+
+      # ── docs-backend sidebar registration (published HTML → web sidebar) ────
+      # Empty ⇒ disabled (no error, but published docs won't appear in the sidebar).
+      DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
+      DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
+
+      # ── Production-safe auth default ────────────────────────────────────────
+      # Base compose defaults ALLOW_BOOTSTRAP=true (dev convenience); force false.
+      ALLOW_BOOTSTRAP: ${ALLOW_BOOTSTRAP:-false}
+
+  # Disable the base PostgreSQL service — compose only merges, never deletes, so a
+  # profile keeps it out of the default schedule.
+  postgres:
+    profiles: ["disabled"]
+
+  # Bundled MySQL 8 (self-contained; no pre-existing octo MySQL required).
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-octo_docs}
+      MYSQL_USER: ${MYSQL_USER:-octo_docs}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-octo_docs_pw}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-octo_docs_root_pw}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-octo_docs_root_pw}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  # One-shot MySQL migrate: `docker compose ... --profile migrate run --rm migrate`.
+  migrate:
+    profiles: ["migrate"]
+    image: ghcr.io/lml2468/octo-doc:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      STORAGE_DRIVER: mysql
+      DATABASE_URL: "${MYSQL_USER:-octo_docs}:${MYSQL_PASSWORD:-octo_docs_pw}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo_docs}?charset=utf8mb4&parseTime=true&loc=Local"
+    command: ["migrate"]
+
+volumes:
+  mysql-data:

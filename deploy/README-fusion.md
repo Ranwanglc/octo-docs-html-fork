@@ -8,6 +8,30 @@ This overlay adds three fusion-specific env vars, flips `ALLOW_BOOTSTRAP` to a
 production-safe default, and splits PostgreSQL into a dedicated `octodoc-pg`
 instance so it can coexist with other octo services on the same host.
 
+## Deployment modes — pick one
+
+Three compose paths ship in `deploy/`, layered on the base
+`docker-compose.yml`:
+
+1. **Stand-alone PostgreSQL** (base only) — `docker compose -f
+   deploy/docker-compose.yml up -d`. Self-contained app + Caddy + PG + MinIO.
+2. **Fusion PostgreSQL** (this guide) — base + `docker-compose.fusion.yml`.
+   Dedicated `octodoc-pg`, fusion identity env, production-safe bootstrap.
+3. **Self-contained MySQL** — base + `docker-compose.mysql.yml`. Swaps the
+   metadata store to a **bundled MySQL 8** container (no pre-existing octo
+   MySQL required) and injects the full env contract
+   (`STORAGE_DRIVER=mysql`, identity, asset signing, docs-backend
+   registration, doc_binding). One command brings a brand-new environment up:
+   ```bash
+   cp deploy/.env.example deploy/.env
+   # edit deploy/.env — fill MYSQL_* + secrets (+ OCTO_SERVER_BASE_URL / DOCS_BACKEND_* if used)
+   docker compose --env-file deploy/.env \
+     -f deploy/docker-compose.yml \
+     -f deploy/docker-compose.mysql.yml up -d
+   ```
+   Env-key reference: `deploy/.env.example`. The rest of *this* file documents
+   the PostgreSQL fusion path (mode 2).
+
 ## Deploy prerequisites / required environment variables
 
 Every variable below must be set (or explicitly left at the noted default)
@@ -28,13 +52,13 @@ out — those are the ones that boot fine but quietly break the fusion contract.
 | `COOKIE_SECURE`         | `true`                    | Leave true behind TLS; only flip to false for plain-HTTP local dev.                                                                        |
 
 The compose overlay reads these from `deploy/.env.fusion` (copy from
-`deploy/.env.fusion.example`). The systemd unit reads them from
+`deploy/.env.example`). The systemd unit reads them from
 `/etc/octo-doc/octo-doc.env` (copy from `deploy/systemd/octo-doc.env.example`).
 
 ## Option A — docker-compose (recommended)
 
 ```bash
-cp deploy/.env.fusion.example deploy/.env.fusion
+cp deploy/.env.example deploy/.env.fusion
 # edit deploy/.env.fusion — fill LOGIN_ENABLED / FRAME_ANCESTORS / OWNER / secrets
 
 docker compose \

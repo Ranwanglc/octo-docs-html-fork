@@ -27,6 +27,16 @@ services:
       FRAME_ANCESTORS: ${FRAME_ANCESTORS:-'none'}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Identity bridge + integration knobs. Default empty/false ⇒ base PG stack
+      # behaves as before; listed here so `--env-file` values pass through to the
+      # container (an env-file only supplies interpolation, not passthrough).
+      LOGIN_ENABLED: ${LOGIN_ENABLED:-false}
+      OCTO_SERVER_BASE_URL: ${OCTO_SERVER_BASE_URL:-}
+      BOT_AUTH_ENABLED: ${BOT_AUTH_ENABLED:-false}
+      OCTO_DOC_BINDING_URL: ${OCTO_DOC_BINDING_URL:-}
+      ASSET_SIGNING_SECRET: ${ASSET_SIGNING_SECRET:-}
+      DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
+      DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
       DATABASE_URL: postgres://${PG_USER:-octo}:${PG_PASSWORD:-octo}@postgres:5432/${PG_DB:-octodoc}
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: ${S3_BUCKET:-octo-doc}
