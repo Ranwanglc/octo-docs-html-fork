@@ -30,6 +30,7 @@ type Config struct {
 	S3ForcePathStyle bool
 	S3AccessKeyID    string
 	S3SecretKey      string
+	S3Prefix         string
 
 	WriteToken     string
 	AllowBootstrap bool
@@ -141,6 +142,7 @@ func Load() (*Config, error) {
 		S3ForcePathStyle: envBool("S3_FORCE_PATH_STYLE", false),
 		S3AccessKeyID:    env("S3_ACCESS_KEY_ID", env("AWS_ACCESS_KEY_ID", "")),
 		S3SecretKey:      env("S3_SECRET_ACCESS_KEY", env("AWS_SECRET_ACCESS_KEY", "")),
+		S3Prefix:         strings.Trim(strings.TrimSpace(env("S3_PREFIX", "")), "/"),
 
 		WriteToken:         env("WRITE_TOKEN", ""),
 		AssetSigningSecret: env("ASSET_SIGNING_SECRET", ""),

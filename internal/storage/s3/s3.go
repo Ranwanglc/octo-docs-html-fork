@@ -32,12 +32,17 @@ type Options struct {
 	ForcePathStyle bool
 	AccessKeyID    string
 	SecretKey      string
+	// Prefix namespaces every object key so one bucket can isolate environments
+	// (e.g. test vs prod). Empty = legacy bare docs/ layout, no migration.
+	Prefix string
 }
 
 // Store is an S3-compatible BlobStore.
 type Store struct {
 	client *awss3.Client
 	bucket string
+	// root is the normalized key namespace: either "" or "<prefix>/".
+	root string
 }
 
 var _ storage.BlobStore = (*Store)(nil)
@@ -63,7 +68,17 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 		o.UsePathStyle = opts.ForcePathStyle
 	})
-	return &Store{client: client, bucket: opts.Bucket}, nil
+	return &Store{client: client, bucket: opts.Bucket, root: normalizeRoot(opts.Prefix)}, nil
+}
+
+// normalizeRoot turns a raw S3_PREFIX into a key namespace: "" or "<prefix>/".
+// Surrounding slashes are trimmed; empty keeps the legacy bare docs/ layout.
+func normalizeRoot(prefix string) string {
+	root := strings.Trim(prefix, "/")
+	if root != "" {
+		root += "/"
+	}
+	return root
 }
 
 // Health verifies the bucket is reachable (used by the readiness probe). Open
@@ -78,7 +93,7 @@ func (s *Store) Health(ctx context.Context) error {
 }
 
 func (s *Store) prefixFor(slug string) string {
-	return "docs/" + storage.HashSlug(slug)
+	return s.root + "docs/" + storage.HashSlug(slug)
 }
 
 func (s *Store) keyFor(slug string, version int) string {

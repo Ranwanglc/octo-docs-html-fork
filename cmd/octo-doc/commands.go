@@ -47,6 +47,7 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 		ForcePathStyle: cfg.S3ForcePathStyle,
 		AccessKeyID:    cfg.S3AccessKeyID,
 		SecretKey:      cfg.S3SecretKey,
+		Prefix:         cfg.S3Prefix,
 	})
 	if err != nil {
 		_ = meta.Close()
