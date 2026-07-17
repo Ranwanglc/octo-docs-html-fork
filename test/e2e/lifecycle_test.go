@@ -25,6 +25,8 @@ import (
 )
 
 func TestFullLifecycle(t *testing.T) {
+	// Exercise the current proxy-trusted Octo identity contract end to end.
+	// Legacy WRITE_TOKEN bearer auth is not an author identity.
 	dbURL := os.Getenv("OCTO_TEST_DATABASE_URL")
 	bucket := os.Getenv("OCTO_TEST_S3_BUCKET")
 	if dbURL == "" || bucket == "" {
@@ -53,7 +55,7 @@ func TestFullLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := &config.Config{WriteToken: "e2e", MaxHTMLBytes: 5 << 20, RepoURL: "https://example.com", RateLimitMax: 0}
+	cfg := &config.Config{MaxHTMLBytes: 5 << 20, RepoURL: "https://example.com", RateLimitMax: 0}
 	locker := sluglock.NewMemory()
 	comments := service.NewCommentService(pg, locker)
 	docs := service.NewDocService(blobs, pg, comments, locker, "", cfg.MaxHTMLBytes)
@@ -65,12 +67,12 @@ func TestFullLifecycle(t *testing.T) {
 	slug := "e2e-lifecycle"
 	t.Cleanup(func() {
 		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/docs/"+slug, nil)
-		req.Header.Set("Authorization", "Bearer e2e")
+		req.Header.Set("X-Octo-Uid", e2eUID)
 		http.DefaultClient.Do(req) //nolint:errcheck
 	})
 
 	// Publish. postJSON returns the unwrapped data object.
-	pub := postJSON(t, srv.URL+"/v1/docs", "e2e",
+	pub := postJSON(t, srv.URL+"/v1/docs", e2eUID,
 		`{"slug":"`+slug+`","html":"<html><body><h1>T</h1><svg viewBox=\"0 0 1 1\"></svg><p>anchor me here</p></body></html>","title":"E2E"}`)
 	if pub["version"].(float64) != 1 || pub["aids"].(float64) != 1 {
 		t.Fatalf("publish result = %v", pub)
@@ -83,10 +85,10 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	// Comment + agent reply (author credential — docs are private by default).
-	c := postJSON(t, srv.URL+"/v1/comments", "e2e",
+	c := postJSON(t, srv.URL+"/v1/comments", e2eUID,
 		`{"slug":"`+slug+`","text":"q","version":1,"anchor":{"kind":"text","text":"anchor me"}}`)
 	cid := c["id"].(string)
-	_ = postJSON(t, srv.URL+"/v1/agent/replies", "e2e",
+	_ = postJSON(t, srv.URL+"/v1/agent/replies", e2eUID,
 		`{"slug":"`+slug+`","parent_id":"`+cid+`","text":"done","status":"applied","applied_in":1}`)
 
 	list := getText(t, srv.URL+"/v1/comments?slug="+slug+"&version=1")
@@ -107,12 +109,14 @@ func TestFullLifecycle(t *testing.T) {
 	}
 }
 
-func postJSON(t *testing.T, url, token, body string) map[string]any {
+const e2eUID = "e2e-user"
+
+func postJSON(t *testing.T, url, uid, body string) map[string]any {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if uid != "" {
+		req.Header.Set("X-Octo-Uid", uid)
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -135,12 +139,12 @@ func postJSON(t *testing.T, url, token, body string) map[string]any {
 	return data
 }
 
-// getText GETs a doc/JSON route as the author (the e2e write token) — docs are
-// private by default, so reads need a credential.
+// getText GETs a doc/JSON route as the trusted Octo author — docs are private
+// by default, so reads need the same identity that created the document.
 func getText(t *testing.T, url string) string {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header.Set("Authorization", "Bearer e2e")
+	req.Header.Set("X-Octo-Uid", e2eUID)
 	res, err := http.DefaultClient.Do(req) //nolint:noctx
 	if err != nil {
 		t.Fatal(err)
