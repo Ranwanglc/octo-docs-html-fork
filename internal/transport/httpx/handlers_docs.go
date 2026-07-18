@@ -143,7 +143,8 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	res, err := s.docs.Publish(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, GroupNo: body.GroupNo, ThreadID: body.ThreadID,
-		CreatorUID: creatorUID,
+		CreatorUID:     creatorUID,
+		PublisherToken: botTokenFromCtx(r.Context()),
 	})
 	if err != nil {
 		return err
