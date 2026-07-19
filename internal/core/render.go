@@ -18,7 +18,10 @@ type OverlayIdentity struct {
 
 // OverlayConfig is the boot config injected as window.__ODOC__ for the overlay.
 type OverlayConfig struct {
-	Slug           string           `json:"slug"`
+	Slug string `json:"slug"`
+	// Title is the human doc title; the overlay top bar shows it instead of
+	// degrading to the slug. omitempty keeps legacy byte output when unset.
+	Title          string           `json:"title,omitempty"`
 	Version        int              `json:"version"`
 	Identity       *OverlayIdentity `json:"identity"`
 	Mode           string           `json:"mode"`
@@ -56,9 +59,37 @@ func SafeJSONForScript(v any) (string, error) {
 	// are valid inside a <script> JSON literal — only bare U+2028/9 in a JS string
 	// literal would be a hazard, which this is not.)
 	s = unescapeLineSep(s)
-	s = strings.ReplaceAll(s, "</script>", `<\/script>`)
+	s = neutralizeScriptClose(s)
 	s = strings.ReplaceAll(s, "<!--", `<\!--`)
 	return s, nil
+}
+
+// neutralizeScriptClose defangs every `</script` sequence by escaping its `<` to
+// `<\`. HTML end-tag matching is case-INSENSITIVE and treats `</script` followed
+// by `>`, whitespace, `/`, or EOF as a real close tag — so `</ScRiPt>` and
+// `</script x>` both terminate the enclosing <script>. Matching only the exact
+// lowercase `</script>` (the old behavior) let a title like `</ScRiPt><img ...>`
+// break out of window.__ODOC__. The escaped `<\/` is harmless inside the JSON
+// script literal and the browser never sees a live close tag. The lowercase
+// `</script>` case still renders as `<\/script>`, preserving legacy bytes.
+func neutralizeScriptClose(s string) string {
+	const tag = "</script"
+	if len(s) < len(tag) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '<' && i+len(tag) <= len(s) && strings.EqualFold(s[i:i+len(tag)], tag) {
+			b.WriteString(`<\`)
+			b.WriteString(s[i+1 : i+len(tag)])
+			i += len(tag)
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // unescapeLineSep rewrites genuine \u2028 / \u2029 JSON escape sequences (the

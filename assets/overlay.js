@@ -800,8 +800,13 @@
   `;
   document.body.appendChild(reanchorBanner);
 
+  // Toolbar title prefers the injected meta title (cfg.title / window.__ODOC__.title)
+  // so it shows the human doc title even when the doc HTML has no <title> element
+  // (the "degrades to slug" case). Falls back to the document's <title> text.
+  const metaTitle = typeof cfg.title === 'string' ? cfg.title.trim() : '';
   const titleEl = document.querySelector('title');
-  if (titleEl && titleEl.textContent) document.getElementById('odoc-title').textContent = titleEl.textContent;
+  const barTitle = metaTitle || (titleEl && titleEl.textContent) || '';
+  if (barTitle) document.getElementById('odoc-title').textContent = barTitle;
 
   // Workspace mark in the bar's left → the open-source project. There is
   // no public catalog; the owner reaches their doc list via the profile

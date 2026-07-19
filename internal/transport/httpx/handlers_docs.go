@@ -220,6 +220,7 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	// Share/Fork. Version 0 signals "not yet a committed version".
 	html, err := core.InjectOverlayCfg(data.HTML, s.overlayJS, core.OverlayConfig{
 		Slug:           slug,
+		Title:          data.Title,
 		Version:        0,
 		Identity:       identityFromSession(session),
 		IsOwner:        s.auth.IsOwner(session),
@@ -371,6 +372,7 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	signedHTML := s.signAssetURLs(slug, data.HTML)
 	html, err := core.InjectOverlayCfg(signedHTML, s.overlayJS, core.OverlayConfig{
 		Slug:           slug,
+		Title:          data.Title,
 		Version:        version,
 		Identity:       identityFromSession(session),
 		IsOwner:        s.auth.IsOwner(session),

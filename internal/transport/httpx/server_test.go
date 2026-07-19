@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/assets"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -149,6 +150,18 @@ func TestRenderAlwaysPublishedMode(t *testing.T) {
 	}
 	if !strings.Contains(body, `"authConfigured":false`) {
 		t.Error("expected authConfigured=false (LoginEnabled off in default test cfg)")
+	}
+	// The render handler must seed __ODOC__ with the human title (data.Title from
+	// meta), so the overlay top bar shows it instead of the slug.
+	if !strings.Contains(body, `"title":"M"`) {
+		t.Errorf("expected human title in __ODOC__: %s", body[strings.Index(body, "__ODOC__"):min(strings.Index(body, "__ODOC__")+160, len(body))])
+	}
+	// Field presence alone is a false-green (the value must actually be consumed).
+	// Assert the real overlay source reads cfg.title so the toolbar renders the meta
+	// title, not just carries it in the JSON blob. (This test injects a mock overlay
+	// string, so assert against the embedded assets.OverlayJS truth source.)
+	if !strings.Contains(assets.OverlayJS, "cfg.title") {
+		t.Error("overlay source must consume cfg.title (toolbar should prefer meta title over <title>)")
 	}
 }
 

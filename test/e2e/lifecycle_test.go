@@ -83,6 +83,15 @@ func TestFullLifecycle(t *testing.T) {
 	if !strings.Contains(body, "window.__ODOC__") || !strings.Contains(body, "data-odoc-aid") {
 		t.Fatal("render missing overlay or aids")
 	}
+	// Title render path (end to end): the published HTML carries meta title "E2E".
+	// __ODOC__ must seed that title AND the injected overlay must consume cfg.title,
+	// so the toolbar shows "E2E" not the slug. Guards a JSON-field-only false green.
+	if !strings.Contains(body, `"title":"E2E"`) {
+		t.Fatal("render: meta title not seeded into __ODOC__")
+	}
+	if !strings.Contains(body, "cfg.title") {
+		t.Fatal("render: overlay does not consume cfg.title (toolbar would degrade to slug)")
+	}
 
 	// Comment + agent reply (author credential — docs are private by default).
 	c := postJSON(t, srv.URL+"/v1/comments", e2eUID,
