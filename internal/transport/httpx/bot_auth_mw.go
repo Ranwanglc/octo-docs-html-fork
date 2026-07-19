@@ -13,6 +13,11 @@ import (
 // sessions on octoSessionCtxKey which are not sufficient for publish auth.
 type botSessionCtxKey struct{}
 
+// botTokenCtxKey carries the publishing bot's own bearer token so the async
+// docs-backend registration can authenticate as that bot (registering the doc
+// under the publisher, not a fixed process identity).
+type botTokenCtxKey struct{}
+
 // botAuthMiddleware enriches Bearer bot tokens into the same context session
 // used by proxy trust headers. It is intentionally non-gating so legacy bearer
 // credentials continue through the existing capability chain.
@@ -22,7 +27,14 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := bearerToken(r)
+		// Read the bot token from either the dedicated "token" header (the octo
+		// client / web+nginx convention) or Authorization: Bearer (CLI/direct).
+		// Using userToken (not bearerToken) is required so a publish arriving via
+		// the web reverse proxy — which forwards only the `token` header — still
+		// resolves the publishing bot's identity; otherwise the docs-backend
+		// registration falls back to the process token and every doc is attributed
+		// to that one bot.
+		token := userToken(r)
 		if token == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -52,6 +64,7 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), octoSessionCtxKey{}, sess)
 		ctx = context.WithValue(ctx, botSessionCtxKey{}, sess)
+		ctx = context.WithValue(ctx, botTokenCtxKey{}, token)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -61,4 +74,13 @@ func botSessionFromCtx(ctx context.Context) *storage.Session {
 		return v
 	}
 	return nil
+}
+
+// botTokenFromCtx returns the publishing bot's own bearer token stashed by
+// botAuthMiddleware, or "" when the request was not bot-authenticated.
+func botTokenFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(botTokenCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
 }

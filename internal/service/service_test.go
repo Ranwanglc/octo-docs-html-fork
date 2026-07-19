@@ -166,6 +166,50 @@ func TestPublishRegistersGroupMountedDoc(t *testing.T) {
 	}
 }
 
+// TestPublishRegistersUnderPublisherToken verifies route-B: when the publish
+// carries a PublisherToken, the docs-backend registration authenticates as that
+// token (so the doc is attributed to whoever published it), overriding the
+// process-configured fallback token.
+func TestPublishRegistersUnderPublisherToken(t *testing.T) {
+	ts, reqs := newDocsBackendStub(t, http.StatusOK)
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+
+	if _, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "pub-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Pub Title",
+		MountType: "group", GroupNo: "g-1",
+		PublisherToken: "publisher-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := waitDocsBackendRequest(t, reqs)
+	if req.Authorization != "Bearer publisher-token" {
+		t.Fatalf("Authorization = %q, want Bearer publisher-token (publisher token must override fallback)", req.Authorization)
+	}
+}
+
+// TestPublishRegisterFallsBackToConfiguredToken verifies that when no
+// PublisherToken is supplied, the registration falls back to the
+// process-configured token — preserving pre-route-B behaviour.
+func TestPublishRegisterFallsBackToConfiguredToken(t *testing.T) {
+	ts, reqs := newDocsBackendStub(t, http.StatusOK)
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+
+	if _, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "fallback-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Fallback Title",
+		MountType: "group", GroupNo: "g-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := waitDocsBackendRequest(t, reqs)
+	if req.Authorization != "Bearer bot-token" {
+		t.Fatalf("Authorization = %q, want Bearer bot-token (fallback token)", req.Authorization)
+	}
+}
+
 func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	reqStarted := make(chan struct{})
 	unblock := make(chan struct{})
@@ -189,7 +233,7 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 			MountType:   "group",
 			Title:       "Slow",
 			SpaceID:     "space-1",
-		})
+		}, "")
 		close(done)
 	}()
 

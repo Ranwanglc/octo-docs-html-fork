@@ -373,3 +373,29 @@ func TestWipeCommentsAuthorOnly(t *testing.T) {
 		t.Fatalf("superAdmin wipe = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestBotAuthAcceptsTokenHeader verifies bot identity resolves from the octo
+// "token" header (the web/nginx transport, which forwards only `token`, not
+// Authorization: Bearer). Without this, a publish via the reverse proxy fails to
+// resolve the publishing bot, and the docs-backend registration falls back to
+// the process token — the "every html attributed to one bot" bug.
+func TestBotAuthAcceptsTokenHeader(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	h := newTestServer(t, ownerAuthCfg())
+
+	// Publish carrying the bot token in the `token` header (NOT Bearer).
+	rec := do(t, h, http.MethodPost, "/v1/docs",
+		map[string]string{"token": "bot-token", "Content-Type": "application/json"},
+		`{"slug":"docTokHdr","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish via token header = %d; want 200 (bot must resolve from token header): %s", rec.Code, rec.Body.String())
+	}
+
+	// The bot's owner can author it → proves the bot session (creator_uid=owner-1)
+	// was filled from the token-header publish.
+	rec = do(t, h, http.MethodDelete, "/v1/docs/docTokHdr",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner delete = %d; want 200 (token-header publish must stamp creator): %s", rec.Code, rec.Body.String())
+	}
+}

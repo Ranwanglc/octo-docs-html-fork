@@ -66,35 +66,41 @@ func newWithTimeout(registerURL, token string, timeout time.Duration, logger *sl
 	}
 }
 
-// Register POSTs an octo-doc registration.
-func (c *Client) Register(ctx context.Context, reg Registration) {
+// Register POSTs an octo-doc registration. token is the publishing bot's own
+// bearer token: docs-backend reverse-resolves the doc's owner/space from it, so
+// the doc is registered under whoever published it. Empty token falls back to
+// the process-configured token (see doJSON).
+func (c *Client) Register(ctx context.Context, reg Registration, token string) {
 	if c == nil {
 		return
 	}
-	c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register")
+	c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register", token)
 }
 
-// Rename PATCHes the registered title by octo-doc slug.
-func (c *Client) Rename(ctx context.Context, slug, title string) {
+// Rename PATCHes the registered title by octo-doc slug. token is the publishing
+// bot's own bearer token; empty falls back to the process-configured token.
+func (c *Client) Rename(ctx context.Context, slug, title, token string) {
 	if c == nil {
 		return
 	}
-	c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename")
+	c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename", token)
 }
 
-// Delete removes the registered docs-backend row by octo-doc slug.
-func (c *Client) Delete(ctx context.Context, slug string) {
+// Delete removes the registered docs-backend row by octo-doc slug. Delete is
+// by-slug and idempotent, so the caller identity is immaterial; token may be
+// empty (falls back to the process-configured token).
+func (c *Client) Delete(ctx context.Context, slug, token string) {
 	if c == nil {
 		return
 	}
-	c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete")
+	c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token)
 }
 
 func (c *Client) octoDocURL(slug string) string {
 	return c.registerURL + "/octo-doc/" + url.PathEscape(slug)
 }
 
-func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op string) {
+func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -119,7 +125,14 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	// Prefer the publishing bot's own token so docs-backend attributes the doc to
+	// whoever published it; fall back to the process-configured token when the
+	// caller had none (e.g. the by-slug delete path).
+	authToken := token
+	if authToken == "" {
+		authToken = c.token
+	}
+	req.Header.Set("Authorization", "Bearer "+authToken)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

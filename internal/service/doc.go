@@ -34,10 +34,12 @@ type DocService struct {
 
 // DocRegistrar is the docs-backend side-effect sink. Implementations must be
 // nil-safe and best-effort: registration failure must never fail doc writes.
+// The token argument is the publishing bot's own bearer token (empty ⇒ the
+// implementation falls back to its process-configured token).
 type DocRegistrar interface {
-	Register(ctx context.Context, reg docsbackend.Registration)
-	Rename(ctx context.Context, slug, title string)
-	Delete(ctx context.Context, slug string)
+	Register(ctx context.Context, reg docsbackend.Registration, token string)
+	Rename(ctx context.Context, slug, title, token string)
+	Delete(ctx context.Context, slug, token string)
 }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
@@ -99,6 +101,11 @@ type PublishInput struct {
 	// create only (a republish never reassigns ownership). Empty ⇒ no creator
 	// recorded (nobody gets author-by-creator for this doc).
 	CreatorUID string
+
+	// PublisherToken is the publishing bot's own bearer token, forwarded to the
+	// docs-backend registration so the doc is attributed to whoever published it.
+	// Empty ⇒ the registrar falls back to its process-configured token.
+	PublisherToken string
 }
 
 // PublishResult is the result of a successful publish.
@@ -118,6 +125,10 @@ type PublishResult struct {
 	mountType string
 	groupNo   string
 	threadID  string
+
+	// publisherToken carries the publishing bot's own token from PublishInput
+	// into afterPublished so the async registration authenticates as the publisher.
+	publisherToken string
 }
 
 // RenderData is the render payload for a document version.
@@ -204,6 +215,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		mountType:      in.MountType,
 		groupNo:        in.GroupNo,
 		threadID:       in.ThreadID,
+		publisherToken: in.PublisherToken,
 	}, nil
 }
 
@@ -604,9 +616,9 @@ func (s *DocService) afterPublished(result *PublishResult) {
 		if !ok {
 			return
 		}
-		s.register.Register(ctx, reg)
+		s.register.Register(ctx, reg, result.publisherToken)
 		if result.hadMeta && result.titleChanged {
-			s.register.Rename(ctx, result.Slug, reg.Title)
+			s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
 		}
 	}()
 }
@@ -620,8 +632,10 @@ func (s *DocService) afterRemoved(slug string) {
 		defer cancel()
 		// Delete is by slug and idempotent: docs-backend 404s harmlessly if the
 		// slug was never registered. No mount info is needed to unregister, so we
-		// call it unconditionally rather than re-deriving a registration.
-		s.register.Delete(ctx, slug)
+		// call it unconditionally rather than re-deriving a registration. No
+		// publisher token is available on the remove path, so "" falls back to the
+		// process-configured token.
+		s.register.Delete(ctx, slug, "")
 	}()
 }
 
