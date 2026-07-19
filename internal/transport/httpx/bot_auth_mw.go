@@ -27,7 +27,14 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := bearerToken(r)
+		// Read the bot token from either the dedicated "token" header (the octo
+		// client / web+nginx convention) or Authorization: Bearer (CLI/direct).
+		// Using userToken (not bearerToken) is required so a publish arriving via
+		// the web reverse proxy — which forwards only the `token` header — still
+		// resolves the publishing bot's identity; otherwise the docs-backend
+		// registration falls back to the process token and every doc is attributed
+		// to that one bot.
+		token := userToken(r)
 		if token == "" {
 			next.ServeHTTP(w, r)
 			return
