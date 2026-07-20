@@ -135,6 +135,9 @@ type PublishResult struct {
 type RenderData struct {
 	HTML     string
 	Versions []storage.VersionRef
+	// Title is the human title from meta, surfaced so the render handler can seed
+	// window.__ODOC__ with it (else the overlay top bar degrades to the slug).
+	Title string
 }
 
 const docsBackendSideEffectTimeout = 5 * time.Second
@@ -360,10 +363,12 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 		return nil, err
 	}
 	var versions []storage.VersionRef
+	var title string
 	if meta != nil {
 		versions = meta.Versions
+		title = meta.Title
 	}
-	return &RenderData{HTML: html, Versions: versions}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
 }
 
 // VersionList is the response of ListVersions.
@@ -433,10 +438,12 @@ func (s *DocService) GetDraft(ctx context.Context, slug string) (*RenderData, er
 		return nil, err
 	}
 	var versions []storage.VersionRef
+	var title string
 	if meta != nil {
 		versions = meta.Versions
+		title = meta.Title
 	}
-	return &RenderData{HTML: html, Versions: versions}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
 }
 
 // Promote turns the current draft into a new immutable version via the normal

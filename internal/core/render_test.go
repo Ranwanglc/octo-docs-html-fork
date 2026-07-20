@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEscapeHTML(t *testing.T) {
 	cases := map[string]string{
@@ -39,6 +42,28 @@ func TestSafeJSONForScript(t *testing.T) {
 		t.Errorf("expected neutralized %q in %q", want, out2)
 	}
 
+	// HTML end-tag matching is case-insensitive and accepts whitespace/attrs after
+	// `script`. A title payload like `</ScRiPt>` or `</script x>` must NOT survive
+	// as a live close tag, or it breaks out of window.__ODOC__ (XSS). Each `<` that
+	// opens a `</script...` sequence must be escaped to `<\`, preserving case.
+	breakout := map[string]string{
+		"a": "</ScRiPt><img src=x onerror=alert(1)>",
+		"b": "</script x>",
+		"c": "</SCRIPT\t>",
+	}
+	out2b, err := SafeJSONForScript(breakout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No live close tag (case-insensitive) may remain.
+	if idx := strings.Index(strings.ToLower(out2b), "</script"); idx >= 0 {
+		t.Errorf("live </script close tag survived at %d: %q", idx, out2b)
+	}
+	// Case must be preserved after the escaped `<\`.
+	if !contains(out2b, `<\/ScRiPt>`) || !contains(out2b, `<\/script x>`) || !contains(out2b, "<\\/SCRIPT\\t>") {
+		t.Errorf("mixed-case script close not neutralized case-preservingly: %q", out2b)
+	}
+
 	// U+2028/U+2029 must survive as raw code points (matching JS JSON.stringify),
 	// not Go's default \u2028 / \u2029 escaping. See parity trap 4 in docs/PORTING.md.
 	sep := map[string]string{"x": "a\u2028b\u2029c"}
@@ -66,6 +91,20 @@ func TestInjectOverlayCfg(t *testing.T) {
 	if !contains(html, "</script>\n</body></html>") {
 		t.Errorf("injection point wrong: %s", html)
 	}
+	// A non-empty Title must surface in __ODOC__ so the overlay top bar can show
+	// the human title instead of degrading to the slug. Omitted when empty so the
+	// legacy byte output is preserved. Fails before the OverlayConfig.Title field
+	// exists; passes after.
+	if contains(html, `"title":`) {
+		t.Errorf("empty Title must be omitted: %s", html)
+	}
+	titled, err := InjectOverlayCfg("<html><body>hi</body></html>", "x", OverlayConfig{Slug: "tennis", Title: "网球 Tennis", Version: 1, Mode: "published"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(titled, `"title":"网球 Tennis"`) {
+		t.Errorf("human title missing from __ODOC__: %s", titled)
+	}
 
 	// No </body>: append.
 	html2, _ := InjectOverlayCfg("<p>no body</p>", "x", cfg)
@@ -75,16 +114,7 @@ func TestInjectOverlayCfg(t *testing.T) {
 }
 
 func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOfStr(s, sub) >= 0
-}
-
-func indexOfStr(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
+	return strings.Contains(s, sub)
 }
 
 func TestSafeJSONForScriptLiteralEscapeNotCorrupted(t *testing.T) {
