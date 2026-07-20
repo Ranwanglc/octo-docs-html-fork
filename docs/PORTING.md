@@ -91,6 +91,6 @@ does not, and historically excluded U+FEFF). Covered by the stamp Unicode-whites
   uses an atomic counter + high-resolution time. This only affects the uniqueness
   suffix of non-idempotent event ids, never the fold result (`DedupEvents` keys on
   the id; idempotent events keep their deterministic ids).
-- **Storage is PostgreSQL + S3 only.** Metadata lives in `MetadataStore`
-  (pgx/JSONB) and blobs in `BlobStore` (aws-sdk-go-v2). The SQLite+FS
-  reference adapters were not ported.
+- **Storage is a SQL database (PostgreSQL or MySQL) + S3 only.** Metadata lives
+  in `MetadataStore` (pgx/JSONB for postgres, or the MySQL adapter) and blobs in
+  `BlobStore` (aws-sdk-go-v2). The SQLite+FS reference adapters were not ported.

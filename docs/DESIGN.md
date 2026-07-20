@@ -9,7 +9,7 @@ octo-doc makes prompt-native, commentable documents something you host yourself.
 The product is "host an HTML file with comments and versions" — so it ships as a
 single static Go binary that runs anywhere — a $5 VPS, a homelab box, a container
 platform — with `docker compose up -d` or a one-file `octo-doc serve`, backed by
-PostgreSQL and any S3-compatible object store you already run.
+PostgreSQL or MySQL and any S3-compatible object store you already run.
 
 ## Runtime & framework selection
 
@@ -75,7 +75,7 @@ BlobStore       immutable HTML keyed by (slug, version)
 ```
 
 octo-doc has exactly **two required backends behind these two interfaces**:
-PostgreSQL for `MetadataStore` and an S3-compatible object store for `BlobStore`.
+PostgreSQL or MySQL for `MetadataStore` and an S3-compatible object store for `BlobStore`.
 There is no single-node fallback — this metadata/blob split is the supported
 topology everywhere, which keeps the production path and the local-development
 path (Postgres + MinIO) identical. The in-memory store exists only to make
@@ -105,13 +105,16 @@ Single-instance is the documented, supported default.
 
 ## Backup & restore
 
-Two backends, two backup streams — metadata in Postgres, blobs in the bucket:
+Two backends, two backup streams — metadata in the SQL database (Postgres or
+MySQL), blobs in the bucket:
 
 ```bash
-pg_dump "$DATABASE_URL" > octo-doc.sql           # metadata + comments
+# metadata + comments — use the tool matching your STORAGE_DRIVER:
+pg_dump "$DATABASE_URL" > octo-doc.sql            # postgres
+# mysqldump --single-transaction <db> > octo-doc.sql   # mysql
 # Blobs live in the S3 bucket; use S3 versioning + lifecycle rules for retention,
 # or `aws s3 sync s3://$S3_BUCKET ./backup/blobs` for a cold copy.
-# Restore: psql < octo-doc.sql, then sync blobs back into the bucket.
+# Restore: psql < octo-doc.sql (or mysql < octo-doc.sql), then sync blobs back.
 ```
 
 S3 lifecycle policy is the recommended way to cap blob growth: e.g. transition
