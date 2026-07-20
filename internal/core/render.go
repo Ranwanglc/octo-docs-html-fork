@@ -33,6 +33,15 @@ type OverlayConfig struct {
 	// hosts allowed to iframe us are the hosts whose octo:init handshake we accept.
 	// Empty ⇒ never accept a handshake (stand-alone deploy).
 	HostOrigins []string `json:"hostOrigins,omitempty"`
+	// CreatorUID / CreatorName / CreatedAt surface authorship + creation time for
+	// display only (OCT-179). Authorship still resolves via __ODOC_CAP__.isAuthor;
+	// never derive it from creator_uid. omitempty keeps legacy __ODOC__ bytes for
+	// docs without a stamped creator or a draft without any published version.
+	// CreatorName is a reserved slot — backend does not fill it yet; the frontend
+	// falls back to CreatorUID when absent.
+	CreatorUID  string `json:"creator_uid,omitempty"`
+	CreatorName string `json:"creator_name,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"` // RFC3339, from Versions[0].Created
 }
 
 // VersionRef is one entry in the overlay's version picker.

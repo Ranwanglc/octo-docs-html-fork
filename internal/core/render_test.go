@@ -156,3 +156,56 @@ func TestOverlayConfigHostOrigins(t *testing.T) {
 		t.Errorf("empty HostOrigins should be omitted, got %q", out2)
 	}
 }
+
+// TestOverlayConfigCreatorFields covers the OCT-179 wire contract: creator_uid,
+// creator_name, and created_at serialize as snake_case and are omitted when
+// empty so legacy docs (no stamped creator, or a draft with no version yet) keep
+// the old __ODOC__ byte output. Written against SafeJSONForScript(cfg) — the
+// same substring-matching pattern TestOverlayConfigHostOrigins uses — so each
+// field can be asserted positively and negatively without noise from unrelated
+// InjectOverlayCfg wrapping.
+func TestOverlayConfigCreatorFields(t *testing.T) {
+	// Empty case: none of the three keys may appear in the payload.
+	empty := OverlayConfig{Slug: "s", Version: 1, Mode: "published"}
+	out, err := SafeJSONForScript(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"creator_uid", "creator_name", "created_at"} {
+		if contains(out, key) {
+			t.Errorf("empty %s should be omitted, got %q", key, out)
+		}
+	}
+
+	// CreatorUID + CreatedAt: keys and values both surface.
+	cfg := OverlayConfig{
+		Slug:       "s",
+		Version:    1,
+		Mode:       "published",
+		CreatorUID: "u-abc",
+		CreatedAt:  "2026-07-20T11:00:00Z",
+	}
+	out, err = SafeJSONForScript(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(out, `"creator_uid":"u-abc"`) {
+		t.Errorf("creator_uid missing: %q", out)
+	}
+	if !contains(out, `"created_at":"2026-07-20T11:00:00Z"`) {
+		t.Errorf("created_at missing: %q", out)
+	}
+	if contains(out, "creator_name") {
+		t.Errorf("empty CreatorName should be omitted, got %q", out)
+	}
+
+	// CreatorName reserved slot: filled independently to prove the field is wired.
+	cfg2 := OverlayConfig{Slug: "s", Version: 1, Mode: "published", CreatorName: "张三"}
+	out2, err := SafeJSONForScript(cfg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(out2, `"creator_name":"张三"`) {
+		t.Errorf("creator_name missing: %q", out2)
+	}
+}

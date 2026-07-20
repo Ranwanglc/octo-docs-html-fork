@@ -138,6 +138,13 @@ type RenderData struct {
 	// Title is the human title from meta, surfaced so the render handler can seed
 	// window.__ODOC__ with it (else the overlay top bar degrades to the slug).
 	Title string
+	// CreatorUID / CreatedAt surface authorship + creation time to the overlay
+	// (OCT-179). CreatorUID comes from meta.CreatorUID() (may be "" for legacy
+	// docs). CreatedAt is Versions[0].Created — the first published version's
+	// timestamp, "" for a draft with no version yet. Both flow to OverlayConfig
+	// via the render handlers; both are display-only, not authorship signals.
+	CreatorUID string
+	CreatedAt  string
 }
 
 const docsBackendSideEffectTimeout = 5 * time.Second
@@ -363,12 +370,16 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 		return nil, err
 	}
 	var versions []storage.VersionRef
-	var title string
+	var title, creatorUID, createdAt string
 	if meta != nil {
 		versions = meta.Versions
 		title = meta.Title
+		creatorUID = meta.CreatorUID()
+		if len(meta.Versions) > 0 && meta.Versions[0].Created != nil {
+			createdAt = *meta.Versions[0].Created
+		}
 	}
-	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: title, CreatorUID: creatorUID, CreatedAt: createdAt}, nil
 }
 
 // VersionList is the response of ListVersions.
@@ -438,12 +449,16 @@ func (s *DocService) GetDraft(ctx context.Context, slug string) (*RenderData, er
 		return nil, err
 	}
 	var versions []storage.VersionRef
-	var title string
+	var title, creatorUID, createdAt string
 	if meta != nil {
 		versions = meta.Versions
 		title = meta.Title
+		creatorUID = meta.CreatorUID()
+		if len(meta.Versions) > 0 && meta.Versions[0].Created != nil {
+			createdAt = *meta.Versions[0].Created
+		}
 	}
-	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: title, CreatorUID: creatorUID, CreatedAt: createdAt}, nil
 }
 
 // Promote turns the current draft into a new immutable version via the normal

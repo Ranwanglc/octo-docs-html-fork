@@ -229,6 +229,8 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 		Mode:           "draft",
 		Versions:       toVersionRefs(data.Versions, 0),
 		HostOrigins:    s.cfg.HostOrigins,
+		CreatorUID:     data.CreatorUID,
+		CreatedAt:      data.CreatedAt,
 	})
 	if err != nil {
 		return err
@@ -381,6 +383,8 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 		Mode:           "published",
 		Versions:       versions,
 		HostOrigins:    s.cfg.HostOrigins,
+		CreatorUID:     data.CreatorUID,
+		CreatedAt:      data.CreatedAt,
 	})
 	if err != nil {
 		return err
