@@ -205,18 +205,36 @@ func TestGetUserPrefersServiceToken(t *testing.T) {
 	srv := newStub(t, map[string]http.HandlerFunc{
 		"GET /v1/users/u9": func(w http.ResponseWriter, r *http.Request) {
 			seen = r.Header.Get("token")
-			_, _ = io.WriteString(w, `{"uid":"u9","name":"Bob","avatar":"x.png","role":"member"}`)
+			_, _ = io.WriteString(w, `{"uid":"u9","name":"Bob","role":"member","is_upload_avatar":1,"avatar_version":3}`)
 		},
 	})
 	defer srv.Close()
 
 	id := octoidentity.New(srv.URL, "svc-tok", time.Second)
 	u, err := id.GetUser(context.Background(), "u9", "caller-tok")
-	if err != nil || u == nil || u.UID != "u9" || u.Avatar != "x.png" {
-		t.Fatalf("user = %+v, err = %v", u, err)
+	wantAvatar := srv.URL + "/v1/users/u9/avatar?v=3"
+	if err != nil || u == nil || u.UID != "u9" || u.Avatar != wantAvatar {
+		t.Fatalf("user = %+v, err = %v; want Avatar = %q", u, err, wantAvatar)
 	}
 	if seen != "svc-tok" {
 		t.Fatalf("service token not sent: got %q", seen)
+	}
+}
+
+// TestGetUserNoUploadedAvatar 守死回归门槛: is_upload_avatar==0 时 Avatar 必须为空,
+// 让前端走 fallback (initial chip / avatarUrlFromUid) 而非发一次空 URL 请求.
+func TestGetUserNoUploadedAvatar(t *testing.T) {
+	srv := newStub(t, map[string]http.HandlerFunc{
+		"GET /v1/users/u9": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"uid":"u9","name":"Bob","role":"member","is_upload_avatar":0,"avatar_version":0}`)
+		},
+	})
+	defer srv.Close()
+
+	id := octoidentity.New(srv.URL, "", time.Second)
+	u, err := id.GetUser(context.Background(), "u9", "caller-tok")
+	if err != nil || u == nil || u.UID != "u9" || u.Avatar != "" {
+		t.Fatalf("no-upload user = %+v, err = %v; want empty Avatar", u, err)
 	}
 }
 

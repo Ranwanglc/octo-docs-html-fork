@@ -14,6 +14,9 @@ import (
 // CreatorUID through octoidentity and stamps the returned Name/Avatar into
 // __ODOC__ as creator_name / creator_avatar. VerifyToken/VerifyBot go
 // unimplemented — no auth is exercised in these tests.
+//
+// 上游 URL 拼装契约 (is_upload_avatar + avatar_version → /v1/users/:uid/avatar?v=N)
+// 由 octoidentity_test.go 覆盖; 本文件只验证 Identity 给的 Avatar URL 能透传进 __ODOC__.
 type creatorStub struct {
 	name       string
 	avatar     string

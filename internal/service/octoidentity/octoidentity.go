@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -175,10 +176,11 @@ func (h *HTTPIdentity) VerifyBot(ctx context.Context, botToken string) (*BotIden
 }
 
 type userBody struct {
-	UID    string `json:"uid"`
-	Name   string `json:"name"`
-	Avatar string `json:"avatar"`
-	Role   string `json:"role"`
+	UID            string `json:"uid"`
+	Name           string `json:"name"`
+	Role           string `json:"role"`
+	IsUploadAvatar int    `json:"is_upload_avatar"`
+	AvatarVersion  int64  `json:"avatar_version"`
 }
 
 // GetUser → GET /v1/users/{uid}. octo-server requires auth on that route, so
@@ -217,7 +219,11 @@ func (h *HTTPIdentity) GetUser(ctx context.Context, uid, callerToken string) (*U
 	if body.UID == "" {
 		return nil, nil
 	}
-	return &User{UID: body.UID, Name: body.Name, Avatar: body.Avatar, Role: body.Role}, nil
+	var avatar string
+	if body.IsUploadAvatar == 1 {
+		avatar = fmt.Sprintf("%s/v1/users/%s/avatar?v=%d", h.baseURL, body.UID, body.AvatarVersion)
+	}
+	return &User{UID: body.UID, Name: body.Name, Avatar: avatar, Role: body.Role}, nil
 }
 
 // ErrDisabled is returned by Get when no provider has been configured. Callers
