@@ -8,6 +8,11 @@
 # host, but bundles its OWN MySQL + MinIO so a brand-new environment comes up with
 # one command and no pre-existing octo services.
 #
+# ⚠ SHARED DATABASE: the bundled MySQL here must ALSO be the database docs-backend
+# uses (doc_meta / doc_member are shared tables; reader grants are mirrored into
+# doc_member via direct SQL). If docs-backend runs against a different MySQL, point
+# both at the same one — a separate DB silently breaks reader access.
+#
 # Usage (fresh environment, one command):
 #   cp deploy/.env.example deploy/.env
 #   # edit deploy/.env — fill secrets + OCTO_SERVER_BASE_URL / DOCS_BACKEND_* if used

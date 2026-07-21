@@ -1,7 +1,7 @@
 # octo-doc — agent guide
 
 Self-hosted, prompt-native interactive HTML docs with versioning + anchored
-comments. **Go 1.26**, chi router, PostgreSQL + S3-compatible storage. Full design
+comments. **Go 1.26**, chi router, PostgreSQL or MySQL + S3-compatible storage. Full design
 in `docs/ARCHITECTURE.md` / `docs/DESIGN.md`; the TS→Go port strategy is in
 `docs/PORTING.md`.
 
@@ -60,8 +60,9 @@ dependency-free leaf and `platform` as cross-cutting support.
   the pinned expectations in the corresponding `_test.go`.
 - **`overlay.js` is the single source of truth**, embedded with `go:embed` in
   `assets/`. It is browser code — never reformat or transpile it.
-- **Storage is PostgreSQL + S3 only.** There is no embedded/sqlite fallback. The
-  two interfaces live in `internal/storage`; keep adapters behind them.
+- **Storage is a SQL database (PostgreSQL or MySQL) + S3 only.** There is no
+  embedded/sqlite fallback; `STORAGE_DRIVER` selects postgres (default) or mysql.
+  The two interfaces live in `internal/storage`; keep adapters behind them.
 - **`golangci-lint` must pass with 0 issues** (`make lint`). Exported symbols
   need doc comments; unchecked errors and unclosed bodies are flagged.
 - Use Conventional Commit subjects (lowercase, e.g. `fix: …`).

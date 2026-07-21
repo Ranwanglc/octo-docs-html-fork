@@ -3,7 +3,7 @@
 octo-doc is a self-hosted, prompt-native interactive document server that
 preserves the document model, URL scheme, and comment semantics of its original
 TypeScript implementation byte-for-byte. It is written in Go 1.26 and ships as a
-single static binary backed by PostgreSQL (metadata) and an S3-compatible object
+single static binary backed by PostgreSQL or MySQL (metadata) and an S3-compatible object
 store (blobs).
 
 ## System shape
@@ -52,7 +52,7 @@ are no import cycles.
 | Concern | Backend |
 | ------- | ------- |
 | Immutable version HTML + the mutable draft slot | `BlobStore` → S3-compatible (S3 / MinIO) |
-| Doc metadata, comments, sessions | `MetadataStore` → PostgreSQL (pgx) |
+| Doc metadata, comments, sessions | `MetadataStore` → PostgreSQL (pgx) or MySQL |
 | Per-slug write serialization | in-process keyed mutex (`internal/platform/sluglock`) |
 | Author auth | `WRITE_TOKEN` env, or a `/v1/admin/bootstrap` token |
 | Overlay delivery | `assets/overlay.js` embedded via `go:embed` |

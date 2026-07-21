@@ -37,11 +37,17 @@ services:
       # container (an env-file only supplies interpolation, not passthrough).
       LOGIN_ENABLED: ${LOGIN_ENABLED:-false}
       OCTO_SERVER_BASE_URL: ${OCTO_SERVER_BASE_URL:-}
+      # octo-server OpenAPI base for user-info lookups; empty falls back to OCTO_SERVER_BASE_URL.
+      OCTO_OPENAPI_URL: ${OCTO_OPENAPI_URL:-}
       BOT_AUTH_ENABLED: ${BOT_AUTH_ENABLED:-false}
       OCTO_DOC_BINDING_URL: ${OCTO_DOC_BINDING_URL:-}
       ASSET_SIGNING_SECRET: ${ASSET_SIGNING_SECRET:-}
       DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
       DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
+      # NOTE: this database must be the SAME one docs-backend uses — doc_meta /
+      # doc_member are shared tables. On a reader grant doc-app writes doc_member
+      # in this DB directly (the mirror, not HTTP); docs-backend's preflight reads
+      # the same table. Pointing doc-app at a separate DB breaks reader access.
       DATABASE_URL: postgres://${PG_USER:-octo}:${PG_PASSWORD:-octo}@postgres:5432/${PG_DB:-octodoc}
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: ${S3_BUCKET:-octo-doc}
@@ -49,6 +55,8 @@ services:
       S3_FORCE_PATH_STYLE: "1"
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      # Object-key namespace so one bucket can hold multiple envs. Empty = bucket root.
+      S3_PREFIX: ${S3_PREFIX:-}
     ports:
       - "8080:8080"
     healthcheck:

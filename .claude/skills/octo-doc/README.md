@@ -6,7 +6,7 @@ document, publishes it to your self-hosted octo-doc server over the `/v1` HTTP
 API, shares it with text- and artifact-anchored inline commenting, and iterates it
 from those comments.
 
-octo-doc is an **API-only** server (Go + PostgreSQL + S3-compatible storage). This
+octo-doc is an **API-only** server (Go + PostgreSQL/MySQL + S3-compatible storage). This
 skill drives that API — there is no compiled client binary. `scripts/octo.sh`
 (bash + curl + jq) is a thin convenience wrapper over the endpoints; the raw
 contract is in `references/api.md`.

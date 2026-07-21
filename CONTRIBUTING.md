@@ -19,7 +19,7 @@ By participating, you agree to abide by our
 cmd/octo-doc/        entrypoint: serve | migrate | bootstrap | health
 internal/core/       dependency-free domain kernel (byte-equivalent port)
 internal/service/    application logic (doc, comment, auth)
-internal/storage/    MetadataStore + BlobStore (postgres, s3, memory)
+internal/storage/    MetadataStore + BlobStore (postgres, mysql, s3, memory)
 internal/transport/  HTTP layer (chi router, handlers, middleware)
 internal/platform/   cross-cutting: config, logging, typed errors, sluglock
 assets/              overlay.js (embedded via go:embed)
