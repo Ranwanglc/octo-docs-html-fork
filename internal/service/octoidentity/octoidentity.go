@@ -180,7 +180,6 @@ type userBody struct {
 	Name           string `json:"name"`
 	Role           string `json:"role"`
 	IsUploadAvatar int    `json:"is_upload_avatar"`
-	AvatarVersion  int64  `json:"avatar_version"`
 }
 
 // GetUser → GET /v1/users/{uid}. octo-server requires auth on that route, so
@@ -219,9 +218,11 @@ func (h *HTTPIdentity) GetUser(ctx context.Context, uid, callerToken string) (*U
 	if body.UID == "" {
 		return nil, nil
 	}
+	// avatar_version 未随 /v1/users/:uid 下发, /v1/users/:uid/avatar 也不认 ?v=
+	// query, 故不带 cache-bust; 待上游补该字段并让 avatar 端点认 ?v 后再对齐.
 	var avatar string
 	if body.IsUploadAvatar == 1 {
-		avatar = fmt.Sprintf("%s/v1/users/%s/avatar?v=%d", h.baseURL, body.UID, body.AvatarVersion)
+		avatar = fmt.Sprintf("%s/v1/users/%s/avatar", h.baseURL, body.UID)
 	}
 	return &User{UID: body.UID, Name: body.Name, Avatar: avatar, Role: body.Role}, nil
 }
