@@ -76,7 +76,13 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 	// /v1/auth/login returns 404 and LoginEnabled stays off (unless the legacy
 	// LOGIN_ENABLED flag is set for the reverse-proxy path).
 	if cfg.OctoServerBaseURL != "" {
-		octoidentity.Set(octoidentity.New(cfg.OctoServerBaseURL, cfg.OctoServiceToken, cfg.IOTimeout))
+		// LRU/TTL cache in front of the HTTP client so the render hot path (which
+		// calls GetUser for every doc view to resolve creator_name / creator_avatar,
+		// OCT-187) doesn't round-trip octo-server per request. TTL is short enough
+		// that a bot rename/avatar change surfaces within a minute; the ceiling caps
+		// memory across many distinct bots.
+		base := octoidentity.New(cfg.OctoServerBaseURL, cfg.OctoServiceToken, cfg.IOTimeout)
+		octoidentity.Set(octoidentity.NewCachingIdentity(base, 60*time.Second, 1024))
 	}
 	// FEAT-3 doc_binding channel. The probe only fires when an octo session is
 	// also present (see capability.go), so leaving the URL set on a doc host

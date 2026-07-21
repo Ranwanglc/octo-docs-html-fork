@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
@@ -219,6 +220,7 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	}
 	// Draft mode: the overlay shows a Publish affordance (promote) instead of
 	// Share/Fork. Version 0 signals "not yet a committed version".
+	creatorName, creatorAvatar := resolveCreatorDisplay(r.Context(), data.CreatorUID, userToken(r))
 	html, err := core.InjectOverlayCfg(data.HTML, s.overlayJS, core.OverlayConfig{
 		Slug:           slug,
 		Title:          data.Title,
@@ -230,6 +232,8 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 		Versions:       toVersionRefs(data.Versions, 0),
 		HostOrigins:    s.cfg.HostOrigins,
 		CreatorUID:     data.CreatorUID,
+		CreatorName:    creatorName,
+		CreatorAvatar:  creatorAvatar,
 		CreatedAt:      data.CreatedAt,
 	})
 	if err != nil {
@@ -373,6 +377,7 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	// Sign inline asset URLs so the browser's native <img> loads (which carry no
 	// token header) are authorized by a per-asset signature — see signAssetURLs.
 	signedHTML := s.signAssetURLs(slug, data.HTML)
+	creatorName, creatorAvatar := resolveCreatorDisplay(r.Context(), data.CreatorUID, userToken(r))
 	html, err := core.InjectOverlayCfg(signedHTML, s.overlayJS, core.OverlayConfig{
 		Slug:           slug,
 		Title:          data.Title,
@@ -384,6 +389,8 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 		Versions:       versions,
 		HostOrigins:    s.cfg.HostOrigins,
 		CreatorUID:     data.CreatorUID,
+		CreatorName:    creatorName,
+		CreatorAvatar:  creatorAvatar,
 		CreatedAt:      data.CreatedAt,
 	})
 	if err != nil {
@@ -415,6 +422,27 @@ func (s *Server) resolveVersionParam(ctx context.Context, slug, raw string) (int
 		return 0, apperr.NotFound("")
 	}
 	return version, nil
+}
+
+// resolveCreatorDisplay looks CreatorUID up through the process octoidentity
+// provider and returns (name, avatar) for the overlay. Fail-soft: no provider
+// (ErrDisabled), empty uid, upstream error, or empty fields all fold to empty
+// strings so the render path never blocks on the identity server — omitempty on
+// OverlayConfig then keeps the wire bytes clean and the frontend falls back to
+// the raw uid.
+func resolveCreatorDisplay(ctx context.Context, uid, callerToken string) (name, avatar string) {
+	if uid == "" {
+		return "", ""
+	}
+	provider, err := octoidentity.Get()
+	if err != nil || provider == nil {
+		return "", ""
+	}
+	u, err := provider.GetUser(ctx, uid, callerToken)
+	if err != nil || u == nil {
+		return "", ""
+	}
+	return u.Name, u.Avatar
 }
 
 // injectCapMarker adds window.__ODOC_CAP__ before the overlay script so the
