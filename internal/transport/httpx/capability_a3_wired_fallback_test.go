@@ -184,3 +184,61 @@ func seedLegacyReaderGrant(t *testing.T, store *memory.Store, slug, uid string) 
 		t.Fatalf("seed write: %v", err)
 	}
 }
+
+// yujiawei round-3 P1b end-to-end revoke-bypass regression. Mirrors his
+// HTTP repro from the round-3 review: an M2-migrated reader has BOTH a
+// doc_member row AND a stale meta.grants[uid] entry (M2 copies, does not
+// delete). A DELETE /grants/{uid} used to remove the doc_member row but
+// leave meta.grants alone; the next read fell through the wired probe
+// (ok=false, docRegistered=true) to legacy meta.GrantRole and still
+// returned CapReader — the revoke was silent no-op = revoke bypass.
+//
+// With the P1a/P1b fix, docRegistered=true blocks the meta fallback and
+// the post-revoke read is 404. This is the "safety property" test.
+func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
+	mirror := &stubMirror{slugToDoc: map[string]string{"docM": "dM"}}
+	h, store := newServerWithMirrorAndBotAuth(t, mirror)
+
+	// Owner publishes; creator_uid = owner-42.
+	rec := do(t, h, http.MethodPost, "/v1/docs",
+		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
+		`{"slug":"docM","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Owner grants reader-9 (writes doc_member).
+	rec = do(t, h, http.MethodPut, "/v1/docs/docM/grants",
+		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
+		`{"uid":"reader-9","role":"reader"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grant = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Simulate M2: the migration copied the same grant into meta.grants and
+	// never deleted the source. Plant that stale entry now.
+	seedLegacyReaderGrant(t, store, "docM", "reader-9")
+
+	// Pre-revoke sanity: reader-9 can read.
+	rec = do(t, h, http.MethodGet, "/d/docM/v/1",
+		map[string]string{octoUIDHeaderName: "reader-9"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-revoke read = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// Owner revokes. doc_member row is deleted; meta.grants[reader-9] lingers.
+	rec = do(t, h, http.MethodDelete, "/v1/docs/docM/grants/reader-9",
+		map[string]string{octoUIDHeaderName: "owner-42"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("revoke = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// Post-revoke: A4 wired returns docRegistered=true, ok=false; fallback
+	// disabled; meta.grants[reader-9] IGNORED; render 404. Pre-fix this was
+	// still 200 and the revoke was a silent no-op.
+	rec = do(t, h, http.MethodGet, "/d/docM/v/1",
+		map[string]string{octoUIDHeaderName: "reader-9"}, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("post-revoke read = %d; want 404 (revoke bypass closed): %s", rec.Code, rec.Body.String())
+	}
+}
