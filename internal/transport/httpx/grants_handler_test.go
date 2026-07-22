@@ -1,11 +1,13 @@
 package httpx_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // doc_grants: an author can list/grant/revoke per-uid access; a granted uid
@@ -238,5 +240,75 @@ func TestListGrantsWiredNoCreatorDup(t *testing.T) {
 	}
 	if !friend {
 		t.Fatalf("friend reader row missing: %+v", body.Data.Items)
+	}
+}
+
+// yujiawei round-3 P3: legacyListGrantsFromMeta must skip the creator uid.
+// The wired path already dedupes (P2-B), and the handler always synthesises
+// the creator row; on the unwired path we used to iterate meta.grants
+// blindly, so a stray meta.grants[creator]=... entry would surface as a
+// second "creator" row (once as author/owner, once as reader/direct).
+// Seed that state via the store and verify the API response has exactly one
+// creator row.
+func TestListGrantsLegacyMetaSkipsCreator(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	h, store := newTestServerWithStore(t, ownerAuthCfg())
+	publishAsBot(t, h, "docLegacy") // creator_uid = owner-1 (unwired path)
+
+	// Plant a stray meta.grants[owner-1]=reader (M2 leftover / bad data / test).
+	ctx := context.Background()
+	meta, err := store.GetMeta(ctx, "docLegacy")
+	if err != nil || meta == nil {
+		t.Fatalf("seed lookup: meta=%v err=%v", meta, err)
+	}
+	extra := map[string]any{}
+	for k, v := range meta.Extra {
+		extra[k] = v
+	}
+	grants, _ := extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants seed for P3 test
+	if grants == nil {
+		grants = map[string]any{}
+	}
+	grants["owner-1"] = map[string]any{"role": "reader"}
+	grants["friend-1"] = map[string]any{"role": "reader"}
+	extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants seed for P3 test
+	if err := store.PutMeta(ctx, "docLegacy", storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, "/v1/docs/docLegacy/grants",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Items []struct {
+				UID    string `json:"uid"`
+				Role   string `json:"role"`
+				Source string `json:"source"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	creatorRows := 0
+	for _, it := range body.Data.Items {
+		if it.UID == "owner-1" {
+			creatorRows++
+		}
+	}
+	if creatorRows != 1 {
+		t.Fatalf("creator rows on unwired path = %d; want 1 (legacyListGrantsFromMeta must skip creator): %+v", creatorRows, body.Data.Items)
+	}
+	friend := false
+	for _, it := range body.Data.Items {
+		if it.UID == "friend-1" && it.Role == "reader" && it.Source == "direct" {
+			friend = true
+		}
+	}
+	if !friend {
+		t.Fatalf("friend row missing: %+v", body.Data.Items)
 	}
 }

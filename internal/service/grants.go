@@ -49,7 +49,7 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 		return nil, apperr.NotFound("no such doc: " + slug)
 	}
 	if s.docMembers == nil {
-		return legacyListGrantsFromMeta(meta), nil
+		return legacyListGrantsFromMeta(meta, meta.CreatorUID()), nil
 	}
 	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
 	if err != nil {
@@ -58,7 +58,7 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 	if !ok {
 		// No rich-doc row yet; fall back to meta so ListGrants stays useful
 		// during the moment between publish and mirror registration.
-		return legacyListGrantsFromMeta(meta), nil
+		return legacyListGrantsFromMeta(meta, meta.CreatorUID()), nil
 	}
 	members, err := s.docMembers.ListMembers(ctx, docID)
 	if err != nil {
@@ -77,13 +77,20 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 
 // legacyListGrantsFromMeta reads the pre-plan③ meta.grants map. Used only in
 // the mirror-unwired fallback path so single-node deploys keep working.
-func legacyListGrantsFromMeta(meta *storage.DocMeta) map[string]string {
+//
+// yujiawei round-3 P3: skip the creator uid so the caller (handler
+// synthesises the "author"/"owner" row) does not receive a duplicate row on
+// the unwired path — mirrors the wired-side dedup in ListGrants above.
+func legacyListGrantsFromMeta(meta *storage.DocMeta, creator string) map[string]string {
 	out := map[string]string{}
 	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 	if !ok {
 		return out
 	}
 	for uid, v := range grants {
+		if creator != "" && uid == creator {
+			continue
+		}
 		if entry, ok := v.(map[string]any); ok {
 			if role, ok := entry["role"].(string); ok {
 				out[uid] = role
