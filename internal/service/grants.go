@@ -133,6 +133,14 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 // addGrantToDocMember is the plan③ A6 primary path. UpsertDirectGrant is
 // idempotent — repeated calls for the same (docID,uid,role) update
 // updated_at only, no duplicate row.
+//
+// yujiawei P1-B: probe RoleByDocUID first and refuse reader-grants that would
+// silently downgrade an admin (role=3) or the creator uid. UpsertDirectGrant
+// runs ON DUPLICATE KEY UPDATE role=VALUES(role), so a naive reader upsert on
+// an existing admin row would clobber it — and once A1 flips creator_uid to
+// the bot, the owner's author is nothing but their doc_member admin row.
+// One reader grant would demote them. Idempotent reader→reader is a no-op
+// (no permission_epoch bump).
 func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grantedBy string) error {
 	// Existence check via meta so we still 404 on a bogus slug (rich-doc
 	// mirror only knows registered docs).
@@ -143,12 +151,27 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 	if meta == nil {
 		return apperr.NotFound("no such doc: " + slug)
 	}
+	if creator := meta.CreatorUID(); creator != "" && creator == uid {
+		return ErrGrantProtected
+	}
 	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return apperr.NotFound("doc has no rich-doc registration yet: " + slug)
+	}
+	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if role == DocMemberRoleAdmin {
+			return ErrGrantProtected
+		}
+		if role >= DocMemberRoleReader {
+			return nil // already reader (or higher-that-is-not-admin); no-op, no epoch bump
+		}
 	}
 	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy)
 }

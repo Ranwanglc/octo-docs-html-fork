@@ -197,12 +197,18 @@ func TestRemoveAbsentGrantSkipsMirror(t *testing.T) {
 // direct grants, so a mirror write error must surface to the caller instead
 // of being swallowed (silent divergence between what the API reports and
 // what the auth layer will read on the next request).
+//
+// P1-B changed AddGrant to no-op when uid is already reader (idempotent), so
+// this test exercises the write path with a fresh uid and a pre-seeded uid
+// separately: AddGrant on a new uid triggers upsert (surfaces error), and
+// RemoveGrant on a reader still calls DeleteGrant (surfaces error).
 func TestGrantMirrorErrorsSurface(t *testing.T) {
 	svc, slug := newGrantSvc(t)
 	svc.WithDocMemberMirror(&fakeDocMemberMirror{err: errors.New("mirror down"), roles: map[string]int{"u1": 1}})
 	ctx := context.Background()
 
-	if err := svc.AddGrant(ctx, slug, "u1", "reader", "owner"); err == nil {
+	// Fresh uid → probe misses → upsert runs → mirror error surfaces.
+	if err := svc.AddGrant(ctx, slug, "fresh-uid", "reader", "owner"); err == nil {
 		t.Fatalf("AddGrant with mirror error = nil; want error")
 	}
 	if err := svc.RemoveGrant(ctx, slug, "u1"); err == nil {
@@ -401,5 +407,74 @@ func TestListGrantsSurfacesCreatorWhenMirrorEmpty(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("grants = %v; want just the creator", got)
+	}
+}
+
+
+// A6+P1-B: AddGrant refuses to downgrade a doc_member admin (role=3) to
+// reader. UpsertDirectGrant would otherwise clobber the admin row via
+// ON DUPLICATE KEY UPDATE — after Stage 5 A1 this is the owner's only author
+// signal, so the protection is a hard prerequisite.
+func TestAddGrantRefusesDowngradeAdmin(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	mirror := &fakeDocMemberMirror{
+		docID: "doc-A",
+		roles: map[string]int{"owner-uid": service.DocMemberRoleAdmin},
+	}
+	svc.WithDocMemberMirror(mirror)
+	ctx := context.Background()
+
+	if err := svc.AddGrant(ctx, slug, "owner-uid", "reader", "someone"); !errors.Is(err, service.ErrGrantProtected) {
+		t.Fatalf("AddGrant(admin) = %v; want ErrGrantProtected", err)
+	}
+	// Admin row untouched — no upsert call recorded.
+	for _, c := range mirror.calls {
+		if c.op == "upsert" && c.uid == "owner-uid" {
+			t.Fatalf("admin row was upserted: %+v", c)
+		}
+	}
+	if mirror.roles["owner-uid"] != service.DocMemberRoleAdmin {
+		t.Fatalf("admin role after refused downgrade = %d; want %d", mirror.roles["owner-uid"], service.DocMemberRoleAdmin)
+	}
+}
+
+// A6+P1-B: AddGrant refuses to write a reader row on the creator uid. The
+// creator's author identity flows from meta.creator_uid + doc_member admin,
+// never from a reader grant, so a reader row on the creator is nonsensical
+// and would either land as a duplicate or (after A1) demote the owner.
+func TestAddGrantRefusesCreator(t *testing.T) {
+	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
+	mirror := &fakeDocMemberMirror{docID: "doc-A"}
+	svc.WithDocMemberMirror(mirror)
+	ctx := context.Background()
+
+	if err := svc.AddGrant(ctx, slug, "creator-uid", "reader", "someone"); !errors.Is(err, service.ErrGrantProtected) {
+		t.Fatalf("AddGrant(creator) = %v; want ErrGrantProtected", err)
+	}
+	if len(mirror.calls) != 0 {
+		t.Fatalf("creator refuse should not touch mirror; calls=%+v", mirror.calls)
+	}
+}
+
+// A6+P1-B: AddGrant on a uid that is already a reader is a no-op — no
+// duplicate upsert and no permission_epoch bump. Guards against churn when
+// the UI resends the same grant on save.
+func TestAddGrantIdempotentReaderNoEpochBump(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	mirror := &fakeDocMemberMirror{
+		docID: "doc-A",
+		roles: map[string]int{"reader-uid": service.DocMemberRoleReader},
+	}
+	svc.WithDocMemberMirror(mirror)
+	ctx := context.Background()
+
+	if err := svc.AddGrant(ctx, slug, "reader-uid", "reader", "owner"); err != nil {
+		t.Fatalf("AddGrant(existing reader): %v", err)
+	}
+	if len(mirror.calls) != 0 {
+		t.Fatalf("idempotent reader path should not touch mirror; calls=%+v", mirror.calls)
+	}
+	if mirror.roles["reader-uid"] != service.DocMemberRoleReader {
+		t.Fatalf("reader role changed: %d", mirror.roles["reader-uid"])
 	}
 }
