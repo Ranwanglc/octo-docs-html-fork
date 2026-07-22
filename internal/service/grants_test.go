@@ -362,10 +362,12 @@ func TestRemoveGrantRevokesReader(t *testing.T) {
 	}
 }
 
-// A6: ListGrants surfaces the creator row + every doc_member row without
-// duplicating the creator when M1 has already backfilled an admin row for
-// that uid — the doc_member row wins.
-func TestListGrantsSurfacesCreatorAndMembers(t *testing.T) {
+// P2-B: ListGrants drops the creator row from the wired path. The HTTP
+// handler synthesises the leading {creator, "author", "owner"} entry itself,
+// so surfacing the same uid here caused a duplicate row in the UI that
+// rendered as a deletable grant (and 409-ed on click). Only non-creator
+// members should come back.
+func TestListGrantsSkipsCreatorInDocMember(t *testing.T) {
 	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
 	// M1 backfilled the creator's admin row + one reader friend.
 	svc.WithDocMemberMirror(&fakeDocMemberMirror{
@@ -381,21 +383,21 @@ func TestListGrantsSurfacesCreatorAndMembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListGrants: %v", err)
 	}
-	if got["creator-uid"] != "admin" {
-		t.Fatalf("creator role = %q; want admin", got["creator-uid"])
+	if _, ok := got["creator-uid"]; ok {
+		t.Fatalf("creator uid must not appear in ListGrants (handler synthesises it); got %v", got)
 	}
 	if got["friend-uid"] != "reader" {
 		t.Fatalf("friend role = %q; want reader", got["friend-uid"])
 	}
-	if len(got) != 2 {
-		t.Fatalf("grants = %v; want exactly two entries (no creator duplication)", got)
+	if len(got) != 1 {
+		t.Fatalf("grants = %v; want exactly the friend entry", got)
 	}
 }
 
-// A6: ListGrants surfaces the creator row even when doc_member has not yet
-// been backfilled — belt-and-suspenders for the moment between publish and
-// M1 landing. Mirror is wired but the members list is empty.
-func TestListGrantsSurfacesCreatorWhenMirrorEmpty(t *testing.T) {
+// P2-B: with the creator dropped from the wired path, an empty doc_member
+// list produces an empty grants map. The handler still renders the creator
+// row from meta.creator_uid so the UI is unaffected.
+func TestListGrantsEmptyWhenNoMembersAndCreatorSuppressed(t *testing.T) {
 	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
 	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "doc-A"})
 	ctx := context.Background()
@@ -404,11 +406,8 @@ func TestListGrantsSurfacesCreatorWhenMirrorEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListGrants: %v", err)
 	}
-	if got["creator-uid"] != "admin" {
-		t.Fatalf("creator role = %q; want admin (from meta.creator_uid)", got["creator-uid"])
-	}
-	if len(got) != 1 {
-		t.Fatalf("grants = %v; want just the creator", got)
+	if len(got) != 0 {
+		t.Fatalf("grants = %v; want empty (handler synthesises creator)", got)
 	}
 }
 

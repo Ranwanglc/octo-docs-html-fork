@@ -65,16 +65,12 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 		return nil, err
 	}
 	out := map[string]string{}
+	creator := meta.CreatorUID()
 	for _, m := range members {
-		out[m.UID] = roleCodeToLabel(m.Role)
-	}
-	// Surface creator_uid as admin so callers still see the author even when
-	// M1 has not landed for this doc. Skip when doc_member already has a row
-	// for the same uid — that row is authoritative.
-	if creator := meta.CreatorUID(); creator != "" {
-		if _, exists := out[creator]; !exists {
-			out[creator] = roleCodeToLabel(DocMemberRoleAdmin)
+		if creator != "" && m.UID == creator {
+			continue // handler synthesises the creator row (P2-B)
 		}
+		out[m.UID] = roleCodeToLabel(m.Role)
 	}
 	return out, nil
 }

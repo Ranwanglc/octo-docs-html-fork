@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 )
 
 // doc_grants: an author can list/grant/revoke per-uid access; a granted uid
@@ -175,5 +177,66 @@ func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
 		`{"uid":"admin-uid","role":"reader"}`)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("grant downgrade admin = %d; want 409: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// P2-B: on the wired path, GET /v1/docs/{slug}/grants must return the creator
+// exactly once — as the handler-synthesised {role:"author", source:"owner"}
+// row. If the service surfaces the creator from doc_member as well, the UI
+// renders the creator twice (once as author, once as a deletable direct
+// grant). Repro: mirror wired, doc_member has the creator admin row (M1
+// backfill) + a real reader friend.
+func TestListGrantsWiredNoCreatorDup(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docLD": "dLD"},
+		listMembers: map[string][]service.DocMember{
+			"dLD": {
+				{UID: "owner-1", Role: 3, GrantedBy: "system"},
+				{UID: "friend-1", Role: 1, GrantedBy: "owner-1"},
+			},
+		},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docLD")
+
+	rec := do(t, h, http.MethodGet, "/v1/docs/docLD/grants",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list grants = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Items []struct {
+				UID    string `json:"uid"`
+				Role   string `json:"role"`
+				Source string `json:"source"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	creatorRows := 0
+	for _, it := range body.Data.Items {
+		if it.UID == "owner-1" {
+			creatorRows++
+			if it.Role != "author" || it.Source != "owner" {
+				t.Fatalf("creator row = %+v; want role=author source=owner", it)
+			}
+		}
+	}
+	if creatorRows != 1 {
+		t.Fatalf("creator rows = %d; want exactly 1 (no doc_member duplication)", creatorRows)
+	}
+	// Sanity: friend row still comes through as a direct reader.
+	friend := false
+	for _, it := range body.Data.Items {
+		if it.UID == "friend-1" && it.Role == "reader" && it.Source == "direct" {
+			friend = true
+		}
+	}
+	if !friend {
+		t.Fatalf("friend reader row missing: %+v", body.Data.Items)
 	}
 }
