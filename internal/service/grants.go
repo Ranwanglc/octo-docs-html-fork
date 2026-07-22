@@ -243,7 +243,16 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		return ErrGrantProtected
 	}
 	if s.docMembers != nil {
-		return s.removeGrantFromDocMember(ctx, slug, uid)
+		if err := s.removeGrantFromDocMember(ctx, slug, uid); err != nil {
+			return err
+		}
+		// yujiawei round-4 P2 sweep: purge any legacy meta.grants[uid] on
+		// every remove path (registered as well as unregistered) so a later
+		// unmount / soft-delete flipping DocIDBySlug back to ok=false cannot
+		// resurrect the entry through the A4 fallback. removeGrantFromMeta
+		// takes the slug lock itself, and this call is outside any outer
+		// lock, so no deadlock. Absent entry ⇒ nil (idempotent).
+		return s.removeGrantFromMeta(ctx, slug, uid)
 	}
 	return s.removeGrantFromMeta(ctx, slug, uid)
 }
@@ -254,12 +263,10 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 		return err
 	}
 	if !ok {
-		// P2-C: even though there's no rich-doc row, sweep any legacy
-		// meta.grants[uid] left over from pre-plan③ so a later unwire or
-		// migration cannot resurrect a stale grant. Reads already ignore
-		// meta.grants once the mirror is wired, so this is a no-op for the
-		// live auth path.
-		return s.removeGrantFromMeta(ctx, slug, uid)
+		// Doc not registered in rich-doc yet (async publish gap, thread-mount,
+		// non-mounted). Nothing to delete from doc_member — the caller
+		// (RemoveGrant) still sweeps meta.grants unconditionally.
+		return nil
 	}
 	// Probe first so an absent uid is a true no-op (no wasted DELETE, no
 	// permission_epoch bump) and admin rows are refused before DELETE runs.

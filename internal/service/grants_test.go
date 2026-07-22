@@ -724,3 +724,61 @@ func TestReconcileMetaGrantsUnwiredNoop(t *testing.T) {
 		t.Fatalf("unwired reconcile must be nil: %v", err)
 	}
 }
+
+// yujiawei round-4 P2: on the registered branch, RemoveGrant must also sweep
+// any stale meta.grants[uid] entry (M2 copies rather than moves), otherwise a
+// later unmount / soft-delete flipping DocIDBySlug back to ok=false would let
+// the A4 fallback resurrect read access after a revoke.
+func TestRemoveGrantRegisteredBranchAlsoSweepsMeta(t *testing.T) {
+	store := memory.New()
+	slug := "docP2Reg"
+	// Seed the doc with a legacy meta.grants[reader-9]=reader row alongside
+	// a live doc_member row (via the fake mirror below).
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed M2-style double-write
+				"reader-9": map[string]any{"role": "reader"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-P2Reg", roles: map[string]int{"reader-9": service.DocMemberRoleReader}}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.RemoveGrant(context.Background(), slug, "reader-9"); err != nil {
+		t.Fatalf("RemoveGrant(registered): %v", err)
+	}
+	// doc_member row was deleted...
+	if _, still := mirror.roles["reader-9"]; still {
+		t.Fatalf("doc_member row not deleted: roles=%v", mirror.roles)
+	}
+	// ...and the stale meta.grants entry was swept too.
+	meta, _ := store.GetMeta(context.Background(), slug)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // reading legacy meta.grants to assert sweep
+	if _, still := grants["reader-9"]; still {
+		t.Fatalf("meta.grants[reader-9] not swept on registered branch: %v", grants)
+	}
+}
+
+// Sweep is a no-op when meta.grants has nothing for uid (probe returns nil,
+// no permission_epoch bump). Guards against a doubled sweep after the
+// unregistered branch already ran removeGrantFromMeta itself.
+func TestRemoveGrantSweepIdempotentOnAbsentMeta(t *testing.T) {
+	store := memory.New()
+	slug := "docP2Idem"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{Slug: slug, Title: "T", Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"}}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "doc-P2Idem", roles: map[string]int{"friend": service.DocMemberRoleReader}})
+
+	if err := svc.RemoveGrant(context.Background(), slug, "friend"); err != nil {
+		t.Fatalf("RemoveGrant(no meta grant): %v", err)
+	}
+	// No panic, no error — that's the assertion.
+}
