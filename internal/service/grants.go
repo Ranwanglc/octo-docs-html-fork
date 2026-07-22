@@ -244,16 +244,24 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		return ErrGrantProtected
 	}
 	if s.docMembers != nil {
-		if err := s.removeGrantFromDocMember(ctx, slug, uid); err != nil {
-			return err
-		}
-		// yujiawei round-4 P2 sweep: purge any legacy meta.grants[uid] on
-		// every remove path (registered as well as unregistered) so a later
-		// unmount / soft-delete flipping DocIDBySlug back to ok=false cannot
-		// resurrect the entry through the A4 fallback. removeGrantFromMeta
-		// takes the slug lock itself, and this call is outside any outer
-		// lock, so no deadlock. Absent entry ⇒ nil (idempotent).
-		return s.removeGrantFromMeta(ctx, slug, uid)
+		// yujiawei round-5 P1-b: hold the slug lock across BOTH the
+		// doc_member DELETE and the meta sweep. Without this, reconcile
+		// could snapshot meta.grants[uid], then RemoveGrant deletes the
+		// doc_member row and sweeps meta.grants, and finally reconcile
+		// re-inserts the doc_member row from its stale snapshot =
+		// resurrected revoked grant. Round-4's per-op locks left this
+		// TOCTOU open; wrapping both here (and reconcile takes the same
+		// lock) serialises the pair.
+		return s.lock.With(ctx, slug, func() error {
+			if err := s.removeGrantFromDocMember(ctx, slug, uid); err != nil {
+				return err
+			}
+			// yujiawei round-4 P2 sweep: purge any legacy meta.grants[uid]
+			// on every remove path so a later unmount / soft-delete flipping
+			// DocIDBySlug back to ok=false cannot resurrect via the A4
+			// fallback. Absent entry ⇒ nil (idempotent).
+			return s.removeGrantFromMetaLocked(ctx, slug, uid)
+		})
 	}
 	return s.removeGrantFromMeta(ctx, slug, uid)
 }
@@ -294,38 +302,51 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 	return nil
 }
 
+// removeGrantFromMeta takes the slug lock and calls the locked helper. Used
+// by the mirror-unwired branch of RemoveGrant so single-node deploys still get
+// serialized meta writes.
 func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string) error {
 	return s.lock.With(ctx, slug, func() error {
-		meta, gerr := s.meta.GetMeta(ctx, slug)
-		if gerr != nil {
-			return gerr
+		return s.removeGrantFromMetaLocked(ctx, slug, uid)
+	})
+}
+
+// removeGrantFromMetaLocked is the body of removeGrantFromMeta assuming the
+// caller already holds s.lock for slug. yujiawei round-5 P1-b: RemoveGrant's
+// wired branch takes one slug lock across both the doc_member DELETE and the
+// meta sweep, so this helper serialises with reconcile (which also holds the
+// same lock) — reconcile can no longer resurrect a revoked reader from a
+// stale meta.grants snapshot.
+func (s *AuthService) removeGrantFromMetaLocked(ctx context.Context, slug, uid string) error {
+	meta, gerr := s.meta.GetMeta(ctx, slug)
+	if gerr != nil {
+		return gerr
+	}
+	if meta == nil {
+		return apperr.NotFound("no such doc: " + slug)
+	}
+	existing, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	if !ok {
+		return nil
+	}
+	if _, has := existing[uid]; !has {
+		return nil
+	}
+	extra := map[string]any{}
+	maps.Copy(extra, meta.Extra)
+	grants := map[string]any{}
+	for k, v := range existing {
+		if k != uid {
+			grants[k] = v
 		}
-		if meta == nil {
-			return apperr.NotFound("no such doc: " + slug)
-		}
-		existing, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
-		if !ok {
-			return nil
-		}
-		if _, has := existing[uid]; !has {
-			return nil
-		}
-		extra := map[string]any{}
-		maps.Copy(extra, meta.Extra)
-		grants := map[string]any{}
-		for k, v := range existing {
-			if k != uid {
-				grants[k] = v
-			}
-		}
-		if len(grants) == 0 {
-			delete(extra, storage.GrantsExtraKey) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
-		} else {
-			extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
-		}
-		return s.meta.PutMeta(ctx, slug, storage.DocMeta{
-			Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
-		})
+	}
+	if len(grants) == 0 {
+		delete(extra, storage.GrantsExtraKey) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	} else {
+		extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	}
+	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
+		Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
 	})
 }
 
@@ -385,54 +406,69 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 // logged and skipped so one bad row cannot block the rest, matching the
 // fire-and-forget semantics of afterPublished itself. meta.grants entries are
 // left in place so mirror-unwired deploys keep working; A7 cleanup drops them.
+//
+// yujiawei round-5 P1-b: the entire read-then-upsert sequence runs under the
+// slug lock (same lock removeGrantFromMeta takes) and re-fetches meta inside
+// the critical section. Without this, RemoveGrant could delete a doc_member
+// row and sweep meta.grants between reconcile's read and its upsert,
+// resurrecting a revoked reader when the next Publish/SaveDraft fires
+// afterPublished.
+//
+// Known limitation (yujiawei round-5 P2-β): if docs-backend Register HTTP
+// call absorbs a failure (docsbackend.go swallows non-2xx), afterPublished
+// still fires reconcileFn and DocIDBySlug ok=false yields a silent no-op with
+// no retry. Follow-up: reconcile keyed off a confirmed-registered signal or
+// a bounded retry.
 func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug string) error {
 	if s.docMembers == nil {
 		return nil
 	}
-	meta, err := s.meta.GetMeta(ctx, slug)
-	if err != nil {
-		return fmt.Errorf("reconcile meta lookup: %w", err)
-	}
-	if meta == nil {
-		return nil
-	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
-	if err != nil {
-		return fmt.Errorf("reconcile slug resolve: %w", err)
-	}
-	if !ok {
-		// Not registered yet (or unregisterable mount type). Nothing to
-		// reconcile; a later publish or manual mount will retrigger.
-		return nil
-	}
-	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
-	if !ok || len(grants) == 0 {
-		return nil
-	}
-	creator := meta.CreatorUID()
-	logger := slog.Default()
-	for uid, v := range grants {
-		if uid == "" || (creator != "" && uid == creator) {
-			continue
+	return s.lock.With(ctx, slug, func() error {
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return fmt.Errorf("reconcile meta lookup: %w", err)
 		}
-		entry, ok := v.(map[string]any)
+		if meta == nil {
+			return nil
+		}
+		docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+		if err != nil {
+			return fmt.Errorf("reconcile slug resolve: %w", err)
+		}
 		if !ok {
-			continue
+			// Not registered yet (or unregisterable mount type). Nothing to
+			// reconcile; a later publish or manual mount will retrigger.
+			return nil
 		}
-		roleStr, _ := entry["role"].(string)
-		if roleStr != grantRoleReader {
-			// Only reader is a valid per-uid role today; skip anything else
-			// rather than surprise-promote a stray value.
-			continue
+		grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+		if !ok || len(grants) == 0 {
+			return nil
 		}
-		grantedBy, _ := entry["granted_by"].(string)
-		if grantedBy == "" {
-			grantedBy = "reconcile_afterpublished"
+		creator := meta.CreatorUID()
+		logger := slog.Default()
+		for uid, v := range grants {
+			if uid == "" || (creator != "" && uid == creator) {
+				continue
+			}
+			entry, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			roleStr, _ := entry["role"].(string)
+			if roleStr != grantRoleReader {
+				// Only reader is a valid per-uid role today; skip anything else
+				// rather than surprise-promote a stray value.
+				continue
+			}
+			grantedBy, _ := entry["granted_by"].(string)
+			if grantedBy == "" {
+				grantedBy = "reconcile_afterpublished"
+			}
+			if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy); err != nil {
+				logger.Debug("reconcile upsert failed", "slug", slug, "uid", uid, "err", err.Error())
+				continue
+			}
 		}
-		if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy); err != nil {
-			logger.Debug("reconcile upsert failed", "slug", slug, "uid", uid, "err", err.Error())
-			continue
-		}
-	}
-	return nil
+		return nil
+	})
 }

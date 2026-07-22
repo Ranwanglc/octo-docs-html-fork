@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
@@ -22,6 +23,10 @@ type mirrorCall struct {
 }
 
 type fakeDocMemberMirror struct {
+	// mu guards calls/roles so tests that drive concurrent AuthService
+	// callers (e.g. reconcile ∥ revoke) don't false-positive on -race for
+	// mock-side map growth. Real mirrors get atomicity from their DB.
+	mu         sync.Mutex
 	calls      []mirrorCall
 	docID      string
 	resolveErr error
@@ -50,6 +55,8 @@ func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (strin
 }
 
 func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, mirrorCall{op: "upsert", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
 	if f.err != nil {
 		return f.err
@@ -67,6 +74,8 @@ func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid st
 }
 
 func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, mirrorCall{op: "delete", docID: docID, uid: uid})
 	if f.err != nil {
 		return f.err
@@ -81,6 +90,8 @@ func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) 
 }
 
 func (f *fakeDocMemberMirror) RoleByDocUID(_ context.Context, _, uid string) (int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.readErr != nil {
 		return 0, false, f.readErr
 	}
@@ -917,5 +928,103 @@ func TestReconcileMetaGrantsSkipsAdminRow(t *testing.T) {
 	}
 	if mirror.roles["owner-2"] != service.DocMemberRoleAdmin {
 		t.Fatalf("admin row clobbered by reconcile: %d (want %d)", mirror.roles["owner-2"], service.DocMemberRoleAdmin)
+	}
+}
+
+// yujiawei round-5 P1-b: reconcile ∥ revoke TOCTOU. Without the slug lock,
+// reconcile snapshots meta.grants[uid], then RemoveGrant deletes the
+// doc_member row and sweeps meta.grants, and finally reconcile's stale
+// snapshot re-inserts the doc_member row = resurrected revoked grant.
+//
+// With the lock, RemoveGrant serializes against reconcile: whichever runs
+// first fully drains the lock before the other observes state. When
+// RemoveGrant lands its meta sweep first, reconcile's re-fetched meta
+// carries no entry and no upsert happens; when reconcile lands first, its
+// upsert races the DELETE cleanly and the row is deleted afterwards.
+//
+// This test drives the "RemoveGrant lands first" leg deterministically: it
+// seeds meta.grants[uid], runs RemoveGrant (which sweeps meta.grants under
+// the lock), then runs reconcile. The stale-snapshot bug would have
+// re-inserted the row; the fixed code sees an empty meta inside the lock
+// and no-ops.
+func TestReconcileMetaGrantsAfterRevokeDoesNotResurrect(t *testing.T) {
+	store := memory.New()
+	slug := "docRace"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed reader before revoke
+				"reader-9": map[string]any{"role": "reader", "granted_by": "owner-1"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-R", roles: map[string]int{"reader-9": service.DocMemberRoleReader}}
+	svc.WithDocMemberMirror(mirror)
+
+	// Admin revokes reader-9. RemoveGrant deletes the doc_member row (mirror
+	// side) and sweeps meta.grants under the slug lock.
+	if err := svc.RemoveGrant(context.Background(), slug, "reader-9"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, present := mirror.roles["reader-9"]; present {
+		t.Fatalf("revoke did not delete doc_member row: roles=%v", mirror.roles)
+	}
+
+	// Reconcile now. Enters the same slug lock, re-fetches meta -> no
+	// grants entry for reader-9 -> no upsert. Row must stay deleted.
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if role, present := mirror.roles["reader-9"]; present {
+		t.Fatalf("reconcile resurrected revoked reader-9 (role=%d) — TOCTOU bug", role)
+	}
+	// No upsert call recorded either.
+	for _, c := range mirror.calls {
+		if c.op == "upsert" && c.uid == "reader-9" {
+			t.Fatalf("reconcile issued a stray upsert for revoked reader-9: %+v", c)
+		}
+	}
+}
+
+// Companion: reconcile and revoke run concurrently and always serialize.
+// Whichever wins the lock first drains fully before the other observes
+// state; the doc_member row is empty at the end because RemoveGrant is
+// definitive (it deletes the row regardless of reconcile's order).
+func TestReconcileMetaGrantsConcurrentRevokeNoResurrect(t *testing.T) {
+	store := memory.New()
+	slug := "docRaceConc"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed reader before concurrent revoke
+				"reader-9": map[string]any{"role": "reader", "granted_by": "owner-1"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-RC", roles: map[string]int{"reader-9": service.DocMemberRoleReader}}
+	svc.WithDocMemberMirror(mirror)
+
+	done := make(chan error, 2)
+	go func() { done <- svc.RemoveGrant(context.Background(), slug, "reader-9") }()
+	go func() { done <- svc.ReconcileMetaGrantsToDocMember(context.Background(), slug) }()
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("concurrent op err: %v", err)
+		}
+	}
+	// Regardless of interleaving, RemoveGrant is definitive: reader-9 must
+	// not appear in doc_member at the end.
+	if role, present := mirror.roles["reader-9"]; present {
+		t.Fatalf("concurrent reconcile resurrected revoked reader-9 (role=%d) — TOCTOU bug", role)
 	}
 }
