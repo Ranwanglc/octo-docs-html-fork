@@ -101,22 +101,22 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		}
 		return best, nil
 	}
-	// matchUID is the USER uid this session authors as. Two shapes:
-	//   (a) a real octo user → its own Login is the author uid, or
-	//   (b) a bot session → its OwnerUID (the user behind the bot); a bot's own
-	//       Login is the bot uid and never matches a creator_uid.
+	// Plan③ A2: split the caller identity into two USER uids so downstream
+	// author/reader tiers can distinguish "this session’s own uid" from
+	// "the owner behind it".
+	//   selfUID  = sess.Login — bot session→ bot uid, real user→ real uid.
+	//   ownerUID = bot session→ sess.OwnerUID, real user→ sess.Login.
 	// Invariant: botAuthMiddleware stashes the SAME *Session under both
 	// octoSessionCtxKey and botSessionCtxKey, so octoSessionFromCtx and
 	// botSessionFromCtx here observe one identity — do not split them into
 	// separate instances or the bot→OwnerUID mapping below silently breaks.
-	matchUID := ""
-	if sess != nil {
-		if bs := botSessionFromCtx(r.Context()); bs != nil && bs.OwnerUID != "" {
-			matchUID = bs.OwnerUID
-		} else if sess.Login != "" {
-			matchUID = sess.Login
-		}
-	}
+	selfUID, ownerUID := sessionUIDs(r)
+	// matchUID keeps the pre-plan③ semantics (owner-preferring) for the
+	// existing author-by-creator, doc_grants, and doc_binding branches so A2
+	// is a pure refactor — A3 flips the author path to use selfUID/ownerUID
+	// explicitly.
+	matchUID := ownerUID
+	_ = selfUID // consumed by A3; kept here so A2 lands standalone.
 	// Author-by-creator: the doc's creator uid is a USER uid, matched by matchUID
 	// above. This replaces the removed "every bot is superAdmin" grant: a bot only
 	// gets author on docs its owner created.
@@ -342,6 +342,33 @@ func (s *Server) requireDocAuthorOrFirstCreate(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sessionUIDs returns the two USER uids downstream capability tiers need
+// (plan③ A2):
+//
+//	selfUID  = sess.Login — the caller’s own uid. For a bot session that is
+//	           the bot uid; for a real user, their own uid.
+//	ownerUID = the owner behind the caller. For a bot session that is
+//	           sess.OwnerUID (the user the bot acts for); for a real user it
+//	           collapses to selfUID.
+//
+// Both are "" when there is no session, or when the session carries no uid
+// under the relevant field. Runs entirely off the request context — no
+// IM/RPC — so it is safe to call on every bestCred hop.
+func sessionUIDs(r *http.Request) (selfUID, ownerUID string) {
+	ctx := r.Context()
+	sess := octoSessionFromCtx(ctx)
+	if sess == nil {
+		return "", ""
+	}
+	selfUID = sess.Login
+	if bs := botSessionFromCtx(ctx); bs != nil && bs.OwnerUID != "" {
+		ownerUID = bs.OwnerUID
+	} else {
+		ownerUID = sess.Login
+	}
+	return selfUID, ownerUID
 }
 
 // hasWriteSession reports whether the request carries an authenticated session
