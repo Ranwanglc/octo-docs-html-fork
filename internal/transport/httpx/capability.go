@@ -143,24 +143,30 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 				return best, nil
 			}
 		}
-		// ② owner has admin row in doc_member. Skipped when ownerUID == "".
-		// When a mirror is wired we consult doc_member and stop — M1 backfill
-		// is the contract that every owner-admin has a row here.
-		// When no mirror is wired (single-node deploys, in-memory tests) we
-		// fall back to the pre-plan③ owner-preferring semantics
-		// (creator_uid == ownerUID → CapAuthor) so those environments continue
-		// to function; a bot's owner still authors bot-authored docs.
+		// ② owner has admin row in doc_member (M1 contract) — or, until that
+		// row exists, falls back to the pre-plan③ owner-preferring match on
+		// meta.creator_uid. The fallback is not just an unwired-deploy escape:
+		// doc_member rows are registered asynchronously (DocService.afterPublished
+		// go func) and thread-mount / non-mounted docs are never registered at
+		// all, so a wired mirror can legitimately return ok=false on a live doc.
+		// Without this fallback the same-owner bot session (Bearer bot-token)
+		// would 404 on a doc it just published. Skipped when ownerUID == "".
 		if ownerUID != "" {
+			hit := false
 			if s.auth.DocMembersWired() {
-				if role, ok, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID); rerr != nil {
+				role, ok, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
+				if rerr != nil {
 					return service.CapNone, rerr
-				} else if ok && role == service.DocMemberRoleAdmin {
-					if service.CapAuthor > best {
-						best = service.CapAuthor
-					}
-					return best, nil
 				}
-			} else if meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+				if ok && role == service.DocMemberRoleAdmin {
+					hit = true
+				}
+				// ok=false: fall through to the legacy match below.
+			}
+			if !hit && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+				hit = true
+			}
+			if hit {
 				if service.CapAuthor > best {
 					best = service.CapAuthor
 				}
@@ -176,22 +182,28 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	// path (still owner-preferring via matchUID) so single-node deploys and
 	// in-memory tests keep working.
 	if best < service.CapReader {
-		if s.auth.DocMembersWired() {
-			if selfUID != "" {
-				role, ok, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
-				if err != nil {
-					return service.CapNone, err
-				}
-				if ok && role >= service.DocMemberRoleReader {
-					best = service.CapReader
-				}
-			}
-		} else if matchUID != "" {
-			if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
+		hit := false
+		if s.auth.DocMembersWired() && selfUID != "" {
+			role, ok, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
+			if err != nil {
 				return service.CapNone, err
-			} else if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback: reader read of meta.grants when doc_member mirror is unwired
-				best = service.CapReader
 			}
+			if ok && role >= service.DocMemberRoleReader {
+				hit = true
+			}
+			// ok=false: fall through to legacy meta.grants match below.
+		}
+		if !hit && matchUID != "" {
+			meta, err := s.auth.MetaFor(r.Context(), slug)
+			if err != nil {
+				return service.CapNone, err
+			}
+			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback: reader read of meta.grants covers pre-registration + unwired
+				hit = true
+			}
+		}
+		if hit {
+			best = service.CapReader
 		}
 	}
 	// FEAT-3 doc_binding probe (see method comment). Only kicks in when we
