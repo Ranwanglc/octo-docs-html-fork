@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -280,7 +281,17 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 	if role == DocMemberRoleAdmin {
 		return ErrGrantProtected
 	}
-	return s.docMembers.DeleteGrant(ctx, docID, uid)
+	// P2 race guard: DeleteGrant returns ErrDocMemberAdminGuard if a concurrent
+	// backfill promoted the row to admin between our probe and the DELETE.
+	// Translate that to the domain-level protected error so RemoveGrant callers
+	// see one sentinel regardless of where the guard triggered.
+	if err := s.docMembers.DeleteGrant(ctx, docID, uid); err != nil {
+		if errors.Is(err, ErrDocMemberAdminGuard) {
+			return ErrGrantProtected
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string) error {

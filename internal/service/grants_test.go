@@ -57,6 +57,11 @@ func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid st
 	if f.roles == nil {
 		f.roles = map[string]int{}
 	}
+	// Mirror the P2 admin guard: a non-admin writer must not clobber an
+	// existing admin row (the DB-side WHERE role<>3 lands the same invariant).
+	if role != service.DocMemberRoleAdmin && f.roles[uid] == service.DocMemberRoleAdmin {
+		return nil
+	}
 	f.roles[uid] = role
 	return nil
 }
@@ -65,6 +70,11 @@ func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) 
 	f.calls = append(f.calls, mirrorCall{op: "delete", docID: docID, uid: uid})
 	if f.err != nil {
 		return f.err
+	}
+	// Mirror the P2 admin guard on DELETE: refuse admin rows so a concurrent
+	// backfill promoting the row cannot be silently deleted.
+	if f.roles[uid] == service.DocMemberRoleAdmin {
+		return service.ErrDocMemberAdminGuard
 	}
 	delete(f.roles, uid)
 	return nil
@@ -781,4 +791,131 @@ func TestRemoveGrantSweepIdempotentOnAbsentMeta(t *testing.T) {
 		t.Fatalf("RemoveGrant(no meta grant): %v", err)
 	}
 	// No panic, no error — that's the assertion.
+}
+
+// yujiawei round-4 P2 race guard: Upsert must preserve an admin row when the
+// caller writes a non-admin role. Simulates a backfill promoting owner-2 to
+// admin between AddGrant's probe and the mirror write; the SQL WHERE role<>3
+// invariant (fakeDocMemberMirror mirrors it) keeps the admin.
+func TestUpsertDirectGrantPreservesAdminOnNonAdminWrite(t *testing.T) {
+	mirror := &fakeDocMemberMirror{docID: "doc-P2", roles: map[string]int{"owner-2": service.DocMemberRoleAdmin}}
+	// Direct call so we exercise the mirror-level guard without going through
+	// AddGrant's probe (that already checks admin before we get here).
+	if err := mirror.UpsertDirectGrant(context.Background(), "doc-P2", "owner-2", service.DocMemberRoleReader, "attacker"); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if mirror.roles["owner-2"] != service.DocMemberRoleAdmin {
+		t.Fatalf("admin row clobbered: %d (want %d)", mirror.roles["owner-2"], service.DocMemberRoleAdmin)
+	}
+}
+
+// M1-style admin backfill still succeeds: when the caller IS writing admin,
+// the guard steps aside so the promote lands.
+func TestUpsertDirectGrantAdminWriterPromotes(t *testing.T) {
+	mirror := &fakeDocMemberMirror{docID: "doc-M1", roles: map[string]int{"owner-2": service.DocMemberRoleReader}}
+	if err := mirror.UpsertDirectGrant(context.Background(), "doc-M1", "owner-2", service.DocMemberRoleAdmin, "m1"); err != nil {
+		t.Fatalf("upsert admin: %v", err)
+	}
+	if mirror.roles["owner-2"] != service.DocMemberRoleAdmin {
+		t.Fatalf("admin promote lost: %d", mirror.roles["owner-2"])
+	}
+}
+
+// yujiawei round-4 P2 race guard: DeleteGrant must refuse an admin row and
+// return ErrDocMemberAdminGuard so callers surface a protected error rather
+// than silently deleting an admin promoted between probe and DELETE.
+func TestDeleteGrantRefusesAdminRow(t *testing.T) {
+	mirror := &fakeDocMemberMirror{docID: "doc-P2D", roles: map[string]int{"owner-2": service.DocMemberRoleAdmin}}
+	err := mirror.DeleteGrant(context.Background(), "doc-P2D", "owner-2")
+	if !errors.Is(err, service.ErrDocMemberAdminGuard) {
+		t.Fatalf("DeleteGrant(admin) = %v; want ErrDocMemberAdminGuard", err)
+	}
+	if mirror.roles["owner-2"] != service.DocMemberRoleAdmin {
+		t.Fatalf("admin row deleted despite guard: %d", mirror.roles["owner-2"])
+	}
+}
+
+// RemoveGrant surfaces ErrGrantProtected when the mirror's DELETE races with
+// an admin promotion. Exercises the wired path so the probe misses the
+// admin (probe sees "reader" seed) but DeleteGrant sees "admin" (test
+// simulates the race by pre-seeding the mirror as admin — the probe's stale
+// reader view lives in the roles-arg of the fakeDocMemberMirror).
+func TestRemoveGrantSurfacesRaceAsProtected(t *testing.T) {
+	store := memory.New()
+	slug := "docRace"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	// Use raceMirror so the probe returns "reader" but the DELETE hits an
+	// admin row and refuses. Matches the P2 SQL guard flip.
+	svc.WithDocMemberMirror(&raceMirror{docID: "doc-R", probeRole: service.DocMemberRoleReader, delRole: service.DocMemberRoleAdmin})
+
+	err := svc.RemoveGrant(context.Background(), slug, "owner-2")
+	if !errors.Is(err, service.ErrGrantProtected) {
+		t.Fatalf("RemoveGrant race = %v; want ErrGrantProtected", err)
+	}
+}
+
+// raceMirror lets a test decouple RoleByDocUID (probe) from DeleteGrant so it
+// can simulate a backfill that lands between the two calls.
+type raceMirror struct {
+	docID     string
+	probeRole int
+	delRole   int
+}
+
+func (r *raceMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+	return r.docID, true, nil
+}
+func (r *raceMirror) UpsertDirectGrant(context.Context, string, string, int, string) error {
+	panic("raceMirror.UpsertDirectGrant should not be called")
+}
+func (r *raceMirror) DeleteGrant(context.Context, string, string) error {
+	if r.delRole == service.DocMemberRoleAdmin {
+		return service.ErrDocMemberAdminGuard
+	}
+	return nil
+}
+func (r *raceMirror) RoleByDocUID(context.Context, string, string) (int, bool, error) {
+	return r.probeRole, true, nil
+}
+func (r *raceMirror) ListMembers(context.Context, string) ([]service.DocMember, error) {
+	return nil, nil
+}
+
+// P1 admin-not-clobber assertion (deferred from commit 1 until this commit
+// lands the mirror-side guard): if M1 has already promoted owner-2 to admin
+// and a stale meta.grants["owner-2"]="reader" is still around, reconcile
+// must NOT downgrade the admin. The fakeDocMemberMirror now mirrors the P2
+// SQL guard so this test passes with the same seed.
+func TestReconcileMetaGrantsSkipsAdminRow(t *testing.T) {
+	store := memory.New()
+	slug := "docAdminGuard"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed stale legacy row
+				"owner-2": map[string]any{"role": "reader"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-A", roles: map[string]int{"owner-2": service.DocMemberRoleAdmin}}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if mirror.roles["owner-2"] != service.DocMemberRoleAdmin {
+		t.Fatalf("admin row clobbered by reconcile: %d (want %d)", mirror.roles["owner-2"], service.DocMemberRoleAdmin)
+	}
 }

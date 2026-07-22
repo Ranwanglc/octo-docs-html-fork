@@ -18,6 +18,13 @@ const (
 	DocMemberRoleAdmin = 3
 )
 
+// ErrDocMemberAdminGuard is returned by DeleteGrant when the DB-level guard
+// (WHERE role<>3) refuses the delete because a concurrent backfill promoted
+// the row to admin between the caller's probe and the DELETE. Callers should
+// translate this into their domain-level "protected" error (grants.RemoveGrant
+// turns it into ErrGrantProtected).
+var ErrDocMemberAdminGuard = errors.New("doc_member: refuse to modify admin row")
+
 // DocMember is one row of the rich-doc doc_member table exposed to callers that
 // need to enumerate a doc's direct grants (grants.ListGrants, A6). Fields map
 // 1:1 to the columns AuthService actually consumes.
@@ -56,16 +63,33 @@ func NewMySQLDocMemberMirror(db *sql.DB) *MySQLDocMemberMirror {
 
 // UpsertDirectGrant upserts a direct doc_member row (role) and bumps the doc's
 // permission_epoch so live connections re-evaluate access.
+//
+// yujiawei round-4 P2 race guard: when the caller writes a non-admin role we
+// preserve any existing admin (role=3) row rather than downgrading it — a
+// concurrent backfill can promote a row between the caller's probe and this
+// write, and clobbering that admin down to reader silently strips the
+// author's capability. The ON DUPLICATE KEY UPDATE branch keeps the existing
+// role/granted_by whenever the pre-image is admin. When the caller IS
+// writing admin (e.g. an M1 owner backfill) we skip the guard so the promote
+// still lands.
 func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin doc_member upsert: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+	var insertSQL string
+	if role == DocMemberRoleAdmin {
+		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
 		 VALUES (?,?,?,?,1,'')
-		 ON DUPLICATE KEY UPDATE role=VALUES(role), granted_by=VALUES(granted_by)`,
-		docID, uid, role, grantedBy); err != nil {
+		 ON DUPLICATE KEY UPDATE role=VALUES(role), granted_by=VALUES(granted_by)`
+	} else {
+		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+		 VALUES (?,?,?,?,1,'')
+		 ON DUPLICATE KEY UPDATE
+		   role       = IF(role = 3, role, VALUES(role)),
+		   granted_by = IF(role = 3, granted_by, VALUES(granted_by))`
+	}
+	if _, err := tx.ExecContext(ctx, insertSQL, docID, uid, role, grantedBy); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("upsert doc_member: %w", err)
 	}
@@ -82,16 +106,37 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 }
 
 // DeleteGrant removes a doc_member row and bumps permission_epoch.
+//
+// yujiawei round-4 P2 race guard: the DELETE carries WHERE role<>3 so a
+// row promoted to admin between the caller's probe and this call is not
+// silently deleted. Affected=0 with the row still present (probe returned
+// hit → row existed) means the guard kicked in; we return
+// ErrDocMemberAdminGuard so callers can surface a protected-row error and
+// skip the permission_epoch bump.
 func (m *MySQLDocMemberMirror) DeleteGrant(ctx context.Context, docID, uid string) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin doc_member delete: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM doc_member WHERE doc_id=? AND uid=?",
-		docID, uid); err != nil {
+	res, err := tx.ExecContext(ctx,
+		"DELETE FROM doc_member WHERE doc_id=? AND uid=? AND role<>?",
+		docID, uid, DocMemberRoleAdmin)
+	if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("delete doc_member: %w", err)
+	}
+	affected, aerr := res.RowsAffected()
+	if aerr == nil && affected == 0 {
+		// Distinguish "nothing to delete" (already absent) from "row is admin"
+		// (guard tripped). A follow-up SELECT is the cheapest way to tell them
+		// apart under the same tx snapshot.
+		var role int
+		if qerr := tx.QueryRowContext(ctx,
+			"SELECT role FROM doc_member WHERE doc_id=? AND uid=?",
+			docID, uid).Scan(&role); qerr == nil && role == DocMemberRoleAdmin {
+			_ = tx.Rollback()
+			return ErrDocMemberAdminGuard
+		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE doc_meta SET permission_epoch=permission_epoch+1 WHERE doc_id=?",
