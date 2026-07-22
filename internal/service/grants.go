@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"maps"
 	"time"
@@ -15,8 +16,26 @@ import (
 // so grants are read+comment only for now.
 const grantRoleReader = "reader"
 
+// ErrGrantProtected is returned by RemoveGrant when the target uid is the
+// doc's creator or a doc_member admin — those rows must never be revoked
+// through the grants API (that path is for reader grants).
+var ErrGrantProtected = errors.New("grant protected: creator or admin cannot be revoked")
+
 // ListGrants returns the uid→role map of explicit grants for a slug (empty when
 // none). A missing doc is NotFound so callers can hide non-existent docs.
+//
+// Plan③ A6: when a doc_member mirror is wired, the authoritative source is
+// doc_member — every direct grant (reader) and every admin (creator/owner
+// backfill via M1) lives there, and meta.grants is now write-frozen (see
+// AddGrant). The creator row is always surfaced from meta.creator_uid so the
+// UI's "created by" row survives even when doc_member has no explicit admin
+// row for the creator yet (belt-and-suspenders vs. M1 gaps); if doc_member
+// already carries an admin row for the same uid, that row wins — we do not
+// duplicate.
+//
+// When no mirror is wired (single-node deploys, in-memory tests) ListGrants
+// falls back to reading meta.grants, matching the pre-plan③ behaviour those
+// environments still rely on.
 func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]string, error) {
 	meta, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
@@ -25,10 +44,44 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 	if meta == nil {
 		return nil, apperr.NotFound("no such doc: " + slug)
 	}
+	if s.docMembers == nil {
+		return legacyListGrantsFromMeta(meta), nil
+	}
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// No rich-doc row yet; fall back to meta so ListGrants stays useful
+		// during the moment between publish and mirror registration.
+		return legacyListGrantsFromMeta(meta), nil
+	}
+	members, err := s.docMembers.ListMembers(ctx, docID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, m := range members {
+		out[m.UID] = roleCodeToLabel(m.Role)
+	}
+	// Surface creator_uid as admin so callers still see the author even when
+	// M1 has not landed for this doc. Skip when doc_member already has a row
+	// for the same uid — that row is authoritative.
+	if creator := meta.CreatorUID(); creator != "" {
+		if _, exists := out[creator]; !exists {
+			out[creator] = roleCodeToLabel(DocMemberRoleAdmin)
+		}
+	}
+	return out, nil
+}
+
+// legacyListGrantsFromMeta reads the pre-plan③ meta.grants map. Used only in
+// the mirror-unwired fallback path so single-node deploys keep working.
+func legacyListGrantsFromMeta(meta *storage.DocMeta) map[string]string {
 	out := map[string]string{}
 	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any)
 	if !ok {
-		return out, nil
+		return out
 	}
 	for uid, v := range grants {
 		if entry, ok := v.(map[string]any); ok {
@@ -37,11 +90,30 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 			}
 		}
 	}
-	return out, nil
+	return out
+}
+
+// roleCodeToLabel translates rich-doc doc_member.role integers to the string
+// labels this API has always returned. Only reader is used today; admin is
+// added so the creator row from ListGrants renders correctly.
+func roleCodeToLabel(role int) string {
+	switch role {
+	case DocMemberRoleAdmin:
+		return "admin"
+	case DocMemberRoleReader:
+		return grantRoleReader
+	default:
+		return grantRoleReader
+	}
 }
 
 // AddGrant grants uid a role on slug (upsert). grantedBy records who authorized
 // it. Only the reader role is accepted for now.
+//
+// Plan③ A6: doc_member is authoritative — the upsert goes straight through
+// UpsertDirectGrant (source=1 direct grant, encoded inside the mirror impl).
+// meta.grants is no longer written. When no mirror is wired we still write
+// meta.grants so single-node deploys keep working.
 //
 // TODO: verify uid is a real octo user (anti ghost-member) once octo-server
 // exposes a uid-existence lookup the doc can call; today any uid is accepted.
@@ -52,7 +124,41 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 	if role != grantRoleReader {
 		return apperr.Validation("role must be reader", "invalid_grant")
 	}
-	if err := s.lock.With(ctx, slug, func() error {
+	if s.docMembers != nil {
+		return s.addGrantToDocMember(ctx, slug, uid, grantedBy)
+	}
+	return s.addGrantToMeta(ctx, slug, uid, role, grantedBy)
+}
+
+// addGrantToDocMember is the plan③ A6 primary path. UpsertDirectGrant is
+// idempotent — repeated calls for the same (docID,uid,role) update
+// updated_at only, no duplicate row.
+func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grantedBy string) error {
+	// Existence check via meta so we still 404 on a bogus slug (rich-doc
+	// mirror only knows registered docs).
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if meta == nil {
+		return apperr.NotFound("no such doc: " + slug)
+	}
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return apperr.NotFound("doc has no rich-doc registration yet: " + slug)
+	}
+	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy)
+}
+
+// addGrantToMeta preserves the pre-plan③ meta.grants write path for the
+// mirror-unwired fallback (single-node deploys, in-memory tests). This is the
+// only place we still author meta.grants; production reads never see it once
+// A4 lands (bestCred consults doc_member first).
+func (s *AuthService) addGrantToMeta(ctx context.Context, slug, uid, role, grantedBy string) error {
+	return s.lock.With(ctx, slug, func() error {
 		meta, gerr := s.meta.GetMeta(ctx, slug)
 		if gerr != nil {
 			return gerr
@@ -75,18 +181,61 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 		return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 			Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
 		})
-	}); err != nil {
-		return err
-	}
-	s.mirrorGrantUpsert(ctx, slug, uid, grantedBy)
-	return nil
+	})
 }
 
 // RemoveGrant revokes uid's grant on slug. Removing an absent uid is a no-op
-// (idempotent). The grants key itself is dropped once empty.
+// (idempotent).
+//
+// Plan③ A6 protection: refuses to revoke the doc's creator_uid or any
+// doc_member admin row — those are the author identities and the grants API
+// (reader-only) has no authority over them. Callers see ErrGrantProtected
+// and must go through the identity/admin path instead.
 func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
-	deletedGrant := false
-	if err := s.lock.With(ctx, slug, func() error {
+	if uid == "" {
+		return apperr.Validation("uid required", "invalid_grant")
+	}
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if meta == nil {
+		return apperr.NotFound("no such doc: " + slug)
+	}
+	if creator := meta.CreatorUID(); creator != "" && creator == uid {
+		return ErrGrantProtected
+	}
+	if s.docMembers != nil {
+		return s.removeGrantFromDocMember(ctx, slug, uid)
+	}
+	return s.removeGrantFromMeta(ctx, slug, uid)
+}
+
+func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid string) error {
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // no rich-doc row yet, nothing to revoke
+	}
+	// Probe first so an absent uid is a true no-op (no wasted DELETE, no
+	// permission_epoch bump) and admin rows are refused before DELETE runs.
+	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if role == DocMemberRoleAdmin {
+		return ErrGrantProtected
+	}
+	return s.docMembers.DeleteGrant(ctx, docID, uid)
+}
+
+func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string) error {
+	return s.lock.With(ctx, slug, func() error {
 		meta, gerr := s.meta.GetMeta(ctx, slug)
 		if gerr != nil {
 			return gerr
@@ -101,7 +250,6 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		if _, has := existing[uid]; !has {
 			return nil
 		}
-		deletedGrant = true
 		extra := map[string]any{}
 		maps.Copy(extra, meta.Extra)
 		grants := map[string]any{}
@@ -118,16 +266,18 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 			Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
 		})
-	}); err != nil {
-		return err
-	}
-	// Mirror only on a real grant removal — avoid an empty permission_epoch bump.
-	if deletedGrant {
-		s.mirrorGrantDelete(ctx, slug, uid)
-	}
-	return nil
+	})
 }
 
+// mirrorGrantUpsert / mirrorGrantDelete: Deprecated after plan③ A6 —
+// AddGrant/RemoveGrant now talk to doc_member directly. Kept as thin wrappers
+// so any external caller still compiles; both now just log at debug when the
+// mirror is nil and behave as no-ops. Marked for removal once callers are
+// gone (A7 cleanup pass).
+//
+// Deprecated: use AddGrant/RemoveGrant which handle doc_member natively.
+//
+//nolint:unused // Retained per plan③ scope: A7 cleanup pass removes these.
 func (s *AuthService) mirrorGrantUpsert(ctx context.Context, slug, uid, grantedBy string) {
 	if s.docMembers == nil {
 		return
@@ -146,6 +296,9 @@ func (s *AuthService) mirrorGrantUpsert(ctx context.Context, slug, uid, grantedB
 	}
 }
 
+// Deprecated: use RemoveGrant which handles doc_member natively.
+//
+//nolint:unused // Retained per plan③ scope: A7 cleanup pass removes these.
 func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 	if s.docMembers == nil {
 		return

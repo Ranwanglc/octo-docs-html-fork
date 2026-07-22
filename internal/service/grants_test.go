@@ -45,12 +45,23 @@ func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (strin
 
 func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {
 	f.calls = append(f.calls, mirrorCall{op: "upsert", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
-	return f.err
+	if f.err != nil {
+		return f.err
+	}
+	if f.roles == nil {
+		f.roles = map[string]int{}
+	}
+	f.roles[uid] = role
+	return nil
 }
 
 func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) error {
 	f.calls = append(f.calls, mirrorCall{op: "delete", docID: docID, uid: uid})
-	return f.err
+	if f.err != nil {
+		return f.err
+	}
+	delete(f.roles, uid)
+	return nil
 }
 
 func (f *fakeDocMemberMirror) RoleByDocUID(_ context.Context, _, uid string) (int, bool, error) {
@@ -182,16 +193,20 @@ func TestRemoveAbsentGrantSkipsMirror(t *testing.T) {
 	}
 }
 
-func TestGrantMirrorErrorsDoNotBlock(t *testing.T) {
+// Plan③ A6 flipped the source-of-truth: doc_member is now authoritative for
+// direct grants, so a mirror write error must surface to the caller instead
+// of being swallowed (silent divergence between what the API reports and
+// what the auth layer will read on the next request).
+func TestGrantMirrorErrorsSurface(t *testing.T) {
 	svc, slug := newGrantSvc(t)
-	svc.WithDocMemberMirror(&fakeDocMemberMirror{err: errors.New("mirror down")})
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{err: errors.New("mirror down"), roles: map[string]int{"u1": 1}})
 	ctx := context.Background()
 
-	if err := svc.AddGrant(ctx, slug, "u1", "reader", "owner"); err != nil {
-		t.Fatalf("AddGrant with mirror error: %v", err)
+	if err := svc.AddGrant(ctx, slug, "u1", "reader", "owner"); err == nil {
+		t.Fatalf("AddGrant with mirror error = nil; want error")
 	}
-	if err := svc.RemoveGrant(ctx, slug, "u1"); err != nil {
-		t.Fatalf("RemoveGrant with mirror error: %v", err)
+	if err := svc.RemoveGrant(ctx, slug, "u1"); err == nil {
+		t.Fatalf("RemoveGrant with mirror error = nil; want error")
 	}
 }
 
@@ -254,5 +269,137 @@ func TestFakeMirrorListMembersShape(t *testing.T) {
 	m.readErr = errors.New("db down")
 	if _, err := m.ListMembers(ctx, "d1"); err == nil {
 		t.Fatalf("ListMembers with readErr = nil; want error")
+	}
+}
+
+// newGrantSvcWithCreator seeds the doc with a creator_uid so RemoveGrant's
+// creator-protection tier has a value to compare against.
+func newGrantSvcWithCreator(t *testing.T, creator string) (*service.AuthService, string) {
+	t.Helper()
+	store := memory.New()
+	slug := "doca"
+	meta := storage.DocMeta{Slug: slug, Title: "T", Extra: map[string]any{storage.CreatorUIDExtraKey: creator}}
+	if err := store.PutMeta(context.Background(), slug, meta); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	return service.NewAuthService(store, &config.Config{}, sluglock.NewMemory()), slug
+}
+
+// A6: AddGrant is idempotent — same (uid,role) applied twice is not an error
+// and does not produce a duplicate role assignment. Two mirror upsert calls
+// are expected (the mirror itself enforces uniqueness), but the resulting
+// state is a single reader row.
+func TestAddGrantIdempotent(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	mirror := &fakeDocMemberMirror{docID: "doc-A"}
+	svc.WithDocMemberMirror(mirror)
+	ctx := context.Background()
+
+	if err := svc.AddGrant(ctx, slug, "u1", "reader", "owner"); err != nil {
+		t.Fatalf("first AddGrant: %v", err)
+	}
+	if err := svc.AddGrant(ctx, slug, "u1", "reader", "owner"); err != nil {
+		t.Fatalf("second AddGrant: %v", err)
+	}
+	if got := mirror.roles["u1"]; got != service.DocMemberRoleReader {
+		t.Fatalf("roles[u1] = %d; want reader(%d)", got, service.DocMemberRoleReader)
+	}
+	if len(mirror.roles) != 1 {
+		t.Fatalf("roles = %v; want exactly one entry", mirror.roles)
+	}
+}
+
+// A6: RemoveGrant refuses to revoke the doc's creator_uid — the grants API is
+// reader-scoped and must never touch the author identity.
+func TestRemoveGrantProtectsCreator(t *testing.T) {
+	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "doc-A"})
+	ctx := context.Background()
+
+	if err := svc.RemoveGrant(ctx, slug, "creator-uid"); !errors.Is(err, service.ErrGrantProtected) {
+		t.Fatalf("RemoveGrant(creator) = %v; want ErrGrantProtected", err)
+	}
+}
+
+// A6: RemoveGrant refuses to revoke a doc_member admin row (role=3) — the
+// M1 backfill lands owner rows here and they must survive a rogue revoke.
+func TestRemoveGrantProtectsDocMemberAdmin(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{
+		docID: "doc-A",
+		roles: map[string]int{"owner-uid": service.DocMemberRoleAdmin},
+	})
+	ctx := context.Background()
+
+	if err := svc.RemoveGrant(ctx, slug, "owner-uid"); !errors.Is(err, service.ErrGrantProtected) {
+		t.Fatalf("RemoveGrant(admin) = %v; want ErrGrantProtected", err)
+	}
+}
+
+// A6: RemoveGrant on a regular reader row succeeds and clears the row.
+func TestRemoveGrantRevokesReader(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	mirror := &fakeDocMemberMirror{
+		docID: "doc-A",
+		roles: map[string]int{"u1": service.DocMemberRoleReader},
+	}
+	svc.WithDocMemberMirror(mirror)
+	ctx := context.Background()
+
+	if err := svc.RemoveGrant(ctx, slug, "u1"); err != nil {
+		t.Fatalf("RemoveGrant(reader): %v", err)
+	}
+	if _, still := mirror.roles["u1"]; still {
+		t.Fatalf("roles[u1] still present after revoke: %v", mirror.roles)
+	}
+}
+
+// A6: ListGrants surfaces the creator row + every doc_member row without
+// duplicating the creator when M1 has already backfilled an admin row for
+// that uid — the doc_member row wins.
+func TestListGrantsSurfacesCreatorAndMembers(t *testing.T) {
+	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
+	// M1 backfilled the creator's admin row + one reader friend.
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{
+		docID: "doc-A",
+		listMembers: []service.DocMember{
+			{UID: "creator-uid", Role: service.DocMemberRoleAdmin, GrantedBy: "system"},
+			{UID: "friend-uid", Role: service.DocMemberRoleReader, GrantedBy: "creator-uid"},
+		},
+	})
+	ctx := context.Background()
+
+	got, err := svc.ListGrants(ctx, slug)
+	if err != nil {
+		t.Fatalf("ListGrants: %v", err)
+	}
+	if got["creator-uid"] != "admin" {
+		t.Fatalf("creator role = %q; want admin", got["creator-uid"])
+	}
+	if got["friend-uid"] != "reader" {
+		t.Fatalf("friend role = %q; want reader", got["friend-uid"])
+	}
+	if len(got) != 2 {
+		t.Fatalf("grants = %v; want exactly two entries (no creator duplication)", got)
+	}
+}
+
+// A6: ListGrants surfaces the creator row even when doc_member has not yet
+// been backfilled — belt-and-suspenders for the moment between publish and
+// M1 landing. Mirror is wired but the members list is empty.
+func TestListGrantsSurfacesCreatorWhenMirrorEmpty(t *testing.T) {
+	svc, slug := newGrantSvcWithCreator(t, "creator-uid")
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "doc-A"})
+	ctx := context.Background()
+
+	got, err := svc.ListGrants(ctx, slug)
+	if err != nil {
+		t.Fatalf("ListGrants: %v", err)
+	}
+	if got["creator-uid"] != "admin" {
+		t.Fatalf("creator role = %q; want admin (from meta.creator_uid)", got["creator-uid"])
+	}
+	if len(got) != 1 {
+		t.Fatalf("grants = %v; want just the creator", got)
 	}
 }
