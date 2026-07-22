@@ -141,7 +141,7 @@ func (s *AuthService) mirrorGrantUpsert(ctx context.Context, slug, uid, grantedB
 		slog.Default().Debug("doc_member mirror skipped: doc_meta missing", "slug", slug, "uid", uid)
 		return
 	}
-	if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, docMemberRoleReader, grantedBy); err != nil {
+	if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy); err != nil {
 		slog.Default().Debug("doc_member mirror upsert failed", "slug", slug, "uid", uid, "err", err.Error())
 	}
 }

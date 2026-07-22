@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	docMemberRoleReader = 1
+	// DocMemberRoleReader is the rich-doc doc_member.role reader encoding
+	// (>= this = at least reader). bestCred consumes it for the plan③ A4
+	// tier so a forwarded direct grant lifts CapReader.
+	DocMemberRoleReader = 1
 	// DocMemberRoleAdmin mirrors the rich-doc doc_member.role admin encoding.
 	// bestCred consumes this to short-circuit CapAuthor when the caller's
 	// owner uid holds an admin row — the plan③ A3② tier.

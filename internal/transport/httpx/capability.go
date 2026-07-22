@@ -168,14 +168,30 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 			}
 		}
 	}
-	// doc_grants: an explicitly granted USER uid gets reader (read+comment).
-	// Reuse matchUID (already bot→OwnerUID resolved) so a granted user's bot
-	// also reads. After author-by-creator so a grant never downgrades a creator.
-	if matchUID != "" && best < service.CapReader {
-		if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
-			return service.CapNone, err
-		} else if meta != nil && meta.GrantRole(matchUID) != "" {
-			best = service.CapReader
+	// Plan③ A4 reader tier: doc_member row with role >= reader → CapReader.
+	// Consumes selfUID so a bot forwarding-granted as a direct reader (rare
+	// but supported) still reads; the bot's owner reads bot-authored docs via
+	// A3② already, so keying reader on selfUID here does not hide docs from
+	// owners. When no mirror is wired, fall back to the pre-plan③ meta.grants
+	// path (still owner-preferring via matchUID) so single-node deploys and
+	// in-memory tests keep working.
+	if best < service.CapReader {
+		if s.auth.DocMembersWired() {
+			if selfUID != "" {
+				role, ok, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
+				if err != nil {
+					return service.CapNone, err
+				}
+				if ok && role >= service.DocMemberRoleReader {
+					best = service.CapReader
+				}
+			}
+		} else if matchUID != "" {
+			if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
+				return service.CapNone, err
+			} else if meta != nil && meta.GrantRole(matchUID) != "" {
+				best = service.CapReader
+			}
 		}
 	}
 	// FEAT-3 doc_binding probe (see method comment). Only kicks in when we
