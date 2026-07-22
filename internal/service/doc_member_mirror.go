@@ -9,11 +9,25 @@ import (
 
 const docMemberRoleReader = 1
 
-// DocMemberMirror keeps rich-doc list membership in sync with doc-side grants.
+// DocMember is one row of the rich-doc doc_member table exposed to callers that
+// need to enumerate a doc's direct grants (grants.ListGrants, A6). Fields map
+// 1:1 to the columns AuthService actually consumes.
+type DocMember struct {
+	UID       string
+	Role      int
+	GrantedBy string
+}
+
+// DocMemberMirror keeps rich-doc list membership in sync with doc-side grants
+// and lets the auth layer read that same table when deciding capability.
+// RoleByDocUID / ListMembers replace the legacy meta.grants read path
+// (plan③ A3/A4/A6) so grants have a single source of truth in doc_member.
 type DocMemberMirror interface {
 	DocIDBySlug(ctx context.Context, slug string) (string, bool, error)
 	UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error
 	DeleteGrant(ctx context.Context, docID, uid string) error
+	RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error)
+	ListMembers(ctx context.Context, docID string) ([]DocMember, error)
 }
 
 // MySQLDocMemberMirror mirrors doc-side grants into the rich-doc doc_member
@@ -97,4 +111,52 @@ func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug string) (st
 		return "", false, fmt.Errorf("resolve doc_meta by slug: %w", err)
 	}
 	return docID, true, nil
+}
+
+// RoleByDocUID returns the role (doc_member.role) uid holds on docID; ok=false
+// when the uid has no row. Used by bestCred to decide owner-admin (role=3) and
+// reader (role>=1) capability without touching meta.grants (plan③ A3/A4).
+// No cache: doc_member is fast and any cache here would tie freshness of auth
+// to permission_epoch invalidation logic we do not need to add.
+func (m *MySQLDocMemberMirror) RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error) {
+	var role int
+	err := m.db.QueryRowContext(ctx,
+		"SELECT role FROM doc_member WHERE doc_id=? AND uid=? LIMIT 1",
+		docID, uid).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read doc_member role: %w", err)
+	}
+	return role, true, nil
+}
+
+// ListMembers returns every doc_member row for docID. Used by grants.ListGrants
+// (plan③ A6) so the sidebar/API render off doc_member instead of meta.grants.
+// Ordered by created_at then uid for stable rendering; no caller depends on it
+// beyond that.
+func (m *MySQLDocMemberMirror) ListMembers(ctx context.Context, docID string) ([]DocMember, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT uid, role, granted_by FROM doc_member
+		 WHERE doc_id=? ORDER BY created_at ASC, uid ASC`,
+		docID)
+	if err != nil {
+		return nil, fmt.Errorf("list doc_member: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DocMember
+	for rows.Next() {
+		var dm DocMember
+		var grantedBy sql.NullString
+		if err := rows.Scan(&dm.UID, &dm.Role, &grantedBy); err != nil {
+			return nil, fmt.Errorf("scan doc_member row: %w", err)
+		}
+		dm.GrantedBy = grantedBy.String
+		out = append(out, dm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate doc_member rows: %w", err)
+	}
+	return out, nil
 }

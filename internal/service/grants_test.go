@@ -26,6 +26,11 @@ type fakeDocMemberMirror struct {
 	docID      string
 	resolveErr error
 	err        error
+	// roles keyed by uid feeds RoleByDocUID; listMembers feeds ListMembers.
+	// Both are opt-in — an empty map behaves as "no rows".
+	roles       map[string]int
+	listMembers []service.DocMember
+	readErr     error
 }
 
 func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (string, bool, error) {
@@ -46,6 +51,23 @@ func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid st
 func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) error {
 	f.calls = append(f.calls, mirrorCall{op: "delete", docID: docID, uid: uid})
 	return f.err
+}
+
+func (f *fakeDocMemberMirror) RoleByDocUID(_ context.Context, _, uid string) (int, bool, error) {
+	if f.readErr != nil {
+		return 0, false, f.readErr
+	}
+	if role, ok := f.roles[uid]; ok {
+		return role, true, nil
+	}
+	return 0, false, nil
+}
+
+func (f *fakeDocMemberMirror) ListMembers(_ context.Context, _ string) ([]service.DocMember, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return f.listMembers, nil
 }
 
 // newGrantSvc builds an AuthService over an in-memory store seeded with one doc.
@@ -191,5 +213,46 @@ func TestListGrantsMissingDoc(t *testing.T) {
 	_, err := svc.ListGrants(context.Background(), "no-such-slug")
 	if _, ok := err.(*apperr.Error); !ok {
 		t.Fatalf("ListGrants missing = %v; want apperr", err)
+	}
+}
+
+// A5: RoleByDocUID contract — hit returns the row role and ok=true, miss returns
+// ok=false with nil error, and a read error surfaces to the caller. Mirror
+// callers rely on this shape to distinguish "no grant" from "lookup failed".
+func TestFakeMirrorRoleByDocUIDShape(t *testing.T) {
+	m := &fakeDocMemberMirror{roles: map[string]int{"alice": 3, "bob": 1}}
+	ctx := context.Background()
+	if r, ok, err := m.RoleByDocUID(ctx, "d1", "alice"); err != nil || !ok || r != 3 {
+		t.Fatalf("RoleByDocUID(alice) = (%d,%v,%v); want (3,true,nil)", r, ok, err)
+	}
+	if r, ok, err := m.RoleByDocUID(ctx, "d1", "stranger"); err != nil || ok || r != 0 {
+		t.Fatalf("RoleByDocUID(stranger) = (%d,%v,%v); want (0,false,nil)", r, ok, err)
+	}
+	m.readErr = errors.New("db down")
+	if _, _, err := m.RoleByDocUID(ctx, "d1", "alice"); err == nil {
+		t.Fatalf("RoleByDocUID with readErr = nil; want error")
+	}
+}
+
+// A5: ListMembers contract — returns the seeded rows verbatim so grants.List
+// can render (uid,role,granted_by) tuples; a read error surfaces (never a
+// partial slice with err).
+func TestFakeMirrorListMembersShape(t *testing.T) {
+	seed := []service.DocMember{
+		{UID: "creator", Role: 3, GrantedBy: "system"},
+		{UID: "friend", Role: 1, GrantedBy: "creator"},
+	}
+	m := &fakeDocMemberMirror{listMembers: seed}
+	ctx := context.Background()
+	got, err := m.ListMembers(ctx, "d1")
+	if err != nil {
+		t.Fatalf("ListMembers err: %v", err)
+	}
+	if len(got) != 2 || got[0].UID != "creator" || got[0].Role != 3 || got[1].UID != "friend" {
+		t.Fatalf("ListMembers = %+v; want seed", got)
+	}
+	m.readErr = errors.New("db down")
+	if _, err := m.ListMembers(ctx, "d1"); err == nil {
+		t.Fatalf("ListMembers with readErr = nil; want error")
 	}
 }
