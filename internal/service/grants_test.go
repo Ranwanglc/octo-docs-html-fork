@@ -95,21 +95,21 @@ func newGrantSvc(t *testing.T) (*service.AuthService, string) {
 // GrantRole reads the per-uid role from Extra["grants"], nil-safe at every layer.
 func TestDocMetaGrantRole(t *testing.T) {
 	var nilMeta *storage.DocMeta
-	if got := nilMeta.GrantRole("u"); got != "" {
+	if got := nilMeta.GrantRole("u"); got != "" { //nolint:staticcheck // legacy GrantRole shape test until A7 cleanup
 		t.Fatalf("nil meta GrantRole = %q; want empty", got)
 	}
 	m := &storage.DocMeta{Extra: map[string]any{
-		storage.GrantsExtraKey: map[string]any{
+		storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // legacy grants seed until A7 cleanup
 			"friend": map[string]any{"role": "reader"},
 		},
 	}}
-	if got := m.GrantRole("friend"); got != "reader" {
+	if got := m.GrantRole("friend"); got != "reader" { //nolint:staticcheck // legacy GrantRole shape test until A7 cleanup
 		t.Fatalf("GrantRole(friend) = %q; want reader", got)
 	}
-	if got := m.GrantRole("stranger"); got != "" {
+	if got := m.GrantRole("stranger"); got != "" { //nolint:staticcheck // legacy GrantRole shape test until A7 cleanup
 		t.Fatalf("GrantRole(stranger) = %q; want empty", got)
 	}
-	if got := m.GrantRole(""); got != "" {
+	if got := m.GrantRole(""); got != "" { //nolint:staticcheck // legacy GrantRole shape test until A7 cleanup
 		t.Fatalf("GrantRole(\"\") = %q; want empty", got)
 	}
 }

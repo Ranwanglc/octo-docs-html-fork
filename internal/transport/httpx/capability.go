@@ -189,7 +189,7 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		} else if matchUID != "" {
 			if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
 				return service.CapNone, err
-			} else if meta != nil && meta.GrantRole(matchUID) != "" {
+			} else if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback: reader read of meta.grants when doc_member mirror is unwired
 				best = service.CapReader
 			}
 		}

@@ -79,7 +79,7 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 // the mirror-unwired fallback path so single-node deploys keep working.
 func legacyListGrantsFromMeta(meta *storage.DocMeta) map[string]string {
 	out := map[string]string{}
-	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any)
+	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 	if !ok {
 		return out
 	}
@@ -169,7 +169,7 @@ func (s *AuthService) addGrantToMeta(ctx context.Context, slug, uid, role, grant
 		extra := map[string]any{}
 		maps.Copy(extra, meta.Extra)
 		grants := map[string]any{}
-		if existing, ok := extra[storage.GrantsExtraKey].(map[string]any); ok {
+		if existing, ok := extra[storage.GrantsExtraKey].(map[string]any); ok { //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 			maps.Copy(grants, existing)
 		}
 		grants[uid] = map[string]any{
@@ -177,7 +177,7 @@ func (s *AuthService) addGrantToMeta(ctx context.Context, slug, uid, role, grant
 			"granted_by": grantedBy,
 			"created_at": time.Now().UTC().Format(time.RFC3339),
 		}
-		extra[storage.GrantsExtraKey] = grants
+		extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 		return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 			Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
 		})
@@ -243,7 +243,7 @@ func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string)
 		if meta == nil {
 			return apperr.NotFound("no such doc: " + slug)
 		}
-		existing, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any)
+		existing, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 		if !ok {
 			return nil
 		}
@@ -259,9 +259,9 @@ func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string)
 			}
 		}
 		if len(grants) == 0 {
-			delete(extra, storage.GrantsExtraKey)
+			delete(extra, storage.GrantsExtraKey) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 		} else {
-			extra[storage.GrantsExtraKey] = grants
+			extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
 		}
 		return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 			Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
