@@ -13,15 +13,20 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
 )
 
-// P1-A regression tests (yujiawei review on PR #17).
+// P1-A / P1b regression tests (yujiawei rounds 2 & 3 on PR #17).
 //
-// doc_member rows are registered asynchronously (DocService.afterPublished
-// go-routine) and thread-mount / non-mounted docs are never registered at
-// all, so a WIRED mirror can legitimately return ok=false on a live doc.
-// Without a fallback the tier skips and the bot-behind-owner path 404s on
-// its own doc; a legacy reader grant that landed before registration also
-// disappears. A3② and A4 both fall through to the meta-based legacy match
-// when the wired probe misses.
+// P1-A: doc_member rows register asynchronously (DocService.afterPublished
+// go-routine) and thread-mount / non-mounted docs never register, so a WIRED
+// mirror can legitimately return DocIDBySlug ok=false on a live doc. In that
+// state A3② / A4 must fall back to the meta-based legacy match, otherwise a
+// bot-behind-owner would 404 its own freshly published doc and a legacy
+// reader grant that landed pre-registration would disappear.
+//
+// P1b (round 3): the fallback is ONLY safe when the doc is truly unregistered.
+// If the doc IS registered but the caller has no doc_member row (e.g. a M2
+// migrated reader whose row was just DELETEd), falling back to meta.grants
+// would resurrect access = revoke bypass. RoleBySlugUID's docRegistered
+// return separates the two states so this file exercises both.
 
 // newServerWithMirrorAndBotAuth is newServerWithMirror + bot auth enabled so
 // tests can drive a Bearer bot-token request path (selfUID=bot, ownerUID=owner).
@@ -41,23 +46,46 @@ func newServerWithMirrorAndBotAuth(t *testing.T, mirror *stubMirror) (http.Handl
 	return srv.Handler(), store
 }
 
-// A3② wired-!ok fallback: creator_uid == ownerUID via meta, doc_member has
-// no row -> still CapAuthor. Mirrors yujiawei's repro: mirror wired,
-// doc_member empty, creator_uid stamped as owner because A1 has not flipped
-// yet, bot bearer would otherwise 404 its own doc.
-func TestA3OwnerFallsBackToMetaWhenDocMemberEmpty(t *testing.T) {
+// A3② unregistered doc: DocIDBySlug returns ok=false (doc not in doc_member
+// yet) -> docRegistered=false -> meta fallback allowed -> creator_uid==ownerUID
+// authors the bot. Mirrors the real async/thread-mount case yujiawei
+// documented on PR #17: bot bearer would otherwise 404 its own freshly
+// published doc.
+func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
-	mirror := &stubMirror{slugToDoc: map[string]string{"docW": "dW"}} // no roles seeded
+	mirror := &stubMirror{} // no slugToDoc, no roles -> DocIDBySlug ok=false
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
 	publishAsBot(t, h, "docW") // creator_uid = owner-1 (bot -> ownerUID stamp)
 
 	// Bot bearer session: selfUID=bot-1, ownerUID=owner-1. A3① misses (bot uid
-	// != creator=owner-1); A3② wired branch returns ok=false and must fall
-	// back to creator_uid==ownerUID via meta -> author.
+	// != creator=owner-1); A3② wired branch returns docRegistered=false and
+	// falls back to creator_uid==ownerUID via meta -> author.
 	rec := do(t, h, http.MethodPost, "/v1/docs/docW/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("bot bearer share on wired-empty doc = %d; want 200 (P1-A meta fallback): %s", rec.Code, rec.Body.String())
+		t.Fatalf("bot bearer share on unregistered doc = %d; want 200 (P1-A meta fallback): %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A3② P1b revoke-bypass close: doc IS registered but no doc_member owner row.
+// docRegistered=true -> meta creator_uid==ownerUID fallback must be blocked so
+// a stale meta signal cannot resurrect author cap after a doc_member cleanup.
+// This is the round-3 gate: an M2-migrated admin row that got revoked must
+// stay revoked even if meta.creator_uid still points at the owner.
+func TestA3OwnerNoFallbackWhenDocRegisteredButRowMissing(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
+	mirror := &stubMirror{slugToDoc: map[string]string{"docReg": "dReg"}} // registered, no owner row
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docReg") // creator_uid = owner-2
+
+	// A3① misses (bot uid != owner-2); A3② wired returns docRegistered=true,
+	// ok=false -> fallback disabled -> A4 also misses (registered, no reader
+	// row) -> doc_binding probe not wired -> 404. Author cap must NOT come
+	// from meta.creator_uid on a registered doc.
+	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
+		map[string]string{"Authorization": "Bearer bot-token"}, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("bot bearer share on registered-no-row doc = %d; want 404 (P1b no meta fallback): %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -80,15 +108,13 @@ func TestA3OwnerAdminInDocMemberStillWinsAfterFallback(t *testing.T) {
 	}
 }
 
-// A4 wired-!ok fallback: mirror wired but no doc_member row for a uid that
-// only appears in legacy meta.grants (pre-plan③ data or a reader grant
-// added while doc_member registration was still pending). The reader tier
-// must fall back to meta.GrantRole so the caller keeps reader access.
-func TestA4WiredMissFallsBackToMetaGrant(t *testing.T) {
-	// Wired mirror without a slug -> docID mapping. RoleBySlugUID misses.
-	h, store := newServerWithMirrorAndBotAuth(t, &stubMirror{})
+// A4 unregistered doc falls back to meta.grants: mirror wired but no
+// slug->docID mapping (thread-mount / async pre-registration state). The
+// reader tier's wired probe returns docRegistered=false and legacy
+// meta.grants[uid]=reader keeps the caller readable.
+func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
+	h, store := newServerWithMirrorAndBotAuth(t, &stubMirror{}) // no slugToDoc
 
-	// Publish as the owner so creator_uid == "owner-42".
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
 		`{"slug":"docR","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
@@ -96,16 +122,41 @@ func TestA4WiredMissFallsBackToMetaGrant(t *testing.T) {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Simulate pre-plan③ / pending-registration state: plant a legacy
-	// meta.grants[reader-9]=reader row directly in the store.
+	// Legacy grant seeded before doc_member registration lands.
 	seedLegacyReaderGrant(t, store, "docR", "reader-9")
 
-	// reader-9 reads the doc via trust header. Wired probe misses (no docID),
-	// fallback finds meta.grants[reader-9]=reader -> CapReader -> render 200.
 	rec = do(t, h, http.MethodGet, "/d/docR/v/1",
 		map[string]string{octoUIDHeaderName: "reader-9"}, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("wired-but-!ok reader read = %d; want 200 via legacy fallback: %s", rec.Code, rec.Body.String())
+		t.Fatalf("unregistered-doc reader read = %d; want 200 via legacy fallback: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A4 P1b revoke-bypass close: doc IS registered but reader-9 has no
+// doc_member row, yet a stale legacy meta.grants[reader-9]=reader lingers
+// (M2 copies, does not delete; or the row was just DELETEd via
+// /grants/{uid}). Fallback must be blocked so the read is 404 — otherwise
+// the revoke is silently a no-op.
+func TestA4RegisteredDocDeletedRowNoFallback(t *testing.T) {
+	mirror := &stubMirror{slugToDoc: map[string]string{"docR": "dR"}} // registered, no reader row
+	h, store := newServerWithMirrorAndBotAuth(t, mirror)
+
+	rec := do(t, h, http.MethodPost, "/v1/docs",
+		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
+		`{"slug":"docR","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Stale legacy grant left behind after M2 migration / a prior revoke.
+	seedLegacyReaderGrant(t, store, "docR", "reader-9")
+
+	// reader-9 reads. A4 wired returns docRegistered=true, ok=false -> fallback
+	// blocked -> meta.grants[reader-9] IGNORED -> 404. Revoke bypass closed.
+	rec = do(t, h, http.MethodGet, "/d/docR/v/1",
+		map[string]string{octoUIDHeaderName: "reader-9"}, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("registered-no-row reader read = %d; want 404 (P1b revoke bypass close): %s", rec.Code, rec.Body.String())
 	}
 }
 

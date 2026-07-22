@@ -153,17 +153,24 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		// would 404 on a doc it just published. Skipped when ownerUID == "".
 		if ownerUID != "" {
 			hit := false
+			fallbackAllowed := true
 			if s.auth.DocMembersWired() {
-				role, ok, _, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
+				role, ok, docRegistered, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
 				if rerr != nil {
 					return service.CapNone, rerr
 				}
 				if ok && role == service.DocMemberRoleAdmin {
 					hit = true
 				}
-				// ok=false: fall through to the legacy match below.
+				// yujiawei round-3 P1a: doc registered + no owner row → do NOT
+				// fall back to meta creator match. On a registered doc,
+				// doc_member is authoritative; a legacy meta signal must not
+				// resurrect access after DELETE on a M2-migrated grant.
+				if docRegistered {
+					fallbackAllowed = false
+				}
 			}
-			if !hit && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+			if !hit && fallbackAllowed && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
 				hit = true
 			}
 			if hit {
@@ -183,17 +190,24 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	// in-memory tests keep working.
 	if best < service.CapReader {
 		hit := false
+		fallbackAllowed := true
 		if s.auth.DocMembersWired() && selfUID != "" {
-			role, ok, _, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
+			role, ok, docRegistered, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
 			if err != nil {
 				return service.CapNone, err
 			}
 			if ok && role >= service.DocMemberRoleReader {
 				hit = true
 			}
-			// ok=false: fall through to legacy meta.grants match below.
+			// yujiawei round-3 P1a: registered doc + no reader row → do NOT
+			// fall back to meta.GrantRole. Otherwise a stale meta.grants
+			// entry left after M2 (M2 copies, does not delete) or after a
+			// revoke would still grant read = revoke bypass.
+			if docRegistered {
+				fallbackAllowed = false
+			}
 		}
-		if !hit && matchUID != "" {
+		if !hit && fallbackAllowed && matchUID != "" {
 			meta, err := s.auth.MetaFor(r.Context(), slug)
 			if err != nil {
 				return service.CapNone, err
