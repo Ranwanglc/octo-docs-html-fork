@@ -113,6 +113,12 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 // hit → row existed) means the guard kicked in; we return
 // ErrDocMemberAdminGuard so callers can surface a protected-row error and
 // skip the permission_epoch bump.
+//
+// yujiawei round-5 P2-α: (a) surface RowsAffected / probe SELECT errors
+// instead of swallowing them — a transient DB error must not look like
+// "already absent"; (b) bump permission_epoch only when a row was actually
+// deleted, otherwise a no-op DELETE (row absent or concurrently already
+// removed) needlessly invalidates every live connection's auth cache.
 func (m *MySQLDocMemberMirror) DeleteGrant(ctx context.Context, docID, uid string) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -126,17 +132,32 @@ func (m *MySQLDocMemberMirror) DeleteGrant(ctx context.Context, docID, uid strin
 		return fmt.Errorf("delete doc_member: %w", err)
 	}
 	affected, aerr := res.RowsAffected()
-	if aerr == nil && affected == 0 {
-		// Distinguish "nothing to delete" (already absent) from "row is admin"
-		// (guard tripped). A follow-up SELECT is the cheapest way to tell them
-		// apart under the same tx snapshot.
+	if aerr != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("rows affected doc_member delete: %w", aerr)
+	}
+	if affected == 0 {
+		// Distinguish "already absent" from "row is admin (guard tripped)".
+		// A follow-up SELECT under the same tx snapshot decides.
 		var role int
-		if qerr := tx.QueryRowContext(ctx,
+		qerr := tx.QueryRowContext(ctx,
 			"SELECT role FROM doc_member WHERE doc_id=? AND uid=?",
-			docID, uid).Scan(&role); qerr == nil && role == DocMemberRoleAdmin {
+			docID, uid).Scan(&role)
+		switch {
+		case qerr == nil && role == DocMemberRoleAdmin:
 			_ = tx.Rollback()
 			return ErrDocMemberAdminGuard
+		case qerr != nil && !errors.Is(qerr, sql.ErrNoRows):
+			_ = tx.Rollback()
+			return fmt.Errorf("probe doc_member after guarded delete: %w", qerr)
 		}
+		// Row was absent (or non-admin and vanished under concurrent DELETE):
+		// no state changed, skip the epoch bump. Commit an empty tx so we
+		// still release DB resources cleanly.
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit no-op doc_member delete: %w", err)
+		}
+		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE doc_meta SET permission_epoch=permission_epoch+1 WHERE doc_id=?",
