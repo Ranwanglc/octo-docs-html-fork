@@ -67,25 +67,50 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	}
 }
 
-// A3② P1b revoke-bypass close: doc IS registered but no doc_member owner row.
-// docRegistered=true -> meta creator_uid==ownerUID fallback must be blocked so
-// a stale meta signal cannot resurrect author cap after a doc_member cleanup.
-// This is the round-3 gate: an M2-migrated admin row that got revoked must
-// stay revoked even if meta.creator_uid still points at the owner.
-func TestA3OwnerNoFallbackWhenDocRegisteredButRowMissing(t *testing.T) {
+// A3② P1-a lockout close (yujiawei round-5): doc IS registered but no
+// doc_member owner-admin row (M1 has not backfilled yet, or docs-backend
+// registered the doc atomically without owner-admin, or thread-mount
+// state). A3②'s fallback keys on creator_uid, which is stamped at
+// publish and never revocable, so falling back is safe: it cannot
+// resurrect a revoked grant. Round-3 gated this path on docRegistered
+// and locked the owner out of their own doc; round-5 removes the gate
+// on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
+func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
 	mirror := &stubMirror{slugToDoc: map[string]string{"docReg": "dReg"}} // registered, no owner row
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
 	publishAsBot(t, h, "docReg") // creator_uid = owner-2
 
 	// A3① misses (bot uid != owner-2); A3② wired returns docRegistered=true,
-	// ok=false -> fallback disabled -> A4 also misses (registered, no reader
-	// row) -> doc_binding probe not wired -> 404. Author cap must NOT come
-	// from meta.creator_uid on a registered doc.
+	// ok=false; without the round-3 gate, fallback proceeds and
+	// creator_uid==ownerUID lands owner-2 as CapAuthor.
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("bot bearer share on registered-no-row doc = %d; want 404 (P1b no meta fallback): %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 200 (P1-a fallback restored): %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A3② P1-a lockout close, with unrelated doc_member rows present. Mirror
+// has entries for other uids (a reader grant and a stranger) but no
+// owner-admin row. Confirms the fallback keys strictly on
+// creator_uid==ownerUID via meta and is not confused by adjacent rows.
+func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-3", botName: "Bot Three", botSpaceID: "s3", botOwnerUID: "owner-3"})
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docReg3": "dReg3"},
+		roles: map[string]int{
+			"dReg3|reader-x":   service.DocMemberRoleReader,
+			"dReg3|stranger-y": service.DocMemberRoleReader,
+		},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docReg3") // creator_uid = owner-3
+
+	rec := do(t, h, http.MethodPost, "/v1/docs/docReg3/share",
+		map[string]string{"Authorization": "Bearer bot-token"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 200 (creator_uid fallback wins): %s", rec.Code, rec.Body.String())
 	}
 }
 

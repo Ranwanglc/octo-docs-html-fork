@@ -153,24 +153,24 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		// would 404 on a doc it just published. Skipped when ownerUID == "".
 		if ownerUID != "" {
 			hit := false
-			fallbackAllowed := true
 			if s.auth.DocMembersWired() {
-				role, ok, docRegistered, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
+				role, ok, _, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
 				if rerr != nil {
 					return service.CapNone, rerr
 				}
 				if ok && role == service.DocMemberRoleAdmin {
 					hit = true
 				}
-				// yujiawei round-3 P1a: doc registered + no owner row → do NOT
-				// fall back to meta creator match. On a registered doc,
-				// doc_member is authoritative; a legacy meta signal must not
-				// resurrect access after DELETE on a M2-migrated grant.
-				if docRegistered {
-					fallbackAllowed = false
-				}
+				// yujiawei round-5 P1-a: no docRegistered gate here. A3②'s
+				// fallback keys on creator_uid, which is stamped at publish
+				// (doc.go) and never revocable (RemoveGrant refuses it), so it
+				// cannot resurrect a revoked grant. Gating it locks owners out
+				// when the owner-admin row is missing (registered-but-no-row) —
+				// a state this repo cannot rule out, since doc_member lives in
+				// docs-backend. Revoke-bypass is closed on A4 (reader tier)
+				// where the fallback keys on meta.grants, which IS revocable.
 			}
-			if !hit && fallbackAllowed && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+			if !hit && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
 				hit = true
 			}
 			if hit {
