@@ -7,7 +7,13 @@ import (
 	"fmt"
 )
 
-const docMemberRoleReader = 1
+const (
+	docMemberRoleReader = 1
+	// DocMemberRoleAdmin mirrors the rich-doc doc_member.role admin encoding.
+	// bestCred consumes this to short-circuit CapAuthor when the caller's
+	// owner uid holds an admin row — the plan③ A3② tier.
+	DocMemberRoleAdmin = 3
+)
 
 // DocMember is one row of the rich-doc doc_member table exposed to callers that
 // need to enumerate a doc's direct grants (grants.ListGrants, A6). Fields map

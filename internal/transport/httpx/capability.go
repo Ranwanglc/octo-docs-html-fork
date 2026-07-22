@@ -111,23 +111,61 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	// botSessionFromCtx here observe one identity — do not split them into
 	// separate instances or the bot→OwnerUID mapping below silently breaks.
 	selfUID, ownerUID := sessionUIDs(r)
-	// matchUID keeps the pre-plan③ semantics (owner-preferring) for the
-	// existing author-by-creator, doc_grants, and doc_binding branches so A2
-	// is a pure refactor — A3 flips the author path to use selfUID/ownerUID
-	// explicitly.
+	// matchUID keeps the pre-plan③ owner-preferring value for doc_grants (A4)
+	// and doc_binding, which still resolve against the owner uid. The author
+	// tiers below use selfUID/ownerUID explicitly.
 	matchUID := ownerUID
-	_ = selfUID // consumed by A3; kept here so A2 lands standalone.
-	// Author-by-creator: the doc's creator uid is a USER uid, matched by matchUID
-	// above. This replaces the removed "every bot is superAdmin" grant: a bot only
-	// gets author on docs its owner created.
-	if matchUID != "" {
-		if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
+
+	// Plan③ A3 author tiers, in order:
+	//   ① self-uid match  → CapAuthor. Covers bot-authored docs the bot itself
+	//      reads, and real users reading their own docs. When creator_uid still
+	//      stores the owner (legacy A1), a real user visiting their own doc
+	//      also lands here because selfUID == ownerUID.
+	//   ② doc_member owner-admin → CapAuthor. Covers the owner behind a bot
+	//      reading a bot-authored doc: creator_uid is the bot uid (once A1
+	//      flips) or the owner (legacy); either way the owner's admin row in
+	//      doc_member — backfilled by M1 — is the authoritative signal.
+	// Order matters: ① before ② so a real user’s own visit is judged by
+	// creator_uid (not by an unrelated admin grant on the same doc), and both
+	// before A4’s reader path so a grant can never downgrade an author.
+	if selfUID != "" || ownerUID != "" {
+		meta, err := s.auth.MetaFor(r.Context(), slug)
+		if err != nil {
 			return service.CapNone, err
-		} else if meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == matchUID {
-			if service.CapAuthor > best {
-				best = service.CapAuthor
+		}
+		if meta != nil {
+			creator := meta.CreatorUID()
+			// ① self-uid == creator_uid.
+			if creator != "" && selfUID != "" && creator == selfUID {
+				if service.CapAuthor > best {
+					best = service.CapAuthor
+				}
+				return best, nil
 			}
-			return best, nil
+		}
+		// ② owner has admin row in doc_member. Skipped when ownerUID == "".
+		// When a mirror is wired we consult doc_member and stop — M1 backfill
+		// is the contract that every owner-admin has a row here.
+		// When no mirror is wired (single-node deploys, in-memory tests) we
+		// fall back to the pre-plan③ owner-preferring semantics
+		// (creator_uid == ownerUID → CapAuthor) so those environments continue
+		// to function; a bot's owner still authors bot-authored docs.
+		if ownerUID != "" {
+			if s.auth.DocMembersWired() {
+				if role, ok, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID); rerr != nil {
+					return service.CapNone, rerr
+				} else if ok && role == service.DocMemberRoleAdmin {
+					if service.CapAuthor > best {
+						best = service.CapAuthor
+					}
+					return best, nil
+				}
+			} else if meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+				if service.CapAuthor > best {
+					best = service.CapAuthor
+				}
+				return best, nil
+			}
 		}
 	}
 	// doc_grants: an explicitly granted USER uid gets reader (read+comment).
