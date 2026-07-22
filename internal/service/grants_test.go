@@ -592,3 +592,26 @@ func TestRoleBySlugUIDRegisteredHitReturnsRole(t *testing.T) {
 		t.Fatalf("registered-hit: got (role=%d ok=%v docRegistered=%v err=%v); want (reader true true nil)", role, ok, docRegistered, err)
 	}
 }
+
+// yujiawei round-3 P2: AddGrant on an unregistered doc must fall back to
+// meta.grants, matching reads / ListGrants / RemoveGrant. Prior to this fix
+// it 404'd, which made thread-mount / non-mounted docs (which never register
+// in doc_member) permanently un-grantable while still readable — an
+// asymmetric API surface.
+func TestAddGrantUnregisteredFallsBackToMeta(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{unregistered: true})
+
+	if err := svc.AddGrant(context.Background(), slug, "reader-9", "reader", "granter"); err != nil {
+		t.Fatalf("AddGrant on unregistered doc: got %v; want nil (meta fallback)", err)
+	}
+
+	// Verify: ListGrants (unregistered path also reads meta) surfaces reader-9.
+	grants, err := svc.ListGrants(context.Background(), slug)
+	if err != nil {
+		t.Fatalf("ListGrants: %v", err)
+	}
+	if got := grants["reader-9"]; got != "reader" {
+		t.Fatalf("meta.grants[reader-9] = %q; want reader (AddGrant did not fall back)", got)
+	}
+}

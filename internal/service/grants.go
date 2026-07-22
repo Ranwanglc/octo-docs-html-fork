@@ -159,7 +159,13 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 		return err
 	}
 	if !ok {
-		return apperr.NotFound("doc has no rich-doc registration yet: " + slug)
+		// yujiawei round-3 P2: doc not yet registered in doc_member (async
+		// afterPublished, or thread-mount/non-mounted which never register).
+		// Reads / ListGrants / RemoveGrant all fall back to meta.grants in
+		// this state; AddGrant used to 404 here, breaking API symmetry and
+		// making thread-mount docs un-grantable forever. Fall back to the
+		// legacy meta.grants writer so the four operations stay aligned.
+		return s.addGrantToMeta(ctx, slug, uid, grantRoleReader, grantedBy)
 	}
 	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
 	if err != nil {
