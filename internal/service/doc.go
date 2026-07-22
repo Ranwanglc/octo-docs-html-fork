@@ -28,9 +28,19 @@ type DocService struct {
 	baseURL  string
 	maxBytes int64
 
-	register DocRegistrar
-	logger   *slog.Logger
+	register    DocRegistrar
+	reconcileFn GrantReconciler
+	logger      *slog.Logger
 }
+
+// GrantReconciler drains legacy meta.grants entries into doc_member after
+// async registration. Injected (not a hard dep on AuthService) so DocService
+// stays testable in isolation and single-node deploys without a mirror wire a
+// no-op. yujiawei round-4 P1: without this hook, a grant issued while the doc
+// is unregistered (AddGrant → addGrantToMeta fallback) evaporates once
+// registration flips docRegistered=true and the strict wired gate closes the
+// meta fallback.
+type GrantReconciler func(ctx context.Context, slug string) error
 
 // DocRegistrar is the docs-backend side-effect sink. Implementations must be
 // nil-safe and best-effort: registration failure must never fail doc writes.
@@ -65,6 +75,17 @@ func (s *DocService) WithDocsBackendRegistration(r DocRegistrar, logger *slog.Lo
 		logger = slog.Default()
 	}
 	s.logger = logger
+	return s
+}
+
+// WithGrantReconciler attaches the reconciler DocService calls after each
+// async registration to drain legacy meta.grants entries into doc_member.
+// Wired only when both a registrar and a doc_member mirror exist. Returns s.
+func (s *DocService) WithGrantReconciler(fn GrantReconciler) *DocService {
+	if s == nil {
+		return nil
+	}
+	s.reconcileFn = fn
 	return s
 }
 
@@ -626,6 +647,16 @@ func (s *DocService) afterPublished(result *PublishResult) {
 		s.register.Register(ctx, reg, result.publisherToken)
 		if result.hadMeta && result.titleChanged {
 			s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
+		}
+		// yujiawei round-4 P1: reconcile after registration lands so grants
+		// issued during the pre-registration gap (which the wired A4 gate now
+		// refuses to serve from meta.grants) are copied into doc_member. Runs
+		// on this same fire-and-forget goroutine; per-uid errors are absorbed
+		// inside the reconciler.
+		if s.reconcileFn != nil {
+			if err := s.reconcileFn(ctx, result.Slug); err != nil {
+				s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", err.Error())
+			}
 		}
 	}()
 }

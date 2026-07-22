@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"time"
@@ -356,4 +357,64 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 	if err := s.docMembers.DeleteGrant(ctx, docID, uid); err != nil {
 		slog.Default().Debug("doc_member mirror delete failed", "slug", slug, "uid", uid, "err", err.Error())
 	}
+}
+
+// ReconcileMetaGrantsToDocMember copies any legacy meta.grants readers into
+// doc_member. Called by DocService.afterPublished after async registration so
+// that grants issued during the registration gap (AddGrant → meta.grants
+// fallback while DocIDBySlug ok=false) do not evaporate once bestCred flips to
+// the strict wired gate (yujiawei round-4 P1). Best-effort: per-uid errors are
+// logged and skipped so one bad row cannot block the rest, matching the
+// fire-and-forget semantics of afterPublished itself. meta.grants entries are
+// left in place so mirror-unwired deploys keep working; A7 cleanup drops them.
+func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug string) error {
+	if s.docMembers == nil {
+		return nil
+	}
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("reconcile meta lookup: %w", err)
+	}
+	if meta == nil {
+		return nil
+	}
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("reconcile slug resolve: %w", err)
+	}
+	if !ok {
+		// Not registered yet (or unregisterable mount type). Nothing to
+		// reconcile; a later publish or manual mount will retrigger.
+		return nil
+	}
+	grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	if !ok || len(grants) == 0 {
+		return nil
+	}
+	creator := meta.CreatorUID()
+	logger := slog.Default()
+	for uid, v := range grants {
+		if uid == "" || (creator != "" && uid == creator) {
+			continue
+		}
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		roleStr, _ := entry["role"].(string)
+		if roleStr != grantRoleReader {
+			// Only reader is a valid per-uid role today; skip anything else
+			// rather than surprise-promote a stray value.
+			continue
+		}
+		grantedBy, _ := entry["granted_by"].(string)
+		if grantedBy == "" {
+			grantedBy = "reconcile_afterpublished"
+		}
+		if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy); err != nil {
+			logger.Debug("reconcile upsert failed", "slug", slug, "uid", uid, "err", err.Error())
+			continue
+		}
+	}
+	return nil
 }

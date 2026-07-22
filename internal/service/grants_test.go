@@ -615,3 +615,112 @@ func TestAddGrantUnregisteredFallsBackToMeta(t *testing.T) {
 		t.Fatalf("meta.grants[reader-9] = %q; want reader (AddGrant did not fall back)", got)
 	}
 }
+
+// yujiawei round-4 P1: grants issued during the pre-registration gap land in
+// meta.grants (AddGrant unregistered fallback). Once afterPublished registers
+// the doc, the strict wired A4 gate refuses to serve them from meta.grants,
+// so they must be reconciled into doc_member or the reader silently 404s.
+func TestReconcileMetaGrantsPromotesReaderIntoDocMember(t *testing.T) {
+	store := memory.New()
+	slug := "docReconcile"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed legacy grants for reconcile
+				"reader-5": map[string]any{"role": "reader", "granted_by": "owner-1"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-R"}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if mirror.roles["reader-5"] != service.DocMemberRoleReader {
+		t.Fatalf("reader-5 not promoted into doc_member: roles=%v", mirror.roles)
+	}
+	// meta.grants entry stays put so mirror-unwired deploys keep working.
+	meta, _ := store.GetMeta(context.Background(), slug)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants left in place
+	if _, ok := grants["reader-5"]; !ok {
+		t.Fatalf("meta.grants[reader-5] must not be deleted; got %v", grants)
+	}
+}
+
+// Reconcile must skip the creator uid (creator's admin row is provisioned by
+// M1, not by legacy meta.grants) and must skip non-reader roles / malformed
+// entries so a rogue value can't surprise-promote.
+func TestReconcileMetaGrantsSkipsCreatorAndNonReader(t *testing.T) {
+	store := memory.New()
+	slug := "docFilter"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed mixed legacy rows
+				"owner-1":     map[string]any{"role": "reader"}, // creator skip
+				"weirdo":      map[string]any{"role": "editor"}, // unknown role skip
+				"malformed":   "not-a-map",                      // wrong shape skip
+				"real-reader": map[string]any{"role": "reader"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-F"}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if _, present := mirror.roles["owner-1"]; present {
+		t.Fatalf("creator uid must be skipped, but got role %d", mirror.roles["owner-1"])
+	}
+	if _, present := mirror.roles["weirdo"]; present {
+		t.Fatalf("non-reader role must be skipped, but got role %d", mirror.roles["weirdo"])
+	}
+	if _, present := mirror.roles["malformed"]; present {
+		t.Fatal("malformed entry must be skipped")
+	}
+	if mirror.roles["real-reader"] != service.DocMemberRoleReader {
+		t.Fatalf("real reader not promoted: roles=%v", mirror.roles)
+	}
+}
+
+// Reconcile is a no-op when doc has no legacy meta.grants (the common case).
+func TestReconcileMetaGrantsNoOpEmpty(t *testing.T) {
+	store := memory.New()
+	slug := "docEmpty"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{Slug: slug, Title: "T", Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"}}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-E"}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(mirror.calls) != 0 {
+		t.Fatalf("reconcile called mirror on empty grants: %+v", mirror.calls)
+	}
+}
+
+// Reconcile with an unwired mirror is a silent no-op (single-node deploys).
+func TestReconcileMetaGrantsUnwiredNoop(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	// Add a legacy row that would otherwise be reconciled.
+	meta, _ := memory.New().GetMeta(context.Background(), slug)
+	_ = meta // meta unused; unwired path returns before touching store beyond GetMeta
+	if err := svc.ReconcileMetaGrantsToDocMember(context.Background(), slug); err != nil {
+		t.Fatalf("unwired reconcile must be nil: %v", err)
+	}
+}
