@@ -31,11 +31,17 @@ type fakeDocMemberMirror struct {
 	roles       map[string]int
 	listMembers []service.DocMember
 	readErr     error
+	// unregistered=true makes DocIDBySlug return ok=false so tests can drive
+	// the "doc not in doc_member yet" state (yujiawei round-3 P1a).
+	unregistered bool
 }
 
 func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (string, bool, error) {
 	if f.resolveErr != nil {
 		return "", false, f.resolveErr
+	}
+	if f.unregistered {
+		return "", false, nil
 	}
 	if f.docID == "" {
 		return "node-" + slug, true, nil
@@ -544,4 +550,45 @@ func (unregisteredMirror) RoleByDocUID(context.Context, string, string) (int, bo
 
 func (unregisteredMirror) ListMembers(context.Context, string) ([]service.DocMember, error) {
 	return nil, nil
+}
+
+// yujiawei round-3 P1a: RoleBySlugUID must distinguish two "ok=false" states
+// so bestCred can gate its meta fallback correctly. docRegistered=false means
+// "doc has no rich-doc row yet — legacy fallback allowed"; docRegistered=true
+// with ok=false means "doc IS registered, uid just has no row — do NOT fall
+// back to meta.grants, or a stale entry after DELETE would grant read again".
+
+func TestRoleBySlugUIDUnwiredReportsUnregistered(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	role, ok, docRegistered, err := svc.RoleBySlugUID(context.Background(), slug, "u1")
+	if err != nil || role != 0 || ok || docRegistered {
+		t.Fatalf("unwired: got (role=%d ok=%v docRegistered=%v err=%v); want (0 false false nil)", role, ok, docRegistered, err)
+	}
+}
+
+func TestRoleBySlugUIDDocUnregisteredReportsUnregistered(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{unregistered: true})
+	role, ok, docRegistered, err := svc.RoleBySlugUID(context.Background(), slug, "u1")
+	if err != nil || role != 0 || ok || docRegistered {
+		t.Fatalf("wired-but-unregistered: got (role=%d ok=%v docRegistered=%v err=%v); want (0 false false nil)", role, ok, docRegistered, err)
+	}
+}
+
+func TestRoleBySlugUIDRegisteredNoRowReportsRegistered(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "d1"}) // registered, roles empty
+	role, ok, docRegistered, err := svc.RoleBySlugUID(context.Background(), slug, "ghost")
+	if err != nil || role != 0 || ok || !docRegistered {
+		t.Fatalf("registered-no-row: got (role=%d ok=%v docRegistered=%v err=%v); want (0 false true nil) — P1a revoke-bypass gate", role, ok, docRegistered, err)
+	}
+}
+
+func TestRoleBySlugUIDRegisteredHitReturnsRole(t *testing.T) {
+	svc, slug := newGrantSvc(t)
+	svc.WithDocMemberMirror(&fakeDocMemberMirror{docID: "d1", roles: map[string]int{"reader-1": service.DocMemberRoleReader}})
+	role, ok, docRegistered, err := svc.RoleBySlugUID(context.Background(), slug, "reader-1")
+	if err != nil || role != service.DocMemberRoleReader || !ok || !docRegistered {
+		t.Fatalf("registered-hit: got (role=%d ok=%v docRegistered=%v err=%v); want (reader true true nil)", role, ok, docRegistered, err)
+	}
 }

@@ -110,24 +110,36 @@ func (s *AuthService) MetaFor(ctx context.Context, slug string) (*storage.DocMet
 // deploys with no rich-doc DB, and in-memory tests that do not wire a mirror).
 func (s *AuthService) DocMembersWired() bool { return s.docMembers != nil }
 
-// RoleBySlugUID looks the caller's row up in doc_member for slug and returns
-// its role (ok=false when no row). Two-hop: slug -> doc_id (via mirror) ->
-// role. Callers use this for plan③ A3 owner-admin (role=3) short-circuit and
-// A4 reader (role>=1) decisions. Returns ok=false, nil error when no mirror
-// is wired, when the slug is unregistered, or when the caller has no row —
-// bestCred treats every ok=false as "skip this tier".
-func (s *AuthService) RoleBySlugUID(ctx context.Context, slug, uid string) (int, bool, error) {
+// RoleBySlugUID looks the caller's row up in doc_member for slug. Two-hop:
+// slug -> doc_id (via mirror) -> role. Callers use this for plan③ A3
+// owner-admin (role=3) short-circuit and A4 reader (role>=1) decisions.
+//
+// yujiawei round-3 P1a: two very different states must not collapse into the
+// same "ok=false" — otherwise capability.go's meta fallback covers both, and
+// a revoke on a registered doc silently leaves the legacy meta.grants entry
+// still granting read (revoke bypass). docRegistered separates them:
+//
+//   - docRegistered=false, ok=false: mirror unwired, uid empty, or doc has no
+//     doc_member registration yet (async publish, thread-mount, non-mounted).
+//     Callers may fall back to legacy meta.
+//   - docRegistered=true, ok=false: doc IS registered but uid has no row.
+//     Caller MUST treat this as "no access via this tier" and MUST NOT fall
+//     back to meta.grants — a stale meta.grants entry from M2 could otherwise
+//     resurrect access after DELETE /grants/{uid}.
+//   - docRegistered=true, ok=true: role is authoritative.
+func (s *AuthService) RoleBySlugUID(ctx context.Context, slug, uid string) (role int, ok, docRegistered bool, err error) {
 	if s.docMembers == nil || uid == "" {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
 	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
 	if err != nil {
-		return 0, false, err
+		return 0, false, false, err
 	}
 	if !ok {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
-	return s.docMembers.RoleByDocUID(ctx, docID, uid)
+	role, ok, err = s.docMembers.RoleByDocUID(ctx, docID, uid)
+	return role, ok, true, err
 }
 
 // GetSession resolves a session from its id, or nil.

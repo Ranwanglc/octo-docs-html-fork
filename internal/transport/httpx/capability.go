@@ -154,7 +154,7 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		if ownerUID != "" {
 			hit := false
 			if s.auth.DocMembersWired() {
-				role, ok, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
+				role, ok, _, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
 				if rerr != nil {
 					return service.CapNone, rerr
 				}
@@ -184,7 +184,7 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	if best < service.CapReader {
 		hit := false
 		if s.auth.DocMembersWired() && selfUID != "" {
-			role, ok, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
+			role, ok, _, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
 			if err != nil {
 				return service.CapNone, err
 			}
