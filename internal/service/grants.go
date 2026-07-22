@@ -240,7 +240,12 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 		return err
 	}
 	if !ok {
-		return nil // no rich-doc row yet, nothing to revoke
+		// P2-C: even though there's no rich-doc row, sweep any legacy
+		// meta.grants[uid] left over from pre-plan③ so a later unwire or
+		// migration cannot resurrect a stale grant. Reads already ignore
+		// meta.grants once the mirror is wired, so this is a no-op for the
+		// live auth path.
+		return s.removeGrantFromMeta(ctx, slug, uid)
 	}
 	// Probe first so an absent uid is a true no-op (no wasted DELETE, no
 	// permission_epoch bump) and admin rows are refused before DELETE runs.

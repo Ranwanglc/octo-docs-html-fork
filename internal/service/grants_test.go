@@ -478,3 +478,70 @@ func TestAddGrantIdempotentReaderNoEpochBump(t *testing.T) {
 		t.Fatalf("reader role changed: %d", mirror.roles["reader-uid"])
 	}
 }
+
+// P2-C: RemoveGrant on the wired path, when the doc has no rich-doc row yet
+// (DocIDBySlug returns ok=false), sweeps any legacy meta.grants[uid] so a
+// later unwire or a migration reading meta.grants cannot resurrect a stale
+// grant. Reads already ignore meta.grants when the mirror is wired, so this
+// is bookkeeping only — the response is nil either way.
+func TestRemoveGrantWiredButUnregisteredCleansMeta(t *testing.T) {
+	store := memory.New()
+	slug := "docP2C"
+	// Seed the doc and a legacy meta.grants[friend]=reader row.
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // legacy meta.grants seed for P2-C sweep test
+				"friend": map[string]any{"role": "reader"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	// Wire an unregisteredMirror that always returns ok=false so RemoveGrant
+	// hits the P2-C sweep branch instead of the doc_member DELETE path.
+	svc.WithDocMemberMirror(&unregisteredMirror{})
+	ctx := context.Background()
+
+	if err := svc.RemoveGrant(ctx, slug, "friend"); err != nil {
+		t.Fatalf("RemoveGrant(unregistered): %v", err)
+	}
+	// Reads land on the wired path (ListMembers → nil), so use the storage
+	// layer to prove meta.grants was actually swept.
+	meta, err := store.GetMeta(ctx, slug)
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // reading legacy meta.grants to assert sweep
+	if _, still := grants["friend"]; still {
+		t.Fatalf("legacy meta.grants[friend] not swept: %v", grants)
+	}
+}
+
+// unregisteredMirror is a DocMemberMirror whose DocIDBySlug always returns
+// ok=false — simulating a wired-but-unregistered doc for the P2-C sweep
+// path. Every other method is unreachable in that state and panics to
+// catch accidental calls.
+type unregisteredMirror struct{}
+
+func (unregisteredMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (unregisteredMirror) UpsertDirectGrant(context.Context, string, string, int, string) error {
+	panic("unregisteredMirror.UpsertDirectGrant should not be called")
+}
+
+func (unregisteredMirror) DeleteGrant(context.Context, string, string) error {
+	panic("unregisteredMirror.DeleteGrant should not be called")
+}
+
+func (unregisteredMirror) RoleByDocUID(context.Context, string, string) (int, bool, error) {
+	panic("unregisteredMirror.RoleByDocUID should not be called")
+}
+
+func (unregisteredMirror) ListMembers(context.Context, string) ([]service.DocMember, error) {
+	return nil, nil
+}
