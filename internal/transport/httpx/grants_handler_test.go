@@ -134,3 +134,46 @@ func TestNonAuthorCannotManageGrants(t *testing.T) {
 		}
 	}
 }
+
+// P2-A: revoking a doc_member admin (not the creator) previously returned
+// HTTP 500 because ErrGrantProtected was a bare errors.New sentinel and
+// writeErr's errors.As(&apperr.Error) fell through to the generic 500 branch.
+// After P2-A the sentinel is apperr.Conflict so the response is 409.
+func TestRemoveAdminGrantReturns409(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	// Wire the mirror with an admin row on a non-creator uid so the pre-check
+	// (creator == uid) misses and the request reaches RemoveGrant, where the
+	// admin-protection sentinel fires. Publish stamps owner-1 as creator, so
+	// we protect a separate admin uid ("admin-uid").
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docP2A": "dP2A"},
+		roles:     map[string]int{"dP2A|admin-uid": 3},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docP2A")
+
+	rec := do(t, h, http.MethodDelete, "/v1/docs/docP2A/grants/admin-uid",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("revoke admin = %d; want 409 (P2-A apperr.Conflict): %s", rec.Code, rec.Body.String())
+	}
+}
+
+// P2-A: granting reader to a doc_member admin returns HTTP 409 as well,
+// via the same ErrGrantProtected sentinel from P1-B's downgrade guard.
+func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docP2AA": "dP2AA"},
+		roles:     map[string]int{"dP2AA|admin-uid": 3},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docP2AA")
+
+	rec := do(t, h, http.MethodPut, "/v1/docs/docP2AA/grants",
+		map[string]string{octoUIDHeaderName: "owner-1", "Content-Type": "application/json"},
+		`{"uid":"admin-uid","role":"reader"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("grant downgrade admin = %d; want 409: %s", rec.Code, rec.Body.String())
+	}
+}

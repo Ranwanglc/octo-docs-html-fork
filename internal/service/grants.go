@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"maps"
 	"time"
@@ -16,10 +15,15 @@ import (
 // so grants are read+comment only for now.
 const grantRoleReader = "reader"
 
-// ErrGrantProtected is returned by RemoveGrant when the target uid is the
-// doc's creator or a doc_member admin — those rows must never be revoked
-// through the grants API (that path is for reader grants).
-var ErrGrantProtected = errors.New("grant protected: creator or admin cannot be revoked")
+// ErrGrantProtected is returned by AddGrant / RemoveGrant when the target uid
+// is the doc's creator or a doc_member admin — those rows must never be
+// revoked or downgraded through the grants API (that path is reader-scoped).
+//
+// yujiawei P2-A: this is an *apperr.Error so writeErr surfaces a 409 instead
+// of collapsing to 500 through the errors.As(*apperr.Error) fallthrough.
+// Callers still use errors.Is(err, ErrGrantProtected); pointer identity is
+// preserved because the sentinel is a single package-level *apperr.Error.
+var ErrGrantProtected = apperr.Conflict("grant protected: creator or admin cannot be revoked", "grant_protected")
 
 // ListGrants returns the uid→role map of explicit grants for a slug (empty when
 // none). A missing doc is NotFound so callers can hide non-existent docs.

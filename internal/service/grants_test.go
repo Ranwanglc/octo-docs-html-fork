@@ -280,6 +280,8 @@ func TestFakeMirrorListMembersShape(t *testing.T) {
 
 // newGrantSvcWithCreator seeds the doc with a creator_uid so RemoveGrant's
 // creator-protection tier has a value to compare against.
+//
+//nolint:unparam // creator kept parametric so P1-B AddGrant creator-uid tests can vary it.
 func newGrantSvcWithCreator(t *testing.T, creator string) (*service.AuthService, string) {
 	t.Helper()
 	store := memory.New()
@@ -409,7 +411,6 @@ func TestListGrantsSurfacesCreatorWhenMirrorEmpty(t *testing.T) {
 		t.Fatalf("grants = %v; want just the creator", got)
 	}
 }
-
 
 // A6+P1-B: AddGrant refuses to downgrade a doc_member admin (role=3) to
 // reader. UpsertDirectGrant would otherwise clobber the admin row via
