@@ -63,15 +63,21 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 		notifier = eventwebhook.New(cfg.OctoWebhookURL, cfg.OctoDocEventWebhookToken, nil)
 	}
 	comments := service.NewCommentService(meta, locker).WithEventWebhook(notifier, cfg.BaseURL, nil)
+	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(docMemberMirror(meta))
 	docs := service.NewDocService(blobs, meta, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes)
 	if cfg.DocsBackendRegisterURL != "" {
 		docs = docs.WithDocsBackendRegistration(
 			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, nil),
 			nil,
 		)
+		// yujiawei round-4 P1: drain legacy meta.grants into doc_member after
+		// each async registration so grants issued in the pre-registration gap
+		// survive the strict wired A4 gate. Only wired when the docs-backend
+		// registrar is on (thread/non-mounted docs never register and never
+		// reconcile).
+		docs = docs.WithGrantReconciler(auth.ReconcileMetaGrantsToDocMember)
 	}
 	assets := service.NewAssetService(blobs, meta, locker, cfg.MaxAssetBytes, cfg.AssetMIMEAllow)
-	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(docMemberMirror(meta))
 	// OCT-150 http-fallback login provider. Empty base URL ⇒ no provider,
 	// /v1/auth/login returns 404 and LoginEnabled stays off (unless the legacy
 	// LOGIN_ENABLED flag is set for the reverse-proxy path).

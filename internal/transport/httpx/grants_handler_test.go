@@ -1,9 +1,13 @@
 package httpx_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // doc_grants: an author can list/grant/revoke per-uid access; a granted uid
@@ -132,5 +136,179 @@ func TestNonAuthorCannotManageGrants(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("%s %s by non-author = %d; want 404: %s", tc.method, tc.path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// P2-A: revoking a doc_member admin (not the creator) previously returned
+// HTTP 500 because ErrGrantProtected was a bare errors.New sentinel and
+// writeErr's errors.As(&apperr.Error) fell through to the generic 500 branch.
+// After P2-A the sentinel is apperr.Conflict so the response is 409.
+func TestRemoveAdminGrantReturns409(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	// Wire the mirror with an admin row on a non-creator uid so the pre-check
+	// (creator == uid) misses and the request reaches RemoveGrant, where the
+	// admin-protection sentinel fires. Publish stamps owner-1 as creator, so
+	// we protect a separate admin uid ("admin-uid").
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docP2A": "dP2A"},
+		roles:     map[string]int{"dP2A|admin-uid": 3},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docP2A")
+
+	rec := do(t, h, http.MethodDelete, "/v1/docs/docP2A/grants/admin-uid",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("revoke admin = %d; want 409 (P2-A apperr.Conflict): %s", rec.Code, rec.Body.String())
+	}
+}
+
+// P2-A: granting reader to a doc_member admin returns HTTP 409 as well,
+// via the same ErrGrantProtected sentinel from P1-B's downgrade guard.
+func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docP2AA": "dP2AA"},
+		roles:     map[string]int{"dP2AA|admin-uid": 3},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docP2AA")
+
+	rec := do(t, h, http.MethodPut, "/v1/docs/docP2AA/grants",
+		map[string]string{octoUIDHeaderName: "owner-1", "Content-Type": "application/json"},
+		`{"uid":"admin-uid","role":"reader"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("grant downgrade admin = %d; want 409: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// P2-B: on the wired path, GET /v1/docs/{slug}/grants must return the creator
+// exactly once — as the handler-synthesised {role:"author", source:"owner"}
+// row. If the service surfaces the creator from doc_member as well, the UI
+// renders the creator twice (once as author, once as a deletable direct
+// grant). Repro: mirror wired, doc_member has the creator admin row (M1
+// backfill) + a real reader friend.
+func TestListGrantsWiredNoCreatorDup(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	mirror := &stubMirror{
+		slugToDoc: map[string]string{"docLD": "dLD"},
+		listMembers: map[string][]service.DocMember{
+			"dLD": {
+				{UID: "owner-1", Role: 3, GrantedBy: "system"},
+				{UID: "friend-1", Role: 1, GrantedBy: "owner-1"},
+			},
+		},
+	}
+	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
+	publishAsBot(t, h, "docLD")
+
+	rec := do(t, h, http.MethodGet, "/v1/docs/docLD/grants",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list grants = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Items []struct {
+				UID    string `json:"uid"`
+				Role   string `json:"role"`
+				Source string `json:"source"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	creatorRows := 0
+	for _, it := range body.Data.Items {
+		if it.UID == "owner-1" {
+			creatorRows++
+			if it.Role != "author" || it.Source != "owner" {
+				t.Fatalf("creator row = %+v; want role=author source=owner", it)
+			}
+		}
+	}
+	if creatorRows != 1 {
+		t.Fatalf("creator rows = %d; want exactly 1 (no doc_member duplication)", creatorRows)
+	}
+	// Sanity: friend row still comes through as a direct reader.
+	friend := false
+	for _, it := range body.Data.Items {
+		if it.UID == "friend-1" && it.Role == "reader" && it.Source == "direct" {
+			friend = true
+		}
+	}
+	if !friend {
+		t.Fatalf("friend reader row missing: %+v", body.Data.Items)
+	}
+}
+
+// yujiawei round-3 P3: legacyListGrantsFromMeta must skip the creator uid.
+// The wired path already dedupes (P2-B), and the handler always synthesises
+// the creator row; on the unwired path we used to iterate meta.grants
+// blindly, so a stray meta.grants[creator]=... entry would surface as a
+// second "creator" row (once as author/owner, once as reader/direct).
+// Seed that state via the store and verify the API response has exactly one
+// creator row.
+func TestListGrantsLegacyMetaSkipsCreator(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	h, store := newTestServerWithStore(t, ownerAuthCfg())
+	publishAsBot(t, h, "docLegacy") // creator_uid = owner-1 (unwired path)
+
+	// Plant a stray meta.grants[owner-1]=reader (M2 leftover / bad data / test).
+	ctx := context.Background()
+	meta, err := store.GetMeta(ctx, "docLegacy")
+	if err != nil || meta == nil {
+		t.Fatalf("seed lookup: meta=%v err=%v", meta, err)
+	}
+	extra := map[string]any{}
+	for k, v := range meta.Extra {
+		extra[k] = v
+	}
+	grants, _ := extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants seed for P3 test
+	if grants == nil {
+		grants = map[string]any{}
+	}
+	grants["owner-1"] = map[string]any{"role": "reader"}
+	grants["friend-1"] = map[string]any{"role": "reader"}
+	extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants seed for P3 test
+	if err := store.PutMeta(ctx, "docLegacy", storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, "/v1/docs/docLegacy/grants",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Items []struct {
+				UID    string `json:"uid"`
+				Role   string `json:"role"`
+				Source string `json:"source"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	creatorRows := 0
+	for _, it := range body.Data.Items {
+		if it.UID == "owner-1" {
+			creatorRows++
+		}
+	}
+	if creatorRows != 1 {
+		t.Fatalf("creator rows on unwired path = %d; want 1 (legacyListGrantsFromMeta must skip creator): %+v", creatorRows, body.Data.Items)
+	}
+	friend := false
+	for _, it := range body.Data.Items {
+		if it.UID == "friend-1" && it.Role == "reader" && it.Source == "direct" {
+			friend = true
+		}
+	}
+	if !friend {
+		t.Fatalf("friend row missing: %+v", body.Data.Items)
 	}
 }

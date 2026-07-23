@@ -7,13 +7,43 @@ import (
 	"fmt"
 )
 
-const docMemberRoleReader = 1
+const (
+	// DocMemberRoleReader is the rich-doc doc_member.role reader encoding
+	// (>= this = at least reader). bestCred consumes it for the plan③ A4
+	// tier so a forwarded direct grant lifts CapReader.
+	DocMemberRoleReader = 1
+	// DocMemberRoleAdmin mirrors the rich-doc doc_member.role admin encoding.
+	// bestCred consumes this to short-circuit CapAuthor when the caller's
+	// owner uid holds an admin row — the plan③ A3② tier.
+	DocMemberRoleAdmin = 3
+)
 
-// DocMemberMirror keeps rich-doc list membership in sync with doc-side grants.
+// ErrDocMemberAdminGuard is returned by DeleteGrant when the DB-level guard
+// (WHERE role<>3) refuses the delete because a concurrent backfill promoted
+// the row to admin between the caller's probe and the DELETE. Callers should
+// translate this into their domain-level "protected" error (grants.RemoveGrant
+// turns it into ErrGrantProtected).
+var ErrDocMemberAdminGuard = errors.New("doc_member: refuse to modify admin row")
+
+// DocMember is one row of the rich-doc doc_member table exposed to callers that
+// need to enumerate a doc's direct grants (grants.ListGrants, A6). Fields map
+// 1:1 to the columns AuthService actually consumes.
+type DocMember struct {
+	UID       string
+	Role      int
+	GrantedBy string
+}
+
+// DocMemberMirror keeps rich-doc list membership in sync with doc-side grants
+// and lets the auth layer read that same table when deciding capability.
+// RoleByDocUID / ListMembers replace the legacy meta.grants read path
+// (plan③ A3/A4/A6) so grants have a single source of truth in doc_member.
 type DocMemberMirror interface {
 	DocIDBySlug(ctx context.Context, slug string) (string, bool, error)
 	UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error
 	DeleteGrant(ctx context.Context, docID, uid string) error
+	RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error)
+	ListMembers(ctx context.Context, docID string) ([]DocMember, error)
 }
 
 // MySQLDocMemberMirror mirrors doc-side grants into the rich-doc doc_member
@@ -33,16 +63,33 @@ func NewMySQLDocMemberMirror(db *sql.DB) *MySQLDocMemberMirror {
 
 // UpsertDirectGrant upserts a direct doc_member row (role) and bumps the doc's
 // permission_epoch so live connections re-evaluate access.
+//
+// yujiawei round-4 P2 race guard: when the caller writes a non-admin role we
+// preserve any existing admin (role=3) row rather than downgrading it — a
+// concurrent backfill can promote a row between the caller's probe and this
+// write, and clobbering that admin down to reader silently strips the
+// author's capability. The ON DUPLICATE KEY UPDATE branch keeps the existing
+// role/granted_by whenever the pre-image is admin. When the caller IS
+// writing admin (e.g. an M1 owner backfill) we skip the guard so the promote
+// still lands.
 func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin doc_member upsert: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+	var insertSQL string
+	if role == DocMemberRoleAdmin {
+		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
 		 VALUES (?,?,?,?,1,'')
-		 ON DUPLICATE KEY UPDATE role=VALUES(role), granted_by=VALUES(granted_by)`,
-		docID, uid, role, grantedBy); err != nil {
+		 ON DUPLICATE KEY UPDATE role=VALUES(role), granted_by=VALUES(granted_by)`
+	} else {
+		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+		 VALUES (?,?,?,?,1,'')
+		 ON DUPLICATE KEY UPDATE
+		   role       = IF(role = 3, role, VALUES(role)),
+		   granted_by = IF(role = 3, granted_by, VALUES(granted_by))`
+	}
+	if _, err := tx.ExecContext(ctx, insertSQL, docID, uid, role, grantedBy); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("upsert doc_member: %w", err)
 	}
@@ -59,16 +106,58 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 }
 
 // DeleteGrant removes a doc_member row and bumps permission_epoch.
+//
+// yujiawei round-4 P2 race guard: the DELETE carries WHERE role<>3 so a
+// row promoted to admin between the caller's probe and this call is not
+// silently deleted. Affected=0 with the row still present (probe returned
+// hit → row existed) means the guard kicked in; we return
+// ErrDocMemberAdminGuard so callers can surface a protected-row error and
+// skip the permission_epoch bump.
+//
+// yujiawei round-5 P2-α: (a) surface RowsAffected / probe SELECT errors
+// instead of swallowing them — a transient DB error must not look like
+// "already absent"; (b) bump permission_epoch only when a row was actually
+// deleted, otherwise a no-op DELETE (row absent or concurrently already
+// removed) needlessly invalidates every live connection's auth cache.
 func (m *MySQLDocMemberMirror) DeleteGrant(ctx context.Context, docID, uid string) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin doc_member delete: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM doc_member WHERE doc_id=? AND uid=?",
-		docID, uid); err != nil {
+	res, err := tx.ExecContext(ctx,
+		"DELETE FROM doc_member WHERE doc_id=? AND uid=? AND role<>?",
+		docID, uid, DocMemberRoleAdmin)
+	if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("delete doc_member: %w", err)
+	}
+	affected, aerr := res.RowsAffected()
+	if aerr != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("rows affected doc_member delete: %w", aerr)
+	}
+	if affected == 0 {
+		// Distinguish "already absent" from "row is admin (guard tripped)".
+		// A follow-up SELECT under the same tx snapshot decides.
+		var role int
+		qerr := tx.QueryRowContext(ctx,
+			"SELECT role FROM doc_member WHERE doc_id=? AND uid=?",
+			docID, uid).Scan(&role)
+		switch {
+		case qerr == nil && role == DocMemberRoleAdmin:
+			_ = tx.Rollback()
+			return ErrDocMemberAdminGuard
+		case qerr != nil && !errors.Is(qerr, sql.ErrNoRows):
+			_ = tx.Rollback()
+			return fmt.Errorf("probe doc_member after guarded delete: %w", qerr)
+		}
+		// Row was absent (or non-admin and vanished under concurrent DELETE):
+		// no state changed, skip the epoch bump. Commit an empty tx so we
+		// still release DB resources cleanly.
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit no-op doc_member delete: %w", err)
+		}
+		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE doc_meta SET permission_epoch=permission_epoch+1 WHERE doc_id=?",
@@ -97,4 +186,52 @@ func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug string) (st
 		return "", false, fmt.Errorf("resolve doc_meta by slug: %w", err)
 	}
 	return docID, true, nil
+}
+
+// RoleByDocUID returns the role (doc_member.role) uid holds on docID; ok=false
+// when the uid has no row. Used by bestCred to decide owner-admin (role=3) and
+// reader (role>=1) capability without touching meta.grants (plan③ A3/A4).
+// No cache: doc_member is fast and any cache here would tie freshness of auth
+// to permission_epoch invalidation logic we do not need to add.
+func (m *MySQLDocMemberMirror) RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error) {
+	var role int
+	err := m.db.QueryRowContext(ctx,
+		"SELECT role FROM doc_member WHERE doc_id=? AND uid=? LIMIT 1",
+		docID, uid).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read doc_member role: %w", err)
+	}
+	return role, true, nil
+}
+
+// ListMembers returns every doc_member row for docID. Used by grants.ListGrants
+// (plan③ A6) so the sidebar/API render off doc_member instead of meta.grants.
+// Ordered by created_at then uid for stable rendering; no caller depends on it
+// beyond that.
+func (m *MySQLDocMemberMirror) ListMembers(ctx context.Context, docID string) ([]DocMember, error) {
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT uid, role, granted_by FROM doc_member
+		 WHERE doc_id=? ORDER BY created_at ASC, uid ASC`,
+		docID)
+	if err != nil {
+		return nil, fmt.Errorf("list doc_member: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DocMember
+	for rows.Next() {
+		var dm DocMember
+		var grantedBy sql.NullString
+		if err := rows.Scan(&dm.UID, &dm.Role, &grantedBy); err != nil {
+			return nil, fmt.Errorf("scan doc_member row: %w", err)
+		}
+		dm.GrantedBy = grantedBy.String
+		out = append(out, dm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate doc_member rows: %w", err)
+	}
+	return out, nil
 }

@@ -104,6 +104,44 @@ func (s *AuthService) MetaFor(ctx context.Context, slug string) (*storage.DocMet
 	return s.meta.GetMeta(ctx, slug)
 }
 
+// DocMembersWired reports whether a doc_member mirror is attached. bestCred
+// uses this to decide between the plan③ A3②/A4 doc_member-only path
+// (production) and the legacy owner-uid==creator_uid fallback (single-node
+// deploys with no rich-doc DB, and in-memory tests that do not wire a mirror).
+func (s *AuthService) DocMembersWired() bool { return s.docMembers != nil }
+
+// RoleBySlugUID looks the caller's row up in doc_member for slug. Two-hop:
+// slug -> doc_id (via mirror) -> role. Callers use this for plan③ A3
+// owner-admin (role=3) short-circuit and A4 reader (role>=1) decisions.
+//
+// yujiawei round-3 P1a: two very different states must not collapse into the
+// same "ok=false" — otherwise capability.go's meta fallback covers both, and
+// a revoke on a registered doc silently leaves the legacy meta.grants entry
+// still granting read (revoke bypass). docRegistered separates them:
+//
+//   - docRegistered=false, ok=false: mirror unwired, uid empty, or doc has no
+//     doc_member registration yet (async publish, thread-mount, non-mounted).
+//     Callers may fall back to legacy meta.
+//   - docRegistered=true, ok=false: doc IS registered but uid has no row.
+//     Caller MUST treat this as "no access via this tier" and MUST NOT fall
+//     back to meta.grants — a stale meta.grants entry from M2 could otherwise
+//     resurrect access after DELETE /grants/{uid}.
+//   - docRegistered=true, ok=true: role is authoritative.
+func (s *AuthService) RoleBySlugUID(ctx context.Context, slug, uid string) (role int, ok, docRegistered bool, err error) {
+	if s.docMembers == nil || uid == "" {
+		return 0, false, false, nil
+	}
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	if err != nil {
+		return 0, false, false, err
+	}
+	if !ok {
+		return 0, false, false, nil
+	}
+	role, ok, err = s.docMembers.RoleByDocUID(ctx, docID, uid)
+	return role, ok, true, err
+}
+
 // GetSession resolves a session from its id, or nil.
 func (s *AuthService) GetSession(ctx context.Context, sid string) (*storage.Session, error) {
 	if sid == "" {

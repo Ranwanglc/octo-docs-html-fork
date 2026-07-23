@@ -39,10 +39,20 @@ func (m *DocMeta) CreatorUID() string {
 // GrantsExtraKey is the DocMeta.Extra key holding per-uid access grants: a
 // map[uid]map[string]any{role, granted_by, created_at}. A granted uid gets that
 // role in addition to the creator (author) and share-code (reader) paths.
+//
+// Deprecated: plan③ moved direct grants to the rich-doc doc_member table; new
+// code must read/write through AuthService and DocMemberMirror. This key is
+// still consulted on the mirror-unwired fallback path (single-node deploys,
+// in-memory tests) and by legacy data, so it is not removed yet — the A7
+// cleanup pass drops it once the fallback goes away.
 const GrantsExtraKey = "grants"
 
 // GrantRole returns the role explicitly granted to uid, or "" when uid has no
 // grant. Nil-safe across every Extra layer so a legacy/absent grants map is "".
+//
+// Deprecated: use AuthService.RoleBySlugUID / DocMemberMirror.RoleByDocUID.
+// Only the mirror-unwired fallback and legacy readers still call this — the
+// A7 cleanup pass removes it once every caller is gone.
 func (m *DocMeta) GrantRole(uid string) string {
 	if m == nil || m.Extra == nil || uid == "" {
 		return ""

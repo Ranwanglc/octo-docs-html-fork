@@ -101,42 +101,122 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		}
 		return best, nil
 	}
-	// matchUID is the USER uid this session authors as. Two shapes:
-	//   (a) a real octo user → its own Login is the author uid, or
-	//   (b) a bot session → its OwnerUID (the user behind the bot); a bot's own
-	//       Login is the bot uid and never matches a creator_uid.
+	// Plan③ A2: split the caller identity into two USER uids so downstream
+	// author/reader tiers can distinguish "this session’s own uid" from
+	// "the owner behind it".
+	//   selfUID  = sess.Login — bot session→ bot uid, real user→ real uid.
+	//   ownerUID = bot session→ sess.OwnerUID, real user→ sess.Login.
 	// Invariant: botAuthMiddleware stashes the SAME *Session under both
 	// octoSessionCtxKey and botSessionCtxKey, so octoSessionFromCtx and
 	// botSessionFromCtx here observe one identity — do not split them into
 	// separate instances or the bot→OwnerUID mapping below silently breaks.
-	matchUID := ""
-	if sess != nil {
-		if bs := botSessionFromCtx(r.Context()); bs != nil && bs.OwnerUID != "" {
-			matchUID = bs.OwnerUID
-		} else if sess.Login != "" {
-			matchUID = sess.Login
-		}
-	}
-	// Author-by-creator: the doc's creator uid is a USER uid, matched by matchUID
-	// above. This replaces the removed "every bot is superAdmin" grant: a bot only
-	// gets author on docs its owner created.
-	if matchUID != "" {
-		if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
+	selfUID, ownerUID := sessionUIDs(r)
+	// matchUID keeps the pre-plan③ owner-preferring value for doc_grants (A4)
+	// and doc_binding, which still resolve against the owner uid. The author
+	// tiers below use selfUID/ownerUID explicitly.
+	matchUID := ownerUID
+
+	// Plan③ A3 author tiers, in order:
+	//   ① self-uid match  → CapAuthor. Covers bot-authored docs the bot itself
+	//      reads, and real users reading their own docs. When creator_uid still
+	//      stores the owner (legacy A1), a real user visiting their own doc
+	//      also lands here because selfUID == ownerUID.
+	//   ② doc_member owner-admin → CapAuthor. Covers the owner behind a bot
+	//      reading a bot-authored doc: creator_uid is the bot uid (once A1
+	//      flips) or the owner (legacy); either way the owner's admin row in
+	//      doc_member — backfilled by M1 — is the authoritative signal.
+	// Order matters: ① before ② so a real user’s own visit is judged by
+	// creator_uid (not by an unrelated admin grant on the same doc), and both
+	// before A4’s reader path so a grant can never downgrade an author.
+	if selfUID != "" || ownerUID != "" {
+		meta, err := s.auth.MetaFor(r.Context(), slug)
+		if err != nil {
 			return service.CapNone, err
-		} else if meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == matchUID {
-			if service.CapAuthor > best {
-				best = service.CapAuthor
+		}
+		if meta != nil {
+			creator := meta.CreatorUID()
+			// ① self-uid == creator_uid.
+			if creator != "" && selfUID != "" && creator == selfUID {
+				if service.CapAuthor > best {
+					best = service.CapAuthor
+				}
+				return best, nil
 			}
-			return best, nil
+		}
+		// ② owner has admin row in doc_member (M1 contract) — or, until that
+		// row exists, falls back to the pre-plan③ owner-preferring match on
+		// meta.creator_uid. The fallback is not just an unwired-deploy escape:
+		// doc_member rows are registered asynchronously (DocService.afterPublished
+		// go func) and thread-mount / non-mounted docs are never registered at
+		// all, so a wired mirror can legitimately return ok=false on a live doc.
+		// Without this fallback the same-owner bot session (Bearer bot-token)
+		// would 404 on a doc it just published. Skipped when ownerUID == "".
+		if ownerUID != "" {
+			hit := false
+			if s.auth.DocMembersWired() {
+				role, ok, _, rerr := s.auth.RoleBySlugUID(r.Context(), slug, ownerUID)
+				if rerr != nil {
+					return service.CapNone, rerr
+				}
+				if ok && role == service.DocMemberRoleAdmin {
+					hit = true
+				}
+				// yujiawei round-5 P1-a: no docRegistered gate here. A3②'s
+				// fallback keys on creator_uid, which is stamped at publish
+				// (doc.go) and never revocable (RemoveGrant refuses it), so it
+				// cannot resurrect a revoked grant. Gating it locks owners out
+				// when the owner-admin row is missing (registered-but-no-row) —
+				// a state this repo cannot rule out, since doc_member lives in
+				// docs-backend. Revoke-bypass is closed on A4 (reader tier)
+				// where the fallback keys on meta.grants, which IS revocable.
+			}
+			if !hit && meta != nil && meta.CreatorUID() != "" && meta.CreatorUID() == ownerUID {
+				hit = true
+			}
+			if hit {
+				if service.CapAuthor > best {
+					best = service.CapAuthor
+				}
+				return best, nil
+			}
 		}
 	}
-	// doc_grants: an explicitly granted USER uid gets reader (read+comment).
-	// Reuse matchUID (already bot→OwnerUID resolved) so a granted user's bot
-	// also reads. After author-by-creator so a grant never downgrades a creator.
-	if matchUID != "" && best < service.CapReader {
-		if meta, err := s.auth.MetaFor(r.Context(), slug); err != nil {
-			return service.CapNone, err
-		} else if meta != nil && meta.GrantRole(matchUID) != "" {
+	// Plan③ A4 reader tier: doc_member row with role >= reader → CapReader.
+	// Consumes selfUID so a bot forwarding-granted as a direct reader (rare
+	// but supported) still reads; the bot's owner reads bot-authored docs via
+	// A3② already, so keying reader on selfUID here does not hide docs from
+	// owners. When no mirror is wired, fall back to the pre-plan③ meta.grants
+	// path (still owner-preferring via matchUID) so single-node deploys and
+	// in-memory tests keep working.
+	if best < service.CapReader {
+		hit := false
+		fallbackAllowed := true
+		if s.auth.DocMembersWired() && selfUID != "" {
+			role, ok, docRegistered, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
+			if err != nil {
+				return service.CapNone, err
+			}
+			if ok && role >= service.DocMemberRoleReader {
+				hit = true
+			}
+			// yujiawei round-3 P1a: registered doc + no reader row → do NOT
+			// fall back to meta.GrantRole. Otherwise a stale meta.grants
+			// entry left after M2 (M2 copies, does not delete) or after a
+			// revoke would still grant read = revoke bypass.
+			if docRegistered {
+				fallbackAllowed = false
+			}
+		}
+		if !hit && fallbackAllowed && matchUID != "" {
+			meta, err := s.auth.MetaFor(r.Context(), slug)
+			if err != nil {
+				return service.CapNone, err
+			}
+			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback: reader read of meta.grants covers pre-registration + unwired
+				hit = true
+			}
+		}
+		if hit {
 			best = service.CapReader
 		}
 	}
@@ -342,6 +422,33 @@ func (s *Server) requireDocAuthorOrFirstCreate(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sessionUIDs returns the two USER uids downstream capability tiers need
+// (plan③ A2):
+//
+//	selfUID  = sess.Login — the caller’s own uid. For a bot session that is
+//	           the bot uid; for a real user, their own uid.
+//	ownerUID = the owner behind the caller. For a bot session that is
+//	           sess.OwnerUID (the user the bot acts for); for a real user it
+//	           collapses to selfUID.
+//
+// Both are "" when there is no session, or when the session carries no uid
+// under the relevant field. Runs entirely off the request context — no
+// IM/RPC — so it is safe to call on every bestCred hop.
+func sessionUIDs(r *http.Request) (selfUID, ownerUID string) {
+	ctx := r.Context()
+	sess := octoSessionFromCtx(ctx)
+	if sess == nil {
+		return "", ""
+	}
+	selfUID = sess.Login
+	if bs := botSessionFromCtx(ctx); bs != nil && bs.OwnerUID != "" {
+		ownerUID = bs.OwnerUID
+	} else {
+		ownerUID = sess.Login
+	}
+	return selfUID, ownerUID
 }
 
 // hasWriteSession reports whether the request carries an authenticated session
