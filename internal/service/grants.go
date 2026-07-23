@@ -399,12 +399,11 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 }
 
 // ReconcileMetaGrantsToDocMember copies any legacy meta.grants readers into
-// doc_member. Called by DocService.afterPublished after async registration so
+// doc_member. Called by DocService.afterPublished after confirmed registration so
 // that grants issued during the registration gap (AddGrant → meta.grants
 // fallback while DocIDBySlug ok=false) do not evaporate once bestCred flips to
 // the strict wired gate (yujiawei round-4 P1). Best-effort: per-uid errors are
-// logged and skipped so one bad row cannot block the rest, matching the
-// fire-and-forget semantics of afterPublished itself. meta.grants entries are
+// logged and skipped so one bad row cannot block the rest. meta.grants entries are
 // left in place so mirror-unwired deploys keep working; A7 cleanup drops them.
 //
 // yujiawei round-5 P1-b: the entire read-then-upsert sequence runs under the
@@ -413,12 +412,6 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 // row and sweep meta.grants between reconcile's read and its upsert,
 // resurrecting a revoked reader when the next Publish/SaveDraft fires
 // afterPublished.
-//
-// Known limitation (yujiawei round-5 P2-β): if docs-backend Register HTTP
-// call absorbs a failure (docsbackend.go swallows non-2xx), afterPublished
-// still fires reconcileFn and DocIDBySlug ok=false yields a silent no-op with
-// no retry. Follow-up: reconcile keyed off a confirmed-registered signal or
-// a bounded retry.
 func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug string) error {
 	if s.docMembers == nil {
 		return nil

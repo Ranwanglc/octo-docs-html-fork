@@ -1,11 +1,12 @@
 // Package docsbackend registers published octo-doc HTML documents with
-// docs-backend as a best-effort side channel.
+// docs-backend.
 package docsbackend
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,6 +26,16 @@ type Registration struct {
 	Title       string `json:"title,omitempty"`
 	Owner       string `json:"owner,omitempty"`
 	SpaceID     string `json:"spaceId,omitempty"`
+}
+
+// RegistrationResult is the canonical docs-backend response for HTML doc
+// registration. Created is false when the idempotent slug registration already
+// existed.
+type RegistrationResult struct {
+	DocID       string `json:"docId"`
+	OctoDocSlug string `json:"octoDocSlug"`
+	ShareURL    string `json:"shareUrl"`
+	Created     bool   `json:"created"`
 }
 
 // Rename is the PATCH /v1/bot/docs/octo-doc/:slug payload.
@@ -66,15 +77,26 @@ func newWithTimeout(registerURL, token string, timeout time.Duration, logger *sl
 	}
 }
 
-// Register POSTs an octo-doc registration. token is the publishing bot's own
-// bearer token: docs-backend reverse-resolves the doc's owner/space from it, so
-// the doc is registered under whoever published it. Empty token falls back to
-// the process-configured token (see doJSON).
-func (c *Client) Register(ctx context.Context, reg Registration, token string) {
+// Register POSTs an octo-doc registration and returns the canonical row.
+func (c *Client) Register(ctx context.Context, reg Registration, token string) (*RegistrationResult, error) {
 	if c == nil {
-		return
+		return nil, fmt.Errorf("docs-backend registrar is disabled")
 	}
-	c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register", token)
+	body, err := c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register", token)
+	if err != nil {
+		return nil, err
+	}
+	var result RegistrationResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode docs-backend registration: %w", err)
+	}
+	if strings.TrimSpace(result.DocID) == "" || strings.TrimSpace(result.OctoDocSlug) == "" || strings.TrimSpace(result.ShareURL) == "" {
+		return nil, fmt.Errorf("decode docs-backend registration: required response field missing")
+	}
+	if result.OctoDocSlug != reg.OctoDocSlug {
+		return nil, fmt.Errorf("decode docs-backend registration: slug mismatch %q", result.OctoDocSlug)
+	}
+	return &result, nil
 }
 
 // Rename PATCHes the registered title by octo-doc slug. token is the publishing
@@ -83,7 +105,7 @@ func (c *Client) Rename(ctx context.Context, slug, title, token string) {
 	if c == nil {
 		return
 	}
-	c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename", token)
+	_, _ = c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename", token)
 }
 
 // Delete removes the registered docs-backend row by octo-doc slug. Delete is
@@ -93,14 +115,14 @@ func (c *Client) Delete(ctx context.Context, slug, token string) {
 	if c == nil {
 		return
 	}
-	c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token)
+	_, _ = c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token)
 }
 
 func (c *Client) octoDocURL(slug string) string {
 	return c.registerURL + "/octo-doc/" + url.PathEscape(slug)
 }
 
-func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string) {
+func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -112,14 +134,14 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 		buf, err := json.Marshal(body)
 		if err != nil {
 			c.logger.Warn("docs_backend_register marshal failed", "slug", slug, "op", op, "err", err.Error())
-			return
+			return nil, fmt.Errorf("marshal docs-backend %s request: %w", op, err)
 		}
 		rdr = bytes.NewReader(buf)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
 	if err != nil {
 		c.logger.Warn("docs_backend_register request build failed", "slug", slug, "op", op, "err", err.Error())
-		return
+		return nil, fmt.Errorf("build docs-backend %s request: %w", op, err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -137,14 +159,16 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.logger.Warn("docs_backend_register request failed", "slug", slug, "op", op, "err", err.Error())
-		return
+		return nil, fmt.Errorf("docs-backend %s request: %w", op, err)
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer resp.Body.Close()
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, fmt.Errorf("read docs-backend %s response: %w", op, readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		c.logger.Warn("docs_backend_register non-2xx", "slug", slug, "op", op, "http_status", resp.StatusCode)
-		return
+		return nil, fmt.Errorf("docs-backend %s returned HTTP %d", op, resp.StatusCode)
 	}
+	return respBody, nil
 }

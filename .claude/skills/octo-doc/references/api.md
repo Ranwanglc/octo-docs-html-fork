@@ -47,11 +47,20 @@ Save HTML and create version 1 (or the next version) in one step.
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"slug":"demo","title":"Demo","html":"<html><body><h1>Hi</h1></body></html>"}' \
   "$BASE/v1/docs"
-# data: { "slug":"demo", "version":1, "url":"/d/demo/v/1", "size":..., "aids":..., "merged_comments":... }
+# data: { "slug":"demo", "version":1, "url":"/d/demo/v/1", "doc_id":"...", "share_url":"https://...", "registered":true, "status":"published", "size":..., "aids":..., "merged_comments":... }
 ```
 
-Body: `{slug, html, title?, version?, comments?}`. `slug` is kebab-case
+Body: `{slug, html, title?, version?, comments?, mount_type?, group_no?, thread_id?}`. `slug` is kebab-case
 (`^[a-zA-Z0-9_-]{1,64}$`). HTML is capped at `MAX_HTML_BYTES` (413 over limit).
+
+For a registerable `group` or `space` mount, the service writes the immutable
+HTML version exactly once, then retries only docs-backend registration for a
+short bounded window. Registration success includes the canonical `doc_id` and
+`share_url`; both a new row (`created:true`) and an existing idempotent row
+(`created:false`) return `registered:true,status:"published"`. If registration
+still fails, the publish response is `registered:false,status:"registration_failed"`:
+the HTML version already exists and callers must not report ordinary publish
+success or retry by publishing the HTML again.
 
 ### `PUT /v1/docs/{slug}/draft` — save the mutable draft (author)
 Overwrites the single draft slot without minting a version. Body: `{html, title?}`.

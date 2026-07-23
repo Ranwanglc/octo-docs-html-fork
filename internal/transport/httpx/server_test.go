@@ -118,6 +118,27 @@ func TestPublishRequiresAuth(t *testing.T) {
 	}
 }
 
+func TestPublishResponseIncludesRegistrationState(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"contract","html":"<html><body>x</body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data["registered"] != false || envelope.Data["status"] != "published" {
+		t.Fatalf("publish data = %#v", envelope.Data)
+	}
+	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
+		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
+	}
+}
+
 func TestPublishTitleFromMeta(t *testing.T) {
 	// The CLI sends the doc's meta.json under `meta` ({slug,version,html,meta,
 	// comments}); the server must read meta.title when no top-level title is given.

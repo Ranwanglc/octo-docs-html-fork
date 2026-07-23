@@ -159,7 +159,7 @@ PATCH/DELETE are the seam a future Octo unified login activates.
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| `POST`   | `/v1/docs` | publish directly (JSON `{slug, version, html, meta, comments}` or multipart); auto-increments version when omitted |
+| `POST`   | `/v1/docs` | publish directly; returns the HTML version plus `doc_id`, `share_url`, `registered`, and `status` |
 | `PUT`    | `/v1/docs/:slug/draft` | save/overwrite the mutable draft slot |
 | `POST`   | `/v1/docs/:slug/draft/promote` | promote the draft to a new immutable version |
 | `POST`   | `/v1/docs/:slug/share` | mint/rotate the per-doc read+comment code → `{ code, url }` |
@@ -201,9 +201,15 @@ POST /v1/docs  (Authorization: Bearer <token>, multipart or JSON)
   ├─ stampAids(html)          identity-stamp artifacts (verbatim port)
   ├─ blobStore.putDoc         immutable write + head-verify
   ├─ metaStore.putMeta        monotonic versions[]
-  └─ commentStore.publish_merge   reconcile anchors + merge local comments
-     → { ok, slug, version, url: "/d/<slug>/v/<n>", size, aids, mergedComments }
+  ├─ commentStore.publish_merge   reconcile anchors + merge local comments
+  └─ docs-backend register       bounded idempotent retries; never republishes HTML
+     → { slug, version, url, doc_id, share_url, registered, status, size, aids, merged_comments }
 ```
+
+`created:false` from docs-backend is an existing-row success. If registration
+still fails after the bounded retry window, the response uses
+`registered:false,status:"registration_failed"`. The immutable HTML version is
+already committed; callers must not retry by publishing HTML again.
 
 See [DESIGN.md](./DESIGN.md) for the runtime/framework selection rationale,
 threat model, adapter contract, and backup/upgrade procedures.

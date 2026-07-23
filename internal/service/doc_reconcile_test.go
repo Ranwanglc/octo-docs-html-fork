@@ -13,19 +13,25 @@ import (
 )
 
 // noopRegistrar is a DocRegistrar that just records that Register ran. It
-// serves the goroutine gate in afterPublished so the reconcile hook fires.
+// serves the registration gate in afterPublished so the reconcile hook fires.
 type noopRegistrar struct {
 	registered atomic.Int32
 }
 
-func (r *noopRegistrar) Register(context.Context, docsbackend.Registration, string) {
+func (r *noopRegistrar) Register(_ context.Context, reg docsbackend.Registration, _ string) (*docsbackend.RegistrationResult, error) {
 	r.registered.Add(1)
+	return &docsbackend.RegistrationResult{
+		DocID:       "doc-" + reg.OctoDocSlug,
+		OctoDocSlug: reg.OctoDocSlug,
+		ShareURL:    "https://docs.example.test/d/doc-" + reg.OctoDocSlug,
+		Created:     true,
+	}, nil
 }
 func (*noopRegistrar) Rename(context.Context, string, string, string) {}
 func (*noopRegistrar) Delete(context.Context, string, string)         {}
 
 // yujiawei round-4 P1: afterPublished must invoke the injected reconciler
-// after the async registration completes so grants written to meta.grants
+// after confirmed registration so grants written to meta.grants
 // during the pre-registration gap survive the strict wired A4 gate.
 func TestAfterPublishedTriggersGrantReconciler(t *testing.T) {
 	store := memory.New()
@@ -72,8 +78,7 @@ func TestAfterPublishedTriggersGrantReconciler(t *testing.T) {
 	}
 }
 
-// afterPublished with a nil reconciler is a plain fire-and-forget register:
-// no panic, no reconcile.
+// afterPublished with a nil reconciler registers without a panic.
 func TestAfterPublishedNilReconcilerSafe(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
@@ -88,8 +93,6 @@ func TestAfterPublishedNilReconcilerSafe(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	// Give the goroutine a moment; the test passes if we don't panic.
-	time.Sleep(50 * time.Millisecond)
 }
 
 // thread-mount docs never register, so afterPublished must not fire the

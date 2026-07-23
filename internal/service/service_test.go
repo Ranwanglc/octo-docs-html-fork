@@ -100,7 +100,17 @@ func newDocsBackendStub(t *testing.T, status int) (*httptest.Server, <-chan docs
 			Authorization: r.Header.Get("Authorization"),
 			Body:          body,
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
+		if status >= 200 && status < 300 {
+			slug, _ := body["octoDocSlug"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"docId":       "doc-" + slug,
+				"octoDocSlug": slug,
+				"shareUrl":    "https://docs.example.test/d/doc-" + slug,
+				"created":     true,
+			})
+		}
 	}))
 	return ts, ch
 }
@@ -139,11 +149,15 @@ func TestPublishRegistersGroupMountedDoc(t *testing.T) {
 	defer ts.Close()
 	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
 
-	if _, err := ds.Publish(context.Background(), service.PublishInput{
+	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "group-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Group Title",
 		MountType: "group", GroupNo: "g-1",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !result.Registered || result.Status != "published" || result.DocID != "doc-group-doc" || result.ShareURL == "" {
+		t.Fatalf("publish result = %+v", result)
 	}
 
 	req := waitDocsBackendRequest(t, reqs)
@@ -225,15 +239,17 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})
+	errCh := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		client.Register(ctx, docsbackend.Registration{
+		_, err := client.Register(ctx, docsbackend.Registration{
 			DocType:     "html",
 			OctoDocSlug: "slow-doc",
 			MountType:   "group",
 			Title:       "Slow",
 			SpaceID:     "space-1",
 		}, "")
+		errCh <- err
 		close(done)
 	}()
 
@@ -249,6 +265,9 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("registrar returned after %s, want caller context to bound request", elapsed)
+	}
+	if err := <-errCh; err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Register error = %v, want context deadline exceeded", err)
 	}
 }
 
@@ -295,7 +314,7 @@ func TestPublishSkipsRegistrationWhenURLDisabled(t *testing.T) {
 	assertNoDocsBackendRequest(t, reqs)
 }
 
-func TestPublishSucceedsWhenRegistrationReturns500(t *testing.T) {
+func TestPublishReportsRegistrationFailureWithoutNewVersion(t *testing.T) {
 	ts, reqs := newDocsBackendStub(t, http.StatusInternalServerError)
 	defer ts.Close()
 	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
@@ -310,9 +329,98 @@ func TestPublishSucceedsWhenRegistrationReturns500(t *testing.T) {
 	if res.Version != 1 {
 		t.Fatalf("version = %d, want 1", res.Version)
 	}
-	req := waitDocsBackendRequest(t, reqs)
-	if req.Method != http.MethodPost || req.Body["octoDocSlug"] != "best-effort-doc" {
-		t.Fatalf("registration request = %+v", req)
+	if res.Registered || res.Status != "registration_failed" {
+		t.Fatalf("result = %+v, want published-but-unregistered", res)
+	}
+	for range 3 {
+		req := waitDocsBackendRequest(t, reqs)
+		if req.Method != http.MethodPost || req.Body["octoDocSlug"] != "best-effort-doc" {
+			t.Fatalf("registration request = %+v", req)
+		}
+	}
+	versions, err := ds.ListVersions(context.Background(), "best-effort-doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions.Versions) != 1 || versions.Versions[0].N != 1 {
+		t.Fatalf("versions = %+v, want only version 1", versions)
+	}
+}
+
+func TestPublishAcceptsExistingRegistration(t *testing.T) {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"docId":"doc-existing","octoDocSlug":"existing-doc","shareUrl":"https://docs.example.test/d/doc-existing","created":false}`))
+	}))
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL)
+	result, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "existing-doc", HTML: "<html><body>x</body></html>", MountType: "space",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || !result.Registered || result.Status != "published" || result.DocID != "doc-existing" {
+		t.Fatalf("calls=%d result=%+v", calls, result)
+	}
+}
+
+func TestPublishRetriesMalformedRegistrationResponse(t *testing.T) {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"docId":`))
+	}))
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL)
+	result, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "bad-json", HTML: "<html><body>x</body></html>", MountType: "group",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || result.Registered || result.Status != "registration_failed" {
+		t.Fatalf("calls=%d result=%+v", calls, result)
+	}
+}
+
+type timeoutRegistrar struct {
+	calls int
+}
+
+func (r *timeoutRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
+	r.calls++
+	return nil, context.DeadlineExceeded
+}
+
+func (*timeoutRegistrar) Rename(context.Context, string, string, string) {}
+func (*timeoutRegistrar) Delete(context.Context, string, string)         {}
+
+func TestPublishRetriesRegistrationTimeoutWithoutRepublish(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	registrar := &timeoutRegistrar{}
+	ds := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil)
+	result, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "timeout-doc", HTML: "<html><body>x</body></html>", MountType: "group",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registrar.calls != 3 || result.Registered || result.Status != "registration_failed" {
+		t.Fatalf("calls=%d result=%+v", registrar.calls, result)
+	}
+	versions, err := ds.ListVersions(context.Background(), "timeout-doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions.Versions) != 1 || versions.Versions[0].N != 1 {
+		t.Fatalf("versions = %+v, want only version 1", versions)
 	}
 }
 

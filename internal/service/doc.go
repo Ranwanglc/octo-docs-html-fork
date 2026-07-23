@@ -34,7 +34,7 @@ type DocService struct {
 }
 
 // GrantReconciler drains legacy meta.grants entries into doc_member after
-// async registration. Injected (not a hard dep on AuthService) so DocService
+// confirmed registration. Injected (not a hard dep on AuthService) so DocService
 // stays testable in isolation and single-node deploys without a mirror wire a
 // no-op. yujiawei round-4 P1: without this hook, a grant issued while the doc
 // is unregistered (AddGrant → addGrantToMeta fallback) evaporates once
@@ -42,12 +42,9 @@ type DocService struct {
 // meta fallback.
 type GrantReconciler func(ctx context.Context, slug string) error
 
-// DocRegistrar is the docs-backend side-effect sink. Implementations must be
-// nil-safe and best-effort: registration failure must never fail doc writes.
-// The token argument is the publishing bot's own bearer token (empty ⇒ the
-// implementation falls back to its process-configured token).
+// DocRegistrar is the docs-backend side-effect sink.
 type DocRegistrar interface {
-	Register(ctx context.Context, reg docsbackend.Registration, token string)
+	Register(ctx context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error)
 	Rename(ctx context.Context, slug, title, token string)
 	Delete(ctx context.Context, slug, token string)
 }
@@ -79,7 +76,7 @@ func (s *DocService) WithDocsBackendRegistration(r DocRegistrar, logger *slog.Lo
 }
 
 // WithGrantReconciler attaches the reconciler DocService calls after each
-// async registration to drain legacy meta.grants entries into doc_member.
+// confirmed registration to drain legacy meta.grants entries into doc_member.
 // Wired only when both a registrar and a doc_member mirror exist. Returns s.
 func (s *DocService) WithGrantReconciler(fn GrantReconciler) *DocService {
 	if s == nil {
@@ -134,21 +131,21 @@ type PublishResult struct {
 	Slug           string `json:"slug"`
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
+	DocID          string `json:"doc_id"`
+	ShareURL       string `json:"share_url"`
+	Registered     bool   `json:"registered"`
+	Status         string `json:"status"`
 	Size           int64  `json:"size"`
 	AIDs           int    `json:"aids"`
 	MergedComments int    `json:"merged_comments"`
 
-	title        string
-	hadMeta      bool
-	titleChanged bool
+	title string
 
 	// Mount info carried from PublishInput into afterPublished for registration.
 	mountType string
-	groupNo   string
-	threadID  string
 
 	// publisherToken carries the publishing bot's own token from PublishInput
-	// into afterPublished so the async registration authenticates as the publisher.
+	// into afterPublished so registration authenticates as the publisher.
 	publisherToken string
 }
 
@@ -161,7 +158,14 @@ type RenderData struct {
 	Title string
 }
 
-const docsBackendSideEffectTimeout = 5 * time.Second
+const (
+	docsBackendSideEffectTimeout = 5 * time.Second
+	docsBackendAttemptTimeout    = time.Second
+	docsBackendRegisterAttempts  = 3
+	docsBackendRegisterDelay     = 100 * time.Millisecond
+	publishStatusPublished       = "published"
+	publishStatusRegisterFailed  = "registration_failed"
+)
 
 // Publish publishes a new (or explicitly-versioned) document.
 func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResult, error) {
@@ -230,15 +234,12 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		Slug:           in.Slug,
 		Version:        version,
 		URL:            fmt.Sprintf("%s/d/%s/v/%d", s.baseURL, in.Slug, version),
+		Status:         publishStatusPublished,
 		Size:           size,
 		AIDs:           len(stamped.AIDs),
 		MergedComments: merged,
 		title:          metaResult.title,
-		hadMeta:        metaResult.hadMeta,
-		titleChanged:   metaResult.titleChanged,
 		mountType:      in.MountType,
-		groupNo:        in.GroupNo,
-		threadID:       in.ThreadID,
 		publisherToken: in.PublisherToken,
 	}, nil
 }
@@ -637,28 +638,53 @@ func (s *DocService) afterPublished(result *PublishResult) {
 	if result == nil || s.register == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
-		defer cancel()
-		reg, ok := s.registrationForMount(result.Slug, result.title, result.mountType)
-		if !ok {
-			return
+	reg, ok := s.registrationForMount(result.Slug, result.title, result.mountType)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
+	defer cancel()
+	var registration *docsbackend.RegistrationResult
+	var err error
+	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, docsBackendAttemptTimeout)
+		registration, err = s.register.Register(attemptCtx, reg, result.publisherToken)
+		attemptCancel()
+		if err == nil {
+			break
 		}
-		s.register.Register(ctx, reg, result.publisherToken)
-		if result.hadMeta && result.titleChanged {
-			s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
+		if attempt == docsBackendRegisterAttempts || !waitForRetry(ctx, docsBackendRegisterDelay) {
+			break
 		}
-		// yujiawei round-4 P1: reconcile after registration lands so grants
-		// issued during the pre-registration gap (which the wired A4 gate now
-		// refuses to serve from meta.grants) are copied into doc_member. Runs
-		// on this same fire-and-forget goroutine; per-uid errors are absorbed
-		// inside the reconciler.
-		if s.reconcileFn != nil {
-			if err := s.reconcileFn(ctx, result.Slug); err != nil {
-				s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", err.Error())
+	}
+	if err != nil {
+		result.Status = publishStatusRegisterFailed
+		s.log().Warn("docs_backend_register failed after publish", "slug", result.Slug, "version", result.Version, "err", err.Error())
+		return
+	}
+	result.DocID = registration.DocID
+	result.ShareURL = registration.ShareURL
+	result.Registered = true
+	if s.reconcileFn != nil {
+		go func() {
+			reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
+			defer reconcileCancel()
+			if reconcileErr := s.reconcileFn(reconcileCtx, result.Slug); reconcileErr != nil {
+				s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
 			}
-		}
-	}()
+		}()
+	}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *DocService) afterRemoved(slug string) {
@@ -774,9 +800,7 @@ func (s *DocService) resolveVersion(ctx context.Context, slug string, explicit i
 }
 
 type publishMetaResult struct {
-	title        string
-	hadMeta      bool
-	titleChanged bool
+	title string
 }
 
 func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version int) (publishMetaResult, error) {
@@ -784,7 +808,6 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	if err != nil {
 		return publishMetaResult{}, err
 	}
-	hadMeta := prev != nil
 	if prev == nil {
 		prev = &storage.DocMeta{Slug: in.Slug, Title: in.Slug, Versions: []storage.VersionRef{}}
 	}
@@ -825,11 +848,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}); err != nil {
 		return publishMetaResult{}, err
 	}
-	return publishMetaResult{
-		title:        title,
-		hadMeta:      hadMeta,
-		titleChanged: strings.TrimSpace(prev.Title) != "" && prev.Title != title,
-	}, nil
+	return publishMetaResult{title: title}, nil
 }
 
 func sortVersions(v []storage.VersionRef) {
