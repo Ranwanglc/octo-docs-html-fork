@@ -27,9 +27,10 @@ type publishBody struct {
 
 	// Mount info the publishing bot supplies so the doc can be registered into
 	// docs-backend (and thus appear in the sidebar) without a doc_binding lookup.
-	MountType string
-	GroupNo   string
-	ThreadID  string
+	MountType        string
+	MountTypePresent bool
+	GroupNo          string
+	ThreadID         string
 }
 
 func (s *Server) readPublishBody(w http.ResponseWriter, r *http.Request) (publishBody, error) {
@@ -51,6 +52,7 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 		b.Version, _ = strconv.Atoi(v)
 	}
 	b.MountType = r.FormValue("mount_type")
+	_, b.MountTypePresent = r.MultipartForm.Value["mount_type"]
 	b.GroupNo = r.FormValue("group_no")
 	b.ThreadID = r.FormValue("thread_id")
 	if file, _, err := r.FormFile("file"); err == nil {
@@ -78,9 +80,9 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		Comments []core.Comment `json:"comments"`
 		// Mount info forwarded to docs-backend registration. snake_case matches the
 		// rest of the publish contract; the bot supplies where it is publishing.
-		MountType string `json:"mount_type"`
-		GroupNo   string `json:"group_no"`
-		ThreadID  string `json:"thread_id"`
+		MountType *string `json:"mount_type"`
+		GroupNo   string  `json:"group_no"`
+		ThreadID  string  `json:"thread_id"`
 	}
 	if r.Body != nil {
 		// Publish bodies carry the document HTML, so cap at the HTML limit plus JSON
@@ -103,10 +105,15 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 	if title == "" && raw.Meta != nil {
 		title = raw.Meta.Title
 	}
-	return publishBody{
+	body := publishBody{
 		Slug: raw.Slug, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
-		MountType: raw.MountType, GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
-	}, nil
+		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
+	}
+	if raw.MountType != nil {
+		body.MountType = *raw.MountType
+		body.MountTypePresent = true
+	}
+	return body, nil
 }
 
 // creatorUIDFromCtx returns the user uid to stamp as a doc's creator. creator_uid
@@ -142,7 +149,8 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	creatorUID := creatorUIDFromCtx(r.Context())
 	res, err := s.docs.Publish(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
-		MountType: body.MountType, GroupNo: body.GroupNo, ThreadID: body.ThreadID,
+		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
+		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
 		PublisherToken: botTokenFromCtx(r.Context()),
 	})

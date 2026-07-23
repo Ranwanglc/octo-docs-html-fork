@@ -157,6 +157,29 @@ func TestPublishGroupFailsClosedWithoutRegistrar(t *testing.T) {
 	}
 }
 
+func TestPublishOmittedOrEmptyMountPreservesExistingMount(t *testing.T) {
+	h := newTestServer(t, nil)
+	for _, body := range []string{
+		`{"slug":"mounted-presence","html":"<html><body>v1</body></html>","mount_type":"group"}`,
+		`{"slug":"mounted-presence","html":"<html><body>v2</body></html>"}`,
+		`{"slug":"mounted-presence","html":"<html><body>v3</body></html>","mount_type":""}`,
+	} {
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Data["status"] != "registration_failed" {
+			t.Fatalf("publish data = %#v; mount context was not preserved", envelope.Data)
+		}
+	}
+}
+
 func TestPublishRejectsInvalidMountType(t *testing.T) {
 	h := newTestServer(t, nil)
 	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),

@@ -187,6 +187,73 @@ func TestReplaceElementRestoresPersistedMountContext(t *testing.T) {
 	}
 }
 
+func TestPublishOmittedMountRestoresPersistedMountContext(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil)
+
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "republish-mounted", HTML: "<html><body><p>v1</p></body></html>", MountType: "group",
+	}); err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+	result, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "republish-mounted", HTML: "<html><body><p>v2</p></body></html>",
+	})
+	if err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+	if !result.Registered || result.Status != "published" {
+		t.Fatalf("republish registration = registered:%v status:%q", result.Registered, result.Status)
+	}
+	if got := registrar.registered.Load(); got != 2 {
+		t.Fatalf("register calls = %d; want 2", got)
+	}
+	meta, err := store.GetMeta(ctx, "republish-mounted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountType, ok := meta.MountType(); !ok || mountType != "group" {
+		t.Fatalf("persisted mount = %q, %v; want group, true", mountType, ok)
+	}
+}
+
+func TestPublishExplicitEmptyMountPreservesExistingMount(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil)
+
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "empty-mounted", HTML: "<html><body><p>v1</p></body></html>", MountType: "space",
+	}); err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+	result, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "empty-mounted", HTML: "<html><body><p>v2</p></body></html>", MountTypePresent: true,
+	})
+	if err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+	if !result.Registered || result.Status != "published" {
+		t.Fatalf("republish registration = registered:%v status:%q", result.Registered, result.Status)
+	}
+	meta, err := store.GetMeta(ctx, "empty-mounted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountType, ok := meta.MountType(); !ok || mountType != "space" {
+		t.Fatalf("persisted mount = %q, %v; want space, true", mountType, ok)
+	}
+}
+
 func TestPromoteRestoresMountAndRenames(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()

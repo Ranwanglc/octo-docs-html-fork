@@ -110,10 +110,12 @@ type PublishInput struct {
 	// Mount info supplied by the publishing bot, normalized and forwarded to
 	// docs-backend registration. Replaces the old GET doc_binding lookup: the
 	// caller (bot) knows where it is publishing, so no user-token binding query
-	// is needed. Empty MountType ⇒ registration is skipped (non-mounted doc).
-	MountType string // "group" | "space" | "thread" (thread ⇒ skipped)
-	GroupNo   string
-	ThreadID  string
+	// is needed. MountTypePresent distinguishes an omitted field from an explicit
+	// empty value; neither implicitly unmounts an existing mounted document.
+	MountType        string // "group" | "space" | "thread" (thread ⇒ skipped)
+	MountTypePresent bool
+	GroupNo          string
+	ThreadID         string
 
 	// CreatorUID is the publishing bot's uid, stamped into DocMeta on first
 	// create only (a republish never reassigns ownership). Empty ⇒ no creator
@@ -181,12 +183,15 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 	if int64(len(in.HTML)) > s.maxBytes {
 		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 	}
+	if in.MountType != "" {
+		in.MountTypePresent = true
+	}
 	mountType, err := normalizeMountType(in.MountType)
 	if err != nil {
 		return nil, err
 	}
 	in.MountType = mountType
-	in.mountContextKnown = true
+	in.mountContextKnown = in.MountTypePresent
 
 	stamped := core.StampAids(in.HTML)
 
@@ -211,6 +216,9 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 // per-slug lock (Publish does); it therefore uses PublishMergeLocked and never
 // re-acquires the lock.
 func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped core.StampResult) (*PublishResult, error) {
+	if err := s.restoreMountContext(ctx, &in); err != nil {
+		return nil, err
+	}
 	version, err := s.resolveVersion(ctx, in.Slug, in.Version)
 	if err != nil {
 		return nil, err
@@ -257,6 +265,31 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
 	}, nil
+}
+
+func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) error {
+	if in.mountContextKnown && in.MountType != "" {
+		return nil
+	}
+	meta, err := s.meta.GetMeta(ctx, in.Slug)
+	if err != nil {
+		return err
+	}
+	if mountType, ok := meta.MountType(); ok {
+		normalized, normalizeErr := normalizeMountType(mountType)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		if normalized != "" || !in.mountContextKnown {
+			in.MountType = normalized
+			in.mountContextKnown = true
+		}
+		return nil
+	}
+	if meta == nil {
+		in.mountContextKnown = true
+	}
+	return nil
 }
 
 // ElementView is the outer HTML of a single artifact located by aid.
