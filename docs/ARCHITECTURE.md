@@ -210,6 +210,9 @@ POST /v1/docs  (Authorization: Bearer <token>, multipart or JSON)
 still fails after the bounded retry window, the response uses
 `registered:false,status:"registration_failed"`. The immutable HTML version is
 already committed; callers must not retry by publishing HTML again.
+Group and space mounts use the same fail-closed status when registration is
+disabled. Thread or unmounted publishes use `published_unregistered`, where
+docs-backend registration does not apply.
 
 See [DESIGN.md](./DESIGN.md) for the runtime/framework selection rationale,
 threat model, adapter contract, and backup/upgrade procedures.

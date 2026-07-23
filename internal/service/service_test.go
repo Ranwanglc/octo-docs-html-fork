@@ -276,11 +276,15 @@ func TestPublishSkipsThreadMountedDocRegistration(t *testing.T) {
 	defer ts.Close()
 	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
 
-	if _, err := ds.Publish(context.Background(), service.PublishInput{
+	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "thread-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Thread Title",
 		MountType: "thread", GroupNo: "g-1", ThreadID: "t-1",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.Registered || result.Status != "published_unregistered" {
+		t.Fatalf("result = %+v", result)
 	}
 	assertNoDocsBackendRequest(t, reqs)
 }
@@ -291,10 +295,14 @@ func TestPublishSkipsRegistrationWhenNoMountType(t *testing.T) {
 	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
 
 	// No mount info on the publish request ⇒ nothing to register against ⇒ skip.
-	if _, err := ds.Publish(context.Background(), service.PublishInput{
+	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "unmounted-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Unmounted",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.Registered || result.Status != "published_unregistered" {
+		t.Fatalf("result = %+v", result)
 	}
 	assertNoDocsBackendRequest(t, reqs)
 }
@@ -305,13 +313,122 @@ func TestPublishSkipsRegistrationWhenURLDisabled(t *testing.T) {
 	// Registrar URL empty ⇒ no registrar wired ⇒ no request even with mount info.
 	ds := newDocWithDocsBackend(t, "")
 
-	if _, err := ds.Publish(context.Background(), service.PublishInput{
+	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "disabled-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Disabled",
 		MountType: "group", GroupNo: "g-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Registered || result.Status != "registration_failed" {
+		t.Fatalf("result = %+v", result)
+	}
+	assertNoDocsBackendRequest(t, reqs)
+}
+
+func TestPublishRenamesExistingRegistrationWhenTitleChanges(t *testing.T) {
+	var mu sync.Mutex
+	var requests []docsBackendRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		requests = append(requests, docsBackendRequest{Method: r.Method, Path: r.URL.Path, Body: body})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"docId":"doc-rename-doc","octoDocSlug":"rename-doc","shareUrl":"https://docs.example.test/d/doc-rename-doc","created":false}`))
+		}
+	}))
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+
+	if _, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "rename-doc", HTML: "<html><body>one</body></html>", Title: "Old", MountType: "group",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assertNoDocsBackendRequest(t, reqs)
+	if _, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "rename-doc", HTML: "<html><body>two</body></html>", Title: "New", MountType: "group",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 3 {
+		t.Fatalf("requests = %+v, want POST, POST, PATCH", requests)
+	}
+	if requests[2].Method != http.MethodPatch || requests[2].Path != "/v1/bot/docs/octo-doc/rename-doc" || requests[2].Body["title"] != "New" {
+		t.Fatalf("rename request = %+v", requests[2])
+	}
+}
+
+type cancelRegistrar struct {
+	mu          sync.Mutex
+	registers   int
+	renames     int
+	firstCalled chan struct{}
+}
+
+func (r *cancelRegistrar) Register(ctx context.Context, _ docsbackend.Registration, _ string) (*docsbackend.RegistrationResult, error) {
+	r.mu.Lock()
+	r.registers++
+	if r.registers == 1 {
+		close(r.firstCalled)
+	}
+	r.mu.Unlock()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *cancelRegistrar) Rename(context.Context, string, string, string) {
+	r.mu.Lock()
+	r.renames++
+	r.mu.Unlock()
+}
+
+func (*cancelRegistrar) Delete(context.Context, string, string) {}
+
+func TestPublishCancellationStopsRegistrationRetries(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	registrar := &cancelRegistrar{firstCalled: make(chan struct{})}
+	ds := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *service.PublishResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := ds.Publish(ctx, service.PublishInput{
+			Slug: "cancel-doc", HTML: "<html><body>x</body></html>", Title: "Cancel", MountType: "group",
+		})
+		done <- result
+		errCh <- err
+	}()
+	<-registrar.firstCalled
+	cancel()
+
+	select {
+	case result := <-done:
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+		if result.Registered || result.Status != "registration_failed" {
+			t.Fatalf("result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Publish did not stop after caller cancellation")
+	}
+	registrar.mu.Lock()
+	defer registrar.mu.Unlock()
+	if registrar.registers != 1 || registrar.renames != 0 {
+		t.Fatalf("registers=%d renames=%d", registrar.registers, registrar.renames)
+	}
+	versions, err := ds.ListVersions(context.Background(), "cancel-doc")
+	if err != nil || len(versions.Versions) != 1 {
+		t.Fatalf("published HTML missing after registration cancellation: versions=%+v err=%v", versions, err)
+	}
 }
 
 func TestPublishReportsRegistrationFailureWithoutNewVersion(t *testing.T) {

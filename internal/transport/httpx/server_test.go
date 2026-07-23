@@ -131,11 +131,29 @@ func TestPublishResponseIncludesRegistrationState(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if envelope.Data["registered"] != false || envelope.Data["status"] != "published" {
+	if envelope.Data["registered"] != false || envelope.Data["status"] != "published_unregistered" {
 		t.Fatalf("publish data = %#v", envelope.Data)
 	}
 	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
 		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
+	}
+}
+
+func TestPublishGroupFailsClosedWithoutRegistrar(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"contract-group","html":"<html><body>x</body></html>","mount_type":"group"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data["registered"] != false || envelope.Data["status"] != "registration_failed" {
+		t.Fatalf("publish data = %#v", envelope.Data)
 	}
 }
 

@@ -61,6 +61,10 @@ short bounded window. Registration success includes the canonical `doc_id` and
 still fails, the publish response is `registered:false,status:"registration_failed"`:
 the HTML version already exists and callers must not report ordinary publish
 success or retry by publishing the HTML again.
+Group and space mounts use the same fail-closed status when registration is
+disabled. Thread or unmounted publishes return
+`registered:false,status:"published_unregistered"` because registration does
+not apply to them.
 
 ### `PUT /v1/docs/{slug}/draft` — save the mutable draft (author)
 Overwrites the single draft slot without minting a version. Body: `{html, title?}`.

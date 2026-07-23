@@ -139,7 +139,9 @@ type PublishResult struct {
 	AIDs           int    `json:"aids"`
 	MergedComments int    `json:"merged_comments"`
 
-	title string
+	title        string
+	hadMeta      bool
+	titleChanged bool
 
 	// Mount info carried from PublishInput into afterPublished for registration.
 	mountType string
@@ -164,6 +166,7 @@ const (
 	docsBackendRegisterAttempts  = 3
 	docsBackendRegisterDelay     = 100 * time.Millisecond
 	publishStatusPublished       = "published"
+	publishStatusUnregistered    = "published_unregistered"
 	publishStatusRegisterFailed  = "registration_failed"
 )
 
@@ -191,7 +194,7 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(result)
+	s.afterPublished(ctx, result)
 	return result, nil
 }
 
@@ -239,6 +242,8 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		AIDs:           len(stamped.AIDs),
 		MergedComments: merged,
 		title:          metaResult.title,
+		hadMeta:        metaResult.hadMeta,
+		titleChanged:   metaResult.titleChanged,
 		mountType:      in.MountType,
 		publisherToken: in.PublisherToken,
 	}, nil
@@ -345,7 +350,7 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(result)
+	s.afterPublished(ctx, result)
 	return result, nil
 }
 
@@ -508,7 +513,7 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(result)
+	s.afterPublished(ctx, result)
 	return result, nil
 }
 
@@ -634,15 +639,24 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 	return nil
 }
 
-func (s *DocService) afterPublished(result *PublishResult) {
-	if result == nil || s.register == nil {
+func (s *DocService) afterPublished(parent context.Context, result *PublishResult) {
+	if result == nil {
 		return
 	}
 	reg, ok := s.registrationForMount(result.Slug, result.title, result.mountType)
 	if !ok {
+		result.Status = publishStatusUnregistered
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
+	if s.register == nil {
+		result.Status = publishStatusRegisterFailed
+		s.log().Warn("docs_backend_register unavailable after publish", "slug", result.Slug, "version", result.Version)
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, docsBackendSideEffectTimeout)
 	defer cancel()
 	var registration *docsbackend.RegistrationResult
 	var err error
@@ -657,22 +671,31 @@ func (s *DocService) afterPublished(result *PublishResult) {
 			break
 		}
 	}
+	if err == nil && registration == nil {
+		err = fmt.Errorf("docs-backend registration returned no result")
+	}
 	if err != nil {
 		result.Status = publishStatusRegisterFailed
 		s.log().Warn("docs_backend_register failed after publish", "slug", result.Slug, "version", result.Version, "err", err.Error())
 		return
 	}
+	if ctx.Err() != nil {
+		result.Status = publishStatusRegisterFailed
+		return
+	}
 	result.DocID = registration.DocID
 	result.ShareURL = registration.ShareURL
 	result.Registered = true
+	if result.hadMeta && result.titleChanged {
+		s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if s.reconcileFn != nil {
-		go func() {
-			reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
-			defer reconcileCancel()
-			if reconcileErr := s.reconcileFn(reconcileCtx, result.Slug); reconcileErr != nil {
-				s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
-			}
-		}()
+		if reconcileErr := s.reconcileFn(ctx, result.Slug); reconcileErr != nil {
+			s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
+		}
 	}
 }
 
@@ -710,9 +733,6 @@ func (s *DocService) afterRemoved(slug string) {
 // reverse-resolves both from the bot's own token via verify-bot, so the caller
 // must not (and need not) supply them.
 func (s *DocService) registrationForMount(slug, title, mountType string) (docsbackend.Registration, bool) {
-	if s.register == nil {
-		return docsbackend.Registration{}, false
-	}
 	mountType = strings.ToLower(strings.TrimSpace(mountType))
 	switch mountType {
 	case "":
@@ -800,7 +820,9 @@ func (s *DocService) resolveVersion(ctx context.Context, slug string, explicit i
 }
 
 type publishMetaResult struct {
-	title string
+	title        string
+	hadMeta      bool
+	titleChanged bool
 }
 
 func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version int) (publishMetaResult, error) {
@@ -808,6 +830,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	if err != nil {
 		return publishMetaResult{}, err
 	}
+	hadMeta := prev != nil
 	if prev == nil {
 		prev = &storage.DocMeta{Slug: in.Slug, Title: in.Slug, Versions: []storage.VersionRef{}}
 	}
@@ -848,7 +871,11 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}); err != nil {
 		return publishMetaResult{}, err
 	}
-	return publishMetaResult{title: title}, nil
+	return publishMetaResult{
+		title:        title,
+		hadMeta:      hadMeta,
+		titleChanged: hadMeta && strings.TrimSpace(prev.Title) != "" && prev.Title != title,
+	}, nil
 }
 
 func sortVersions(v []storage.VersionRef) {
