@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 )
 
@@ -16,6 +18,7 @@ import (
 // serves the registration gate in afterPublished so the reconcile hook fires.
 type noopRegistrar struct {
 	registered atomic.Int32
+	renamed    atomic.Int32
 }
 
 func (r *noopRegistrar) Register(_ context.Context, reg docsbackend.Registration, _ string) (*docsbackend.RegistrationResult, error) {
@@ -27,8 +30,10 @@ func (r *noopRegistrar) Register(_ context.Context, reg docsbackend.Registration
 		Created:     true,
 	}, nil
 }
-func (*noopRegistrar) Rename(context.Context, string, string, string) {}
-func (*noopRegistrar) Delete(context.Context, string, string)         {}
+func (r *noopRegistrar) Rename(context.Context, string, string, string) {
+	r.renamed.Add(1)
+}
+func (*noopRegistrar) Delete(context.Context, string, string) {}
 
 // yujiawei round-4 P1: afterPublished must invoke the injected reconciler
 // after confirmed registration so grants written to meta.grants
@@ -124,5 +129,143 @@ func TestAfterPublishedThreadMountSkipsReconciler(t *testing.T) {
 	}
 	if registrar.registered.Load() != 0 {
 		t.Fatalf("registrar called on thread-mount doc: %d", registrar.registered.Load())
+	}
+}
+
+func TestReplaceElementRestoresPersistedMountContext(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	var reconciled atomic.Int32
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil).
+		WithGrantReconciler(func(context.Context, string) error {
+			reconciled.Add(1)
+			return nil
+		})
+
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "replace-mounted", HTML: "<html><body><section><p>old</p></section></body></html>", MountType: "group",
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	rendered, err := docs.Render(ctx, "replace-mounted", 1)
+	if err != nil || rendered == nil {
+		t.Fatalf("render: data=%v err=%v", rendered, err)
+	}
+	start := strings.Index(rendered.HTML, `data-odoc-aid="`)
+	if start < 0 {
+		t.Fatal("published document has no aid")
+	}
+	start += len(`data-odoc-aid="`)
+	end := strings.Index(rendered.HTML[start:], `"`)
+	if end < 0 {
+		t.Fatal("published document has malformed aid")
+	}
+	aid := rendered.HTML[start : start+end]
+	result, err := docs.ReplaceElement(ctx, "replace-mounted", 1, aid, "<section><p>new</p></section>")
+	if err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if !result.Registered || result.Status != "published" {
+		t.Fatalf("replace registration = registered:%v status:%q", result.Registered, result.Status)
+	}
+	if got := registrar.registered.Load(); got != 2 {
+		t.Fatalf("register calls = %d; want 2", got)
+	}
+	if got := reconciled.Load(); got != 2 {
+		t.Fatalf("reconcile calls = %d; want 2", got)
+	}
+	meta, err := store.GetMeta(ctx, "replace-mounted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountType, ok := meta.MountType(); !ok || mountType != "group" {
+		t.Fatalf("persisted mount = %q, %v; want group, true", mountType, ok)
+	}
+}
+
+func TestPromoteRestoresMountAndRenames(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	var reconciled atomic.Int32
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil).
+		WithGrantReconciler(func(context.Context, string) error {
+			reconciled.Add(1)
+			return nil
+		})
+
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "promote-mounted", HTML: "<html><body><p>v1</p></body></html>", Title: "Old", MountType: "space",
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := docs.SaveDraft(ctx, "promote-mounted", "<html><body><p>draft</p></body></html>", "", ""); err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	result, err := docs.Promote(ctx, "promote-mounted", "New")
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if !result.Registered || result.Status != "published" {
+		t.Fatalf("promote registration = registered:%v status:%q", result.Registered, result.Status)
+	}
+	if got := registrar.registered.Load(); got != 2 {
+		t.Fatalf("register calls = %d; want 2", got)
+	}
+	if got := registrar.renamed.Load(); got != 1 {
+		t.Fatalf("rename calls = %d; want 1", got)
+	}
+	if got := reconciled.Load(); got != 2 {
+		t.Fatalf("reconcile calls = %d; want 2", got)
+	}
+}
+
+func TestLegacyPromoteDoesNotClaimUnregistered(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	var reconciled atomic.Int32
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil).
+		WithGrantReconciler(func(context.Context, string) error {
+			reconciled.Add(1)
+			return nil
+		})
+	ctx := context.Background()
+	created := time.Now().UTC().Format(time.RFC3339)
+	if err := store.PutMeta(ctx, "legacy-promote", storage.DocMeta{
+		Slug: "legacy-promote", Title: "Old", Versions: []storage.VersionRef{{N: 1, Created: &created}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutDoc(ctx, "legacy-promote", 1, "<html><body><p>v1</p></body></html>"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.SaveDraft(ctx, "legacy-promote", "<html><body><p>draft</p></body></html>", "", ""); err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	result, err := docs.Promote(ctx, "legacy-promote", "New")
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if result.Registered || result.Status != "published" {
+		t.Fatalf("legacy promote = registered:%v status:%q; want false, published", result.Registered, result.Status)
+	}
+	if got := registrar.registered.Load(); got != 0 {
+		t.Fatalf("legacy register calls = %d; want 0", got)
+	}
+	if got := registrar.renamed.Load(); got != 1 {
+		t.Fatalf("legacy rename calls = %d; want 1", got)
+	}
+	if got := reconciled.Load(); got != 1 {
+		t.Fatalf("legacy reconcile calls = %d; want 1", got)
 	}
 }

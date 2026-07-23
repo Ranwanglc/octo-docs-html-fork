@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
@@ -57,6 +58,33 @@ func TestPublishRejectsEmptyAndOversized(t *testing.T) {
 	small := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 10)
 	if _, err := small.Publish(ctx, service.PublishInput{Slug: "d", HTML: "<html>way too large</html>"}); err == nil {
 		t.Error("oversized HTML should be rejected")
+	}
+}
+
+func TestPublishRejectsInvalidMountTypeBeforeWrite(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20)
+	_, err := docs.Publish(context.Background(), service.PublishInput{
+		Slug: "bad-mount", HTML: "<html><body>x</body></html>", MountType: "gruop",
+	})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "mount_type_invalid" {
+		t.Fatalf("publish error = %v; want mount_type_invalid", err)
+	}
+	versions, listErr := store.ListVersions(context.Background(), "bad-mount")
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("invalid publish wrote versions: %v", versions)
+	}
+	meta, metaErr := store.GetMeta(context.Background(), "bad-mount")
+	if metaErr != nil {
+		t.Fatal(metaErr)
+	}
+	if meta != nil {
+		t.Fatalf("invalid publish wrote metadata: %+v", meta)
 	}
 }
 

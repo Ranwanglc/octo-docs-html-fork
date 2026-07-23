@@ -26,6 +26,9 @@ type DocMeta struct {
 // so the key is the single source of truth for doc ownership.
 const CreatorUIDExtraKey = "creator_uid"
 
+// MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
+const MountTypeExtraKey = "mount_type"
+
 // CreatorUID returns the creating uid stored under Extra, or "" when absent
 // (legacy docs / no creator recorded ⇒ nobody is author by ownership).
 func (m *DocMeta) CreatorUID() string {
@@ -34,6 +37,17 @@ func (m *DocMeta) CreatorUID() string {
 	}
 	uid, _ := m.Extra[CreatorUIDExtraKey].(string)
 	return uid
+}
+
+// MountType returns the persisted mount type and whether mount context was
+// recorded. The boolean distinguishes legacy metadata from an explicit empty
+// mount, which means the document is intentionally unregistered.
+func (m *DocMeta) MountType() (string, bool) {
+	if m == nil || m.Extra == nil {
+		return "", false
+	}
+	mountType, ok := m.Extra[MountTypeExtraKey].(string)
+	return mountType, ok
 }
 
 // GrantsExtraKey is the DocMeta.Extra key holding per-uid access grants: a

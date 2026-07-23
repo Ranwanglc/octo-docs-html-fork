@@ -157,6 +157,31 @@ func TestPublishGroupFailsClosedWithoutRegistrar(t *testing.T) {
 	}
 }
 
+func TestPublishRejectsInvalidMountType(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"bad-mount","html":"<html><body>x</body></html>","mount_type":"gruop"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != "VALIDATION_ERROR" || envelope.Error.Details["code"] != "mount_type_invalid" {
+		t.Fatalf("error = %#v; want VALIDATION_ERROR/mount_type_invalid", envelope.Error)
+	}
+	rec = do(t, h, http.MethodGet, "/v1/docs/bad-mount/versions", authorHdrNoCT(), "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("invalid publish persisted doc: versions = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPublishTitleFromMeta(t *testing.T) {
 	// The CLI sends the doc's meta.json under `meta` ({slug,version,html,meta,
 	// comments}); the server must read meta.title when no top-level title is given.
