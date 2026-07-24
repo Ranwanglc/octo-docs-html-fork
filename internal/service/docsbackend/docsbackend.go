@@ -161,7 +161,7 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 		c.logger.Warn("docs_backend_register request failed", "slug", slug, "op", op, "err", err.Error())
 		return nil, fmt.Errorf("docs-backend %s request: %w", op, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
 		return nil, fmt.Errorf("read docs-backend %s response: %w", op, readErr)
