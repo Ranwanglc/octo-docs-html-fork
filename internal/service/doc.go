@@ -135,6 +135,7 @@ type PublishResult struct {
 	Slug           string `json:"slug"`
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
+	RenderURL      string `json:"render_url"`
 	DocID          string `json:"doc_id"`
 	ShareURL       string `json:"share_url"`
 	Registered     bool   `json:"registered"`
@@ -253,7 +254,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 	return &PublishResult{
 		Slug:              in.Slug,
 		Version:           version,
-		URL:               fmt.Sprintf("%s/d/%s/v/%d", s.baseURL, in.Slug, version),
+		RenderURL:         fmt.Sprintf("%s/d/%s/v/%d", s.baseURL, in.Slug, version),
 		Status:            publishStatusPublished,
 		Size:              size,
 		AIDs:              len(stamped.AIDs),
@@ -756,6 +757,7 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 		return
 	}
 	result.DocID = registration.DocID
+	result.URL = registration.ShareURL
 	result.ShareURL = registration.ShareURL
 	result.Registered = true
 	if result.hadMeta && result.titleChanged {

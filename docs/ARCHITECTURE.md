@@ -203,7 +203,7 @@ POST /v1/docs  (Authorization: Bearer <token>, multipart or JSON)
   ├─ metaStore.putMeta        monotonic versions[]
   ├─ commentStore.publish_merge   reconcile anchors + merge local comments
   └─ docs-backend register       bounded idempotent retries; never republishes HTML
-     → { slug, version, url, doc_id, share_url, registered, status, size, aids, merged_comments }
+     → { slug, version, url, render_url, doc_id, share_url, registered, status, size, aids, merged_comments }
 ```
 
 `created:false` from docs-backend is an existing-row success. If registration

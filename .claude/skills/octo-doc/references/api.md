@@ -47,7 +47,7 @@ Save HTML and create version 1 (or the next version) in one step.
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"slug":"demo","title":"Demo","html":"<html><body><h1>Hi</h1></body></html>"}' \
   "$BASE/v1/docs"
-# data: { "slug":"demo", "version":1, "url":"/d/demo/v/1", "doc_id":"...", "share_url":"https://...", "registered":true, "status":"published", "size":..., "aids":..., "merged_comments":... }
+# data: { "slug":"demo", "version":1, "url":"https://.../d/<doc_id>?sp=<space>", "render_url":"/d/demo/v/1", "doc_id":"...", "share_url":"https://.../d/<doc_id>?sp=<space>", "registered":true, "status":"published", "size":..., "aids":..., "merged_comments":... }
 ```
 
 Body: `{slug, html, title?, version?, comments?, mount_type?, group_no?, thread_id?}`. `slug` is kebab-case

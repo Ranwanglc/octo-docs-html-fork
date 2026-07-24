@@ -137,6 +137,9 @@ func TestPublishResponseIncludesRegistrationState(t *testing.T) {
 	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
 		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
 	}
+	if envelope.Data["url"] != "" || envelope.Data["render_url"] != "/d/contract/v/1" {
+		t.Fatalf("unregistered response must expose only render_url: %#v", envelope.Data)
+	}
 }
 
 func TestPublishGroupFailsClosedWithoutRegistrar(t *testing.T) {
