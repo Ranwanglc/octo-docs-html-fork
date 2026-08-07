@@ -15,15 +15,16 @@ import (
 
 // firstAID publishes html at slug v1 and returns the aid + tag of the first
 // stamped artifact, by rendering v1 and scraping the stamped attribute.
-func publishAndFirstAID(t *testing.T, h http.Handler, auth map[string]string, slug, html string) string {
+func publishAndFirstAID(t *testing.T, h http.Handler, auth map[string]string, slug, html string) (string, string) {
 	t.Helper()
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"`+slug+`","html":`+jsonString(html)+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("publish %s = %d: %s", slug, rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 	// Render v1 and pull the first data-odoc-aid="..." value out of the HTML.
-	body := do(t, h, http.MethodGet, "/d/"+slug+"/v/1", auth, "").Body.String()
+	body := do(t, h, http.MethodGet, "/d/"+key+"/v/1", auth, "").Body.String()
 	const marker = `data-odoc-aid="`
 	i := strings.Index(body, marker)
 	if i < 0 {
@@ -34,7 +35,7 @@ func publishAndFirstAID(t *testing.T, h http.Handler, auth map[string]string, sl
 	if end < 0 {
 		t.Fatalf("unterminated aid attr in %s", slug)
 	}
-	return rest[:end]
+	return rest[:end], key
 }
 
 func jsonString(s string) string {
@@ -45,12 +46,12 @@ func jsonString(s string) string {
 func TestAgentElementGetHitAndMiss(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"elget", `<html><body><section><p>hello section</p></section></body></html>`)
 
 	// Hit: returns the outer HTML of the stamped element.
 	rec := do(t, h, http.MethodPost, "/v1/agent/element/get", auth,
-		`{"slug":"elget","aid":"`+aid+`"}`)
+		`{"slug":"`+key+`","aid":"`+aid+`"}`)
 	if rec.Code != 200 {
 		t.Fatalf("element get = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -72,7 +73,7 @@ func TestAgentElementGetHitAndMiss(t *testing.T) {
 
 	// Miss: unknown aid → 404-style apperr.
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/get", auth,
-		`{"slug":"elget","aid":"nope"}`)
+		`{"slug":"`+key+`","aid":"nope"}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown aid get = %d; want 404", rec.Code)
 	}
@@ -93,19 +94,19 @@ func TestAgentElementGetRequiresAuth(t *testing.T) {
 func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"elrep", `<html><body><section><p>original text</p></section></body></html>`)
 
 	// Anchor a comment to the doc so we can prove reconcile survives the republish.
 	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"elrep","text":"note","version":1,"anchor":{"kind":"text","text":"original"}}`)
+		`{"slug":"`+key+`","text":"note","version":1,"anchor":{"kind":"text","text":"original"}}`)
 	if rec.Code != 200 {
 		t.Fatalf("seed comment = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Replace the element (base_version omitted → latest).
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-		`{"slug":"elrep","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
+		`{"slug":"`+key+`","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("element replace = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -120,7 +121,7 @@ func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 	}
 
 	// v2 HTML reflects the change; the old content is gone.
-	v2 := do(t, h, http.MethodGet, "/d/elrep/v/2", auth, "").Body.String()
+	v2 := do(t, h, http.MethodGet, "/d/"+key+"/v/2", auth, "").Body.String()
 	if !strings.Contains(v2, "replaced text") {
 		t.Error("v2 missing the replaced content")
 	}
@@ -133,7 +134,7 @@ func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 	}
 
 	// Reconcile ran: the seeded comment is still readable at v2.
-	list := do(t, h, http.MethodGet, "/v1/comments?slug=elrep&version=2", auth, "").Body.String()
+	list := do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=2", auth, "").Body.String()
 	if !strings.Contains(list, "note") {
 		t.Errorf("comment lost after republish (reconcile did not run): %s", list)
 	}
@@ -142,10 +143,10 @@ func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 func TestAgentElementReplaceUnknownAID(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = publishAndFirstAID(t, h, auth,
+	_, key := publishAndFirstAID(t, h, auth,
 		"elbad", `<html><body><section><p>x</p></section></body></html>`)
 	rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-		`{"slug":"elbad","aid":"missing","new_html":`+jsonString(`<section><p>y</p></section>`)+`}`)
+		`{"slug":"`+key+`","aid":"missing","new_html":`+jsonString(`<section><p>y</p></section>`)+`}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("replace unknown aid = %d; want 404", rec.Code)
 	}
@@ -154,7 +155,7 @@ func TestAgentElementReplaceUnknownAID(t *testing.T) {
 func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"eloob", `<html><body><section><p>x</p></section></body></html>`)
 
 	cases := []struct {
@@ -171,7 +172,7 @@ func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-				`{"slug":"eloob","aid":"`+aid+`","new_html":`+jsonString(c.newHTML)+`}`)
+				`{"slug":"`+key+`","aid":"`+aid+`","new_html":`+jsonString(c.newHTML)+`}`)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("%s new_html = %d; want 400: %s", c.name, rec.Code, rec.Body.String())
 			}
@@ -179,7 +180,7 @@ func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 	}
 
 	// A rejected replace must not have minted a new version.
-	rec := do(t, h, http.MethodGet, "/v1/docs/eloob/versions", auth, "")
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", auth, "")
 	if strings.Contains(rec.Body.String(), `"n":2`) {
 		t.Errorf("out-of-bounds replace leaked a new version: %s", rec.Body.String())
 	}
@@ -192,7 +193,7 @@ func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"elinj", `<html><body><section><p>x</p></section></body></html>`)
 
 	cases := []struct {
@@ -209,14 +210,14 @@ func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-				`{"slug":"elinj","aid":"`+aid+`","new_html":`+jsonString(c.newHTML)+`}`)
+				`{"slug":"`+key+`","aid":"`+aid+`","new_html":`+jsonString(c.newHTML)+`}`)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("%s new_html = %d; want 400: %s", c.name, rec.Code, rec.Body.String())
 			}
 		})
 	}
 	// None of the rejected replaces may have minted v2.
-	rec := do(t, h, http.MethodGet, "/v1/docs/elinj/versions", auth, "")
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", auth, "")
 	if strings.Contains(rec.Body.String(), `"n":2`) {
 		t.Errorf("injection replace leaked a new version: %s", rec.Body.String())
 	}
@@ -229,19 +230,19 @@ func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"elodoc", `<html><body><section><p>x</p></section></body></html>`)
 
 	// Literal only in a text node and in a title value — not real attributes.
 	ok := `<section title="data-odoc-aid=fake"><p>mentions data-odoc-artifact in text</p></section>`
 	rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-		`{"slug":"elodoc","aid":"`+aid+`","new_html":`+jsonString(ok)+`}`)
+		`{"slug":"`+key+`","aid":"`+aid+`","new_html":`+jsonString(ok)+`}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("literal-in-value/text replace = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 
 	// A REAL data-odoc-* attribute name is still rejected.
-	v2 := do(t, h, http.MethodGet, "/d/elodoc/v/2", auth, "").Body.String()
+	v2 := do(t, h, http.MethodGet, "/d/"+key+"/v/2", auth, "").Body.String()
 	const marker = `data-odoc-aid="`
 	i := strings.Index(v2, marker)
 	if i < 0 {
@@ -251,7 +252,7 @@ func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
 	aid2 := rest[:strings.IndexByte(rest, '"')]
 	bad := `<section data-odoc-aid="forged"><p>y</p></section>`
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-		`{"slug":"elodoc","aid":"`+aid2+`","new_html":`+jsonString(bad)+`}`)
+		`{"slug":"`+key+`","aid":"`+aid2+`","new_html":`+jsonString(bad)+`}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("real data-odoc attr replace = %d; want 400: %s", rec.Code, rec.Body.String())
 	}
@@ -266,14 +267,14 @@ func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
 func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	aid := publishAndFirstAID(t, h, auth,
+	aid, key := publishAndFirstAID(t, h, auth,
 		"elanchor", `<html><body><section><p>original text</p></section></body></html>`)
 
 	// Seed an ELEMENT-kind comment targeting the exact aid we will replace, with a
 	// fingerprint so reconcile has a hint to rebind against.
 	anchor := `{"kind":"element","aid":"` + aid + `","selector":"[data-odoc-aid=\"` + aid + `\"]","label":"section","fingerprint":{"tag":"section"}}`
 	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"elanchor","text":"element note","version":1,"anchor":`+anchor+`}`)
+		`{"slug":"`+key+`","text":"element note","version":1,"anchor":`+anchor+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("seed element comment = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -282,7 +283,7 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 	// replacement root and re-stamps preserving it, so the element keeps its
 	// identity across the republish (issue-21).
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
-		`{"slug":"elanchor","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
+		`{"slug":"`+key+`","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("element replace = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -290,7 +291,7 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 	// Read v2 comments: the seeded comment must still exist and stay ELEMENT-
 	// anchored to the SAME aid — the replacement inherited it, so the anchor never
 	// drifts to a new aid or goes lost.
-	list := do(t, h, http.MethodGet, "/v1/comments?slug=elanchor&version=2", auth, "").Body.String()
+	list := do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=2", auth, "").Body.String()
 	if !strings.Contains(list, "element note") {
 		t.Fatalf("element-anchored comment lost after republish: %s", list)
 	}

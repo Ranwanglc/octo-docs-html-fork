@@ -29,6 +29,16 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// AliasExtraKey holds the human-readable client-supplied name (the old "slug")
+// for a doc whose identity is now a server-derived key. Used for titles/display
+// and returned as the DTO `alias`. Absent on legacy bare-slug docs.
+const AliasExtraKey = "alias"
+
+// KeySchemeExtraKey records the identity scheme of the doc's storage key. The
+// only current non-empty value is "dockey" (key = DeriveDocKey). ABSENT ⇒ the
+// doc predates the scheme and its key is a legacy client-chosen slug.
+const KeySchemeExtraKey = "key_scheme"
+
 // CreatorUID returns the creating uid stored under Extra, or "" when absent
 // (legacy docs / no creator recorded ⇒ nobody is author by ownership).
 func (m *DocMeta) CreatorUID() string {
@@ -37,6 +47,26 @@ func (m *DocMeta) CreatorUID() string {
 	}
 	uid, _ := m.Extra[CreatorUIDExtraKey].(string)
 	return uid
+}
+
+// Alias returns the human-readable client-supplied name recorded under Extra,
+// or "" when absent (legacy docs never carried one).
+func (m *DocMeta) Alias() string {
+	if m == nil || m.Extra == nil {
+		return ""
+	}
+	alias, _ := m.Extra[AliasExtraKey].(string)
+	return alias
+}
+
+// KeyScheme returns the recorded identity scheme ("dockey" for server-derived
+// keys), or "" when absent — which MUST be treated as the legacy slug scheme.
+func (m *DocMeta) KeyScheme() string {
+	if m == nil || m.Extra == nil {
+		return ""
+	}
+	scheme, _ := m.Extra[KeySchemeExtraKey].(string)
+	return scheme
 }
 
 // MountType returns the persisted mount type and whether mount context was

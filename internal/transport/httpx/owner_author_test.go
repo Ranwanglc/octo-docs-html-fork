@@ -31,7 +31,7 @@ func ownerAuthCfg() *config.Config {
 	}
 }
 
-func publishAsBot(t *testing.T, h http.Handler, slug string) {
+func publishAsBot(t *testing.T, h http.Handler, slug string) string {
 	t.Helper()
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"},
@@ -39,16 +39,17 @@ func publishAsBot(t *testing.T, h http.Handler, slug string) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish as bot %s = %d: %s", slug, rec.Code, rec.Body.String())
 	}
+	return pubKey(t, rec)
 }
 
 // 验收1: bot 发布 → creator = bot 的 OwnerUID（用户 uid），不是 bot uid。
 func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docO")
+	key := publishAsBot(t, h, "docO")
 
 	// The owner user (its own trust-header login == creator_uid) can author.
-	rec := do(t, h, http.MethodDelete, "/v1/docs/docO",
+	rec := do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner delete = %d; creator_uid should be owner uid: %s", rec.Code, rec.Body.String())
@@ -56,8 +57,8 @@ func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 
 	// The bot's own uid must NOT be the creator: a user logging in as the bot uid
 	// (not the owner) gets no author.
-	publishAsBot(t, h, "docO2")
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docO2",
+	key2 := publishAsBot(t, h, "docO2")
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key2,
 		map[string]string{octoUIDHeaderName: "bot-1"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("bot-uid delete = %d; want 404 (creator is owner uid, not bot uid): %s", rec.Code, rec.Body.String())
@@ -68,9 +69,9 @@ func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 func TestOwnerUserAuthorsBotCreatedDoc(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docShare")
+	key := publishAsBot(t, h, "docShare")
 
-	rec := do(t, h, http.MethodPost, "/v1/docs/docShare/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner share = %d: %s", rec.Code, rec.Body.String())
@@ -84,10 +85,10 @@ func TestSameOwnerBotAuthorsOthersRejected(t *testing.T) {
 	// bot and an unrelated user and assert both are hidden (404).
 	withStubIdentity(t, stubIdentity{botUID: "bot-A", botName: "Bot A", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docTeam")
+	key := publishAsBot(t, h, "docTeam")
 
 	// Same-owner bot (OwnerUID owner-1) shares → author.
-	rec := do(t, h, http.MethodPost, "/v1/docs/docTeam/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("same-owner bot share = %d: %s", rec.Code, rec.Body.String())
@@ -95,14 +96,14 @@ func TestSameOwnerBotAuthorsOthersRejected(t *testing.T) {
 
 	// Different-owner bot → 404 (not author).
 	withStubIdentity(t, stubIdentity{botUID: "bot-B", botName: "Bot B", botSpaceID: "s1", botOwnerUID: "owner-2"})
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docTeam",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("different-owner bot delete = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
 	// Unrelated user → 404.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docTeam",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "random-user"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unrelated user delete = %d; want 404: %s", rec.Code, rec.Body.String())
@@ -121,10 +122,11 @@ func TestUnrelatedBotNotSuperAdminOnOthersDoc(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("human publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// Unrelated bot must NOT be able to delete/author it (would have if bot were
 	// a global superAdmin — the retired behavior).
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docHuman",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unrelated bot delete = %d; want 404 (bot is not superAdmin): %s", rec.Code, rec.Body.String())
@@ -142,22 +144,23 @@ func TestDraftFirstCreateByUser(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("draft-first save = %d; want 200 (no longer 404): %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// creator was stamped to the creating user → same user can promote (author).
-	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugU/draft/promote",
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote",
 		map[string]string{octoUIDHeaderName: "user-42"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("promote as creator = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// A different user must not author it after creation.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugU",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "someone-else"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("other user delete = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 	// The creator can delete it.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugU",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "user-42"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("creator delete = %d: %s", rec.Code, rec.Body.String())
@@ -175,9 +178,10 @@ func TestDraftFirstCreateByBotStampsOwner(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bot draft-first save = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// The owner user (owner-D) can author it — creator was stamped to OwnerUID.
-	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugBot/draft/promote",
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote",
 		map[string]string{octoUIDHeaderName: "owner-D"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner promote of bot draft = %d: %s", rec.Code, rec.Body.String())
@@ -185,7 +189,7 @@ func TestDraftFirstCreateByBotStampsOwner(t *testing.T) {
 
 	// The stamped creator survives promote: confirm a published version exists and
 	// the owner can delete.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugBot",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "owner-D"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner delete after promote = %d: %s", rec.Code, rec.Body.String())
@@ -308,8 +312,9 @@ func TestBrandNewSlugDraftFirstStillWorks(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("brand-new draft-first = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 	// The creator was stamped; a different user cannot author it.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/freshSlug",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "other"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("other user delete of freshSlug = %d; want 404: %s", rec.Code, rec.Body.String())
@@ -328,36 +333,37 @@ func TestWipeCommentsAuthorOnly(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 	rec = do(t, h, http.MethodPost, "/v1/comments",
 		map[string]string{octoUIDHeaderName: "creator-w", "Content-Type": "application/json"},
-		`{"slug":"wdoc","text":"note","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"note","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed comment = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Non-author → 404 (hidden), and does NOT wipe.
-	rec = do(t, h, http.MethodDelete, "/v1/comments?slug=wdoc&all=1",
+	rec = do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&all=1",
 		map[string]string{octoUIDHeaderName: "stranger"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("non-author wipe = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
 	// Stale write token no longer authorizes the wipe (author is creator/superAdmin).
-	rec = do(t, h, http.MethodDelete, "/v1/comments?slug=wdoc&all=1",
+	rec = do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&all=1",
 		map[string]string{"Authorization": "Bearer test-token"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("write-token wipe = %d; want 404 (write token no longer authorizes): %s", rec.Code, rec.Body.String())
 	}
 
 	// Comment still present after the rejected attempts.
-	rec = do(t, h, http.MethodGet, "/v1/comments?slug=wdoc&version=1",
+	rec = do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=1",
 		map[string]string{octoUIDHeaderName: "creator-w"}, "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "note") {
 		t.Fatalf("comment should survive rejected wipes: %d %s", rec.Code, rec.Body.String())
 	}
 
 	// The creator CAN wipe (200).
-	rec = do(t, h, http.MethodDelete, "/v1/comments?slug=wdoc&all=1",
+	rec = do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&all=1",
 		map[string]string{octoUIDHeaderName: "creator-w"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("creator wipe = %d; want 200: %s", rec.Code, rec.Body.String())
@@ -366,8 +372,8 @@ func TestWipeCommentsAuthorOnly(t *testing.T) {
 	// A superAdmin can also wipe (seed a fresh comment first).
 	_ = do(t, h, http.MethodPost, "/v1/comments",
 		map[string]string{octoUIDHeaderName: "creator-w", "Content-Type": "application/json"},
-		`{"slug":"wdoc","text":"again","version":1,"anchor":{"kind":"text","text":"hello"}}`)
-	rec = do(t, h, http.MethodDelete, "/v1/comments?slug=wdoc&all=1",
+		`{"slug":"`+key+`","text":"again","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+	rec = do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&all=1",
 		map[string]string{octoUIDHeaderName: "admin-uid", octoRoleHeaderName: "superAdmin"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("superAdmin wipe = %d; want 200: %s", rec.Code, rec.Body.String())
@@ -390,10 +396,11 @@ func TestBotAuthAcceptsTokenHeader(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish via token header = %d; want 200 (bot must resolve from token header): %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// The bot's owner can author it → proves the bot session (creator_uid=owner-1)
 	// was filled from the token-header publish.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docTokHdr",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner delete = %d; want 200 (token-header publish must stamp creator): %s", rec.Code, rec.Body.String())

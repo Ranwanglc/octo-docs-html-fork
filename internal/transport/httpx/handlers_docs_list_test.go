@@ -31,7 +31,7 @@ func memberHeaders() map[string]string {
 	}
 }
 
-func seedDoc(t *testing.T, h http.Handler, slug, title string) {
+func seedDoc(t *testing.T, h http.Handler, slug, title string) string {
 	t.Helper()
 	auth := authorHdr()
 	body := `{"slug":"` + slug + `","version":1,"html":"<html><body><h1>` + title + `</h1></body></html>","meta":{"title":"` + title + `"}}`
@@ -39,6 +39,7 @@ func seedDoc(t *testing.T, h http.Handler, slug, title string) {
 	if rec.Code != 200 {
 		t.Fatalf("seed publish %s = %d: %s", slug, rec.Code, rec.Body.String())
 	}
+	return pubKey(t, rec)
 }
 
 // parseListEnvelope decodes {"data":[...], "pagination":{...}} for assertions.
@@ -82,20 +83,24 @@ func parseDataEnvelope(t *testing.T, body []byte) map[string]any {
 
 func TestGetDocReturnsMetadata(t *testing.T) {
 	h := newTestServer(t, nil)
-	seedDoc(t, h, "detail", "Detail Title")
+	key := seedDoc(t, h, "detail", "Detail Title")
 	auth := authorHdr()
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"detail","html":"<html><body><h1>Detail v2</h1></body></html>"}`)
 	if rec.Code != 200 {
 		t.Fatalf("publish v2 = %d: %s", rec.Code, rec.Body.String())
 	}
+	// v2 by same creator+alias lands on the SAME key (append, not a new doc).
+	if k2 := pubKey(t, rec); k2 != key {
+		t.Fatalf("v2 key = %s; want same key %s (same creator+alias appends)", k2, key)
+	}
 
-	rec = do(t, h, http.MethodGet, "/v1/docs/detail", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key, authorHdrNoCT(), "")
 	if rec.Code != 200 {
 		t.Fatalf("get doc = %d: %s", rec.Code, rec.Body.String())
 	}
 	data := parseDataEnvelope(t, rec.Body.Bytes())
-	if data["slug"] != "detail" || data["title"] != "Detail Title" {
+	if data["slug"] != key || data["title"] != "Detail Title" {
 		t.Fatalf("doc identity = %v", data)
 	}
 	if data["latest"] != float64(2) {
@@ -120,8 +125,8 @@ func TestGetDocNotFound(t *testing.T) {
 
 func TestGetDocUnauthenticated(t *testing.T) {
 	h := newTestServer(t, nil)
-	seedDoc(t, h, "private", "Private")
-	rec := do(t, h, http.MethodGet, "/v1/docs/private", nil, "")
+	key := seedDoc(t, h, "private", "Private")
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key, nil, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unauthenticated doc = %d; want 404: %s", rec.Code, rec.Body.String())
 	}

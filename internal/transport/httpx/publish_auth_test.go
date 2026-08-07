@@ -25,23 +25,27 @@ func TestPublishExistingSlugRequiresEditCapability(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newTestServer(t, nil)
-			slug := "publish-" + tc.role
+			alias := "publish-" + tc.role
 
-			if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody(slug, "owner-v1")); rec.Code != http.StatusOK {
+			rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody(alias, "owner-v1"))
+			if rec.Code != http.StatusOK {
 				t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 			}
+			// The doc lives under the server-derived key; grants and republishes must
+			// address that key, not the alias (a foreign alias derives a different key).
+			key := pubKey(t, rec)
 			grant := fmt.Sprintf(`{"uid":"collaborator","role":%q}`, tc.role)
-			if rec := do(t, h, http.MethodPut, "/v1/docs/"+slug+"/grants", authorHdr(), grant); rec.Code != http.StatusOK {
+			if rec := do(t, h, http.MethodPut, "/v1/docs/"+key+"/grants", authorHdr(), grant); rec.Code != http.StatusOK {
 				t.Fatalf("grant %s = %d: %s", tc.role, rec.Code, rec.Body.String())
 			}
 
 			headers := map[string]string{octoUIDHeaderName: "collaborator", "Content-Type": "application/json"}
-			rec := do(t, h, http.MethodPost, "/v1/docs", headers, publishBody(slug, "collaborator-v2"))
+			rec = do(t, h, http.MethodPost, "/v1/docs", headers, publishBody(key, "collaborator-v2"))
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("%s publish = %d; want %d: %s", tc.role, rec.Code, tc.wantStatus, rec.Body.String())
 			}
 
-			versions := do(t, h, http.MethodGet, "/v1/docs/"+slug+"/versions", authorHdrNoCT(), "")
+			versions := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", authorHdrNoCT(), "")
 			if tc.wantStatus == http.StatusOK {
 				if !strings.Contains(versions.Body.String(), `"n":2`) {
 					t.Fatalf("editor publish did not create v2: %s", versions.Body.String())
@@ -55,19 +59,53 @@ func TestPublishExistingSlugRequiresEditCapability(t *testing.T) {
 
 func TestPublishExistingSlugRejectsUnrelatedIdentity(t *testing.T) {
 	h := newTestServer(t, nil)
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-owned", "owner-v1")); rec.Code != http.StatusOK {
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-owned", "owner-v1"))
+	if rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
+	// Addressing the owner's document directly by its key must be refused: an
+	// unrelated identity has no edit capability on it.
 	headers := map[string]string{octoUIDHeaderName: "outsider", "Content-Type": "application/json"}
-	rec := do(t, h, http.MethodPost, "/v1/docs", headers, publishBody("publish-owned", "outsider-v2"))
+	rec = do(t, h, http.MethodPost, "/v1/docs", headers, publishBody(key, "outsider-v2"))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("outsider publish = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
-	versions := do(t, h, http.MethodGet, "/v1/docs/publish-owned/versions", authorHdrNoCT(), "")
+	versions := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", authorHdrNoCT(), "")
 	if strings.Contains(versions.Body.String(), `"n":2`) || !strings.Contains(versions.Body.String(), `"title":"owner-v1"`) {
 		t.Fatalf("outsider publish mutated document: %s", versions.Body.String())
+	}
+}
+
+// TestPublishSameAliasDifferentIdentityIsolated pins the namespacing property: a
+// second identity publishing under the SAME human alias gets its own document
+// under its own derived key, and the first identity's document is untouched. This
+// is what removes global alias squatting — the outsider never needs to be refused
+// because it can never address someone else's doc by name.
+func TestPublishSameAliasDifferentIdentityIsolated(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("weekly-report", "owner-v1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	ownerKey := pubKey(t, rec)
+
+	headers := map[string]string{octoUIDHeaderName: "other-author", "Content-Type": "application/json"}
+	rec = do(t, h, http.MethodPost, "/v1/docs", headers, publishBody("weekly-report", "other-v1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second identity publish = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	otherKey := pubKey(t, rec)
+	if otherKey == ownerKey {
+		t.Fatalf("same alias from a different identity reused key %q", ownerKey)
+	}
+
+	// The first document still has exactly one version and its original title.
+	versions := do(t, h, http.MethodGet, "/v1/docs/"+ownerKey+"/versions", authorHdrNoCT(), "")
+	if strings.Contains(versions.Body.String(), `"n":2`) || !strings.Contains(versions.Body.String(), `"title":"owner-v1"`) {
+		t.Fatalf("foreign publish mutated the owner document: %s", versions.Body.String())
 	}
 }
 
@@ -81,17 +119,22 @@ func TestPublishNewSlugAllowsAuthenticatedIdentity(t *testing.T) {
 }
 
 func TestPublishExistingSlugAllowsAdmin(t *testing.T) {
+	// The mirror is keyed by the doc's storage key, which is derived — so seed the
+	// doc first, then wire the mirror entry for the resolved key.
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"publish-admin": "doc-admin"},
+		slugToDoc: map[string]string{},
 		roles:     map[string]int{"doc-admin|admin": service.DocMemberRoleAdmin},
 	}
 	h := newServerWithMirror(t, mirror)
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-admin", "owner-v1")); rec.Code != http.StatusOK {
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-admin", "owner-v1"))
+	if rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
+	mirror.slugToDoc[key] = "doc-admin"
 
 	headers := map[string]string{octoUIDHeaderName: "admin", "Content-Type": "application/json"}
-	rec := do(t, h, http.MethodPost, "/v1/docs", headers, publishBody("publish-admin", "admin-v2"))
+	rec = do(t, h, http.MethodPost, "/v1/docs", headers, publishBody(key, "admin-v2"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin republish = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -99,11 +142,22 @@ func TestPublishExistingSlugAllowsAdmin(t *testing.T) {
 
 func TestPublishExistingSlugAllowsCreator(t *testing.T) {
 	h := newTestServer(t, nil)
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-creator", "owner-v1")); rec.Code != http.StatusOK {
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-creator", "owner-v1"))
+	if rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}
-	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-creator", "owner-v2"))
+	key := pubKey(t, rec)
+	// Both addressing forms must reach the same document: by alias (the creator's
+	// own alias re-derives the same key) and by key.
+	rec = do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-creator", "owner-v2"))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("creator republish = %d; want 200: %s", rec.Code, rec.Body.String())
+		t.Fatalf("creator republish by alias = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := pubKey(t, rec); got != key {
+		t.Fatalf("creator republish by alias landed on %q; want %q", got, key)
+	}
+	rec = do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody(key, "owner-v3"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator republish by key = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 }

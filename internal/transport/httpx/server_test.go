@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -94,6 +95,51 @@ func do(t *testing.T, h http.Handler, method, target string, headers map[string]
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// pubKey extracts the server-derived storage key (data.slug) from a publish
+// response envelope. Under the doc-key identity model a publish with a creator
+// identity stores the doc under a derived key, not the client-sent slug, so
+// post-publish addressing (render/versions/share/comments/assets/delete) must
+// use this returned key rather than the original alias.
+func pubKey(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env struct {
+		Data struct {
+			Slug  string `json:"slug"`
+			Alias string `json:"alias"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("pubKey: decode publish response: %v (%s)", err, rec.Body.String())
+	}
+	if env.Data.Slug == "" {
+		t.Fatalf("pubKey: publish response carried no slug: %s", rec.Body.String())
+	}
+	return env.Data.Slug
+}
+
+// mustPublish publishes html under the given alias with the author identity and
+// returns the derived storage key. Fails the test on a non-200.
+func mustPublish(t *testing.T, h http.Handler, alias, html string) string {
+	t.Helper()
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"`+alias+`","html":`+strconv.Quote(html)+`}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mustPublish %q = %d: %s", alias, rec.Code, rec.Body.String())
+	}
+	return pubKey(t, rec)
+}
+
+// mustPublishMeta publishes a full JSON body (already-encoded) with the author
+// identity and returns the derived storage key.
+func mustPublishMeta(t *testing.T, h http.Handler, body string) string {
+	t.Helper()
+	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mustPublishMeta = %d: %s", rec.Code, rec.Body.String())
+	}
+	return pubKey(t, rec)
 }
 
 func TestPingIdentity(t *testing.T) {
@@ -226,7 +272,8 @@ func TestPublishTitleFromMeta(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, http.MethodGet, "/v1/docs/titled/versions", authorHdrNoCT(), "")
+	key := pubKey(t, rec)
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", authorHdrNoCT(), "")
 	if !strings.Contains(rec.Body.String(), `"title":"From Meta"`) {
 		t.Fatalf("title from meta not applied: %s", rec.Body.String())
 	}
@@ -240,9 +287,9 @@ func TestRenderAlwaysPublishedMode(t *testing.T) {
 	// stays anonymous.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"m","version":1,"html":"<html><body><h1>x</h1></body></html>","meta":{"title":"M"}}`)
-	body := do(t, h, http.MethodGet, "/d/m/v/1", authorHdrNoCT(), "").Body.String()
+	key := mustPublishMeta(t, h, `{"slug":"m","version":1,"html":"<html><body><h1>x</h1></body></html>","meta":{"title":"M"}}`)
+	_ = auth
+	body := do(t, h, http.MethodGet, "/d/"+key+"/v/1", authorHdrNoCT(), "").Body.String()
 	if !strings.Contains(body, `"mode":"published"`) {
 		t.Errorf("expected published mode in: %s", body[strings.Index(body, "__ODOC__"):min(strings.Index(body, "__ODOC__")+120, len(body))])
 	}
@@ -268,19 +315,18 @@ func TestCommentRequiresCapability(t *testing.T) {
 	// hidden). Comment capability (author or commenter member) is required.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"anon","version":1,"html":"<html><body><p>hello world</p></body></html>"}`)
+	key := mustPublishMeta(t, h, `{"slug":"anon","version":1,"html":"<html><body><p>hello world</p></body></html>"}`)
 
 	// No credential → rejected.
 	rec := do(t, h, http.MethodPost, "/v1/comments", map[string]string{"Content-Type": "application/json"},
-		`{"slug":"anon","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("anonymous comment = %d; want 404 (needs a capability)", rec.Code)
 	}
 
 	// The author (write token) can comment.
 	rec = do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"anon","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != 200 {
 		t.Fatalf("author comment = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -289,17 +335,20 @@ func TestCommentRequiresCapability(t *testing.T) {
 func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	var key string
 	for _, html := range []string{
 		`{"slug":"private-mutations","html":"<html><body><p>v1</p></body></html>"}`,
 		`{"slug":"private-mutations","html":"<html><body><p>v2</p></body></html>"}`,
 	} {
-		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+		rec := do(t, h, http.MethodPost, "/v1/docs", auth, html)
+		if rec.Code != http.StatusOK {
 			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 		}
+		key = pubKey(t, rec)
 	}
 
 	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"private-mutations","text":"seed","version":2}`)
+		`{"slug":"`+key+`","text":"seed","version":2}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed comment = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -315,10 +364,10 @@ func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
 	for _, tc := range []struct {
 		name, method, target, payload string
 	}{
-		{"patch in range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":2}`},
-		{"patch out of range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":999999}`},
-		{"react in range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":2}`},
-		{"react out of range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":999999}`},
+		{"patch in range", http.MethodPatch, "/v1/comments", `{"slug":"` + key + `","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":2}`},
+		{"patch out of range", http.MethodPatch, "/v1/comments", `{"slug":"` + key + `","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":999999}`},
+		{"react in range", http.MethodPost, "/v1/reactions", `{"slug":"` + key + `","comment_id":"` + created.Data.ID + `","emoji":"x","version":2}`},
+		{"react out of range", http.MethodPost, "/v1/reactions", `{"slug":"` + key + `","comment_id":"` + created.Data.ID + `","emoji":"x","version":999999}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := do(t, h, tc.method, tc.target, map[string]string{"Content-Type": "application/json"}, tc.payload)
@@ -345,9 +394,10 @@ func TestPublishRenderLifecycle(t *testing.T) {
 	if pubData == nil || pubData["version"].(float64) != 1 {
 		t.Fatalf("publish body = %v", pub)
 	}
+	key := pubKey(t, rec)
 
 	// Render injects overlay + stamps aids (author reads it).
-	rec = do(t, h, http.MethodGet, "/d/hello/v/1", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1", authorHdrNoCT(), "")
 	if rec.Code != 200 {
 		t.Fatalf("render = %d", rec.Code)
 	}
@@ -380,7 +430,7 @@ func TestPublishRenderLifecycle(t *testing.T) {
 	}
 
 	// Versions endpoint lists both (author reads).
-	rec = do(t, h, http.MethodGet, "/v1/docs/hello/versions", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", authorHdrNoCT(), "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"n":2`) {
 		t.Fatalf("versions = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -396,13 +446,14 @@ func TestRenderLatestVersion(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish v1 = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 	rec = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"latest","html":"<html><body><h1>Version Two</h1></body></html>"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish v2 = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	rec = do(t, h, http.MethodGet, "/d/latest/v/latest", readAuth, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/latest", readAuth, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("render latest = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -410,12 +461,12 @@ func TestRenderLatestVersion(t *testing.T) {
 		t.Fatalf("latest render body = %s", body)
 	}
 
-	rec = do(t, h, http.MethodGet, "/d/latest/v/latest", nil, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/latest", nil, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unauthenticated latest render = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
-	rec = do(t, h, http.MethodGet, "/d/latest/v/1", readAuth, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1", readAuth, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("render numeric = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -423,7 +474,7 @@ func TestRenderLatestVersion(t *testing.T) {
 		t.Fatalf("numeric render body = %s", body)
 	}
 
-	rec = do(t, h, http.MethodHead, "/d/latest/v/Latest", readAuth, "")
+	rec = do(t, h, http.MethodHead, "/d/"+key+"/v/Latest", readAuth, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("HEAD latest = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -465,6 +516,7 @@ func TestDraftLifecycle(t *testing.T) {
 	}
 
 	// Save a draft (overwrite twice to prove it's mutable).
+	var key string
 	for _, body := range []string{
 		`{"html":"<html><body><h1>draft one</h1></body></html>","title":"Draft Doc"}`,
 		`{"html":"<html><body><h1>draft two</h1></body></html>","title":"Draft Doc"}`,
@@ -473,20 +525,21 @@ func TestDraftLifecycle(t *testing.T) {
 		if rec.Code != 200 {
 			t.Fatalf("draft save = %d: %s", rec.Code, rec.Body.String())
 		}
+		key = pubKey(t, rec)
 	}
 
 	// The draft is NOT a version — versions endpoint has none yet (author reads).
-	rec = do(t, h, http.MethodGet, "/v1/docs/dr/versions", adminHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", adminHdrNoCT(), "")
 	if strings.Contains(rec.Body.String(), `"n":1`) {
 		t.Fatalf("draft leaked into versions: %s", rec.Body.String())
 	}
 
 	// Draft render is author-only. No credential → 404 (existence hidden).
-	rec = do(t, h, http.MethodGet, "/d/dr/draft", nil, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/draft", nil, "")
 	if rec.Code != 401 && rec.Code != 404 {
 		t.Fatalf("unauthenticated draft render = %d; want 401/404", rec.Code)
 	}
-	rec = do(t, h, http.MethodGet, "/d/dr/draft", adminHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/draft", adminHdrNoCT(), "")
 	if rec.Code != 200 {
 		t.Fatalf("draft render = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -498,7 +551,7 @@ func TestDraftLifecycle(t *testing.T) {
 	}
 
 	// Promote → the draft becomes immutable v1.
-	rec = do(t, h, http.MethodPost, "/v1/docs/dr/draft/promote", auth, "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote", auth, "")
 	if rec.Code != 200 {
 		t.Fatalf("promote = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -509,16 +562,16 @@ func TestDraftLifecycle(t *testing.T) {
 	}
 
 	// v1 is now committed; the author reads it, and the draft slot is cleared.
-	if rec = do(t, h, http.MethodGet, "/d/dr/v/1", adminHdrNoCT(), ""); rec.Code != 200 {
+	if rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1", adminHdrNoCT(), ""); rec.Code != 200 {
 		t.Fatalf("published v1 render = %d", rec.Code)
 	}
-	rec = do(t, h, http.MethodGet, "/d/dr/draft", adminHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/draft", adminHdrNoCT(), "")
 	if rec.Code != 404 {
 		t.Fatalf("draft after promote = %d; want 404 (cleared)", rec.Code)
 	}
 
 	// Promoting again with no draft is a clean 404, not a 500.
-	rec = do(t, h, http.MethodPost, "/v1/docs/dr/draft/promote", auth, "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote", auth, "")
 	if rec.Code != 404 {
 		t.Fatalf("promote with no draft = %d; want 404", rec.Code)
 	}
@@ -527,12 +580,11 @@ func TestDraftLifecycle(t *testing.T) {
 func TestCommentLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"doc","html":"<html><body><p>hello world</p></body></html>"}`)
+	key := mustPublish(t, h, "doc", "<html><body><p>hello world</p></body></html>")
 
 	// Create a comment (author credential).
 	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"doc","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != 200 {
 		t.Fatalf("create comment = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -545,7 +597,7 @@ func TestCommentLifecycle(t *testing.T) {
 	}
 
 	// List shows it, wrapped in the data/pagination envelope.
-	rec = do(t, h, http.MethodGet, "/v1/comments?slug=doc&version=1", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=1", authorHdrNoCT(), "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "nice") {
 		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -555,20 +607,20 @@ func TestCommentLifecycle(t *testing.T) {
 
 	// React.
 	rec = do(t, h, http.MethodPost, "/v1/reactions", auth,
-		`{"slug":"doc","comment_id":"`+id+`","emoji":"👍","version":1}`)
+		`{"slug":"`+key+`","comment_id":"`+id+`","emoji":"👍","version":1}`)
 	if rec.Code != 200 {
 		t.Fatalf("react = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Agent reply (write-token gated) flips status.
 	rec = do(t, h, http.MethodPost, "/v1/agent/replies", auth,
-		`{"slug":"doc","parent_id":"`+id+`","text":"done","status":"applied","applied_in":1}`)
+		`{"slug":"`+key+`","parent_id":"`+id+`","text":"done","status":"applied","applied_in":1}`)
 	if rec.Code != 200 {
 		t.Fatalf("agent reply = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Delete.
-	rec = do(t, h, http.MethodDelete, "/v1/comments?slug=doc&id="+id+"&version=1", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&id="+id+"&version=1", authorHdrNoCT(), "")
 	if rec.Code != 200 {
 		t.Fatalf("delete = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -577,23 +629,26 @@ func TestCommentLifecycle(t *testing.T) {
 func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	var key string
 	for _, html := range []string{
 		`{"slug":"anchors","html":"<html><body><p>v1</p></body></html>"}`,
 		`{"slug":"anchors","html":"<html><body><p>v2</p></body></html>"}`,
 	} {
-		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+		rec := do(t, h, http.MethodPost, "/v1/docs", auth, html)
+		if rec.Code != http.StatusOK {
 			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 		}
+		key = pubKey(t, rec)
 	}
 
 	for _, payload := range []string{
-		`{"slug":"anchors","text":"element","version":2,"anchor":{"kind":"element","aid":"a1","selector":"p"}}`,
-		`{"slug":"anchors","text":"text","version":"2","anchor":{"kind":"text","text":"hello","context_before":"before","context_after":"after"}}`,
-		`{"slug":"anchors","text":"latest","version":"latest","anchor":{"kind":"element","aid":"a-latest"}}`,
-		`{"slug":"anchors","text":"v2","version":"v2"}`,
-		`{"slug":"anchors","text":"zero","version":0}`,
-		`{"slug":"anchors","text":"null","version":null}`,
-		`{"slug":"anchors","text":"omitted"}`,
+		`{"slug":"` + key + `","text":"element","version":2,"anchor":{"kind":"element","aid":"a1","selector":"p"}}`,
+		`{"slug":"` + key + `","text":"text","version":"2","anchor":{"kind":"text","text":"hello","context_before":"before","context_after":"after"}}`,
+		`{"slug":"` + key + `","text":"latest","version":"latest","anchor":{"kind":"element","aid":"a-latest"}}`,
+		`{"slug":"` + key + `","text":"v2","version":"v2"}`,
+		`{"slug":"` + key + `","text":"zero","version":0}`,
+		`{"slug":"` + key + `","text":"null","version":null}`,
+		`{"slug":"` + key + `","text":"omitted"}`,
 	} {
 		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
 		if rec.Code != http.StatusOK {
@@ -601,7 +656,7 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 		}
 	}
 
-	rec := do(t, h, http.MethodGet, "/v1/comments?slug=anchors&version=all", authorHdrNoCT(), "")
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=all", authorHdrNoCT(), "")
 	var listed struct {
 		Data []struct {
 			ID        string         `json:"id"`
@@ -633,13 +688,13 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	for _, tc := range []struct {
 		method, target, payload string
 	}{
-		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":-1}`},
-		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":"garbage"}`},
-		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":2}{"anchor":{"kind":"element","aid":"a2"}}`},
-		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":`},
-		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":2} trailing`},
-		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":`},
-		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":2}{}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"` + key + `","text":"bad","version":-1}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"` + key + `","text":"bad","version":"garbage"}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"` + key + `","text":"bad","version":2}{"anchor":{"kind":"element","aid":"a2"}}`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"` + key + `","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"` + key + `","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":2} trailing`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"` + key + `","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"` + key + `","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":2}{}`},
 	} {
 		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
 		if rec.Code != http.StatusBadRequest {
@@ -650,8 +705,8 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	for _, tc := range []struct {
 		method, target, payload string
 	}{
-		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":"latest"}`},
-		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[4].ID + `","emoji":"x","version":0}`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"` + key + `","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":"latest"}`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"` + key + `","comment_id":"` + listed.Data[4].ID + `","emoji":"x","version":0}`},
 	} {
 		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
 		if rec.Code != http.StatusOK {
@@ -663,15 +718,17 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"strict-versions","html":"<html><body><section>v1</section></body></html>"}`); rec.Code != http.StatusOK {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"strict-versions","html":"<html><body><section>v1</section></body></html>"}`)
+	if pb.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", pb.Code, pb.Body.String())
 	}
+	key := pubKey(t, pb)
 	payloads := []string{
-		`{"slug":"strict-versions","text":"future","version":999999}`,
-		`{"slug":"strict-versions","text":"duplicate","version":1,"version":999999}`,
-		`{"slug":"strict-versions","text":"nested duplicate","version":1,"anchor":{"kind":"element","aid":"a","aid":"b"}}`,
-		`{"slug":"strict-versions","anchor":` + strings.Repeat(`[`, 10_000) + `null` + strings.Repeat(`]`, 10_000) + `}`,
+		`{"slug":"` + key + `","text":"future","version":999999}`,
+		`{"slug":"` + key + `","text":"duplicate","version":1,"version":999999}`,
+		`{"slug":"` + key + `","text":"nested duplicate","version":1,"anchor":{"kind":"element","aid":"a","aid":"b"}}`,
+		`{"slug":"` + key + `","anchor":` + strings.Repeat(`[`, 10_000) + `null` + strings.Repeat(`]`, 10_000) + `}`,
 	}
 	for _, payload := range payloads {
 		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
@@ -679,7 +736,7 @@ func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 			t.Fatalf("payload %s = %d, want 400: %s", payload, rec.Code, rec.Body.String())
 		}
 	}
-	rec := do(t, h, http.MethodGet, "/v1/comments?slug=strict-versions&version=all", authorHdrNoCT(), "")
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug="+key+"&version=all", authorHdrNoCT(), "")
 	var listed struct {
 		Data []json.RawMessage `json:"data"`
 	}
@@ -691,13 +748,12 @@ func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 func TestForkExport(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"f","html":"<html><body><p>content here</p></body></html>"}`)
+	key := mustPublish(t, h, "f", "<html><body><p>content here</p></body></html>")
 	_ = do(t, h, http.MethodPost, "/v1/comments", auth,
-		`{"slug":"f","text":"note","version":1,"anchor":{"kind":"text","text":"content"}}`)
+		`{"slug":"`+key+`","text":"note","version":1,"anchor":{"kind":"text","text":"content"}}`)
 
 	rd := authorHdrNoCT()
-	rec := do(t, h, http.MethodGet, "/d/f/v/1/export", rd, "")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1/export", rd, "")
 	if rec.Code != 200 {
 		t.Fatalf("export = %d", rec.Code)
 	}
@@ -708,7 +764,7 @@ func TestForkExport(t *testing.T) {
 		t.Error("fork comments JSON missing")
 	}
 
-	rec = do(t, h, http.MethodGet, "/d/f/v/1/fork", rd, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1/fork", rd, "")
 	if !strings.Contains(rec.Body.String(), "window.__ODOC__") {
 		t.Error("fork should boot overlay")
 	}
@@ -721,10 +777,11 @@ func TestForkExportLatestVersion(t *testing.T) {
 
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"fl","html":"<html><body><p>old export</p></body></html>"}`)
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"fl","html":"<html><body><p>latest export</p></body></html>"}`)
+	key := pubKey(t, pb)
 
-	rec := do(t, h, http.MethodGet, "/d/fl/v/%20LATEST%20/export", rd, "")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/%20LATEST%20/export", rd, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("export latest = %d: %s", rec.Code, rec.Body.String())
 	}

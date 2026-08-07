@@ -27,41 +27,41 @@ func grantAsOwner(t *testing.T, h http.Handler, slug, owner, uid string) *http.R
 func TestGrantGivesReaderAndRevokeRemovesIt(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docG")
+	key := publishAsBot(t, h, "docG")
 
 	// Before any grant, an unrelated user cannot read the private doc → 404.
-	rec := do(t, h, http.MethodGet, "/v1/docs/docG/versions",
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions",
 		map[string]string{octoUIDHeaderName: "friend-1"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("pre-grant read = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
 	// Owner grants friend-1 reader.
-	if resp := grantAsOwner(t, h, "docG", "owner-1", "friend-1"); resp.StatusCode != http.StatusOK {
+	if resp := grantAsOwner(t, h, key, "owner-1", "friend-1"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("grant = %d; want 200", resp.StatusCode)
 	}
 
 	// Now friend-1 can read (reader).
-	rec = do(t, h, http.MethodGet, "/v1/docs/docG/versions",
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions",
 		map[string]string{octoUIDHeaderName: "friend-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("post-grant read = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 
 	// But reader is not author: friend-1 cannot delete → 404 (hides the op).
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docG",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key,
 		map[string]string{octoUIDHeaderName: "friend-1"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("reader delete = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
 	// Revoke → friend-1 back to 404.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docG/grants/friend-1",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key+"/grants/friend-1",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("revoke = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, http.MethodGet, "/v1/docs/docG/versions",
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions",
 		map[string]string{octoUIDHeaderName: "friend-1"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("post-revoke read = %d; want 404: %s", rec.Code, rec.Body.String())
@@ -71,10 +71,10 @@ func TestGrantGivesReaderAndRevokeRemovesIt(t *testing.T) {
 func TestListGrantsShowsCreatorAndMembers(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docL")
-	grantAsOwner(t, h, "docL", "owner-1", "friend-1")
+	key := publishAsBot(t, h, "docL")
+	grantAsOwner(t, h, key, "owner-1", "friend-1")
 
-	rec := do(t, h, http.MethodGet, "/v1/docs/docL/grants",
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/grants",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list grants = %d: %s", rec.Code, rec.Body.String())
@@ -108,9 +108,9 @@ func TestListGrantsShowsCreatorAndMembers(t *testing.T) {
 func TestCreatorCannotBeRemovedAsGrant(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docC")
+	key := publishAsBot(t, h, "docC")
 
-	rec := do(t, h, http.MethodDelete, "/v1/docs/docC/grants/owner-1",
+	rec := do(t, h, http.MethodDelete, "/v1/docs/"+key+"/grants/owner-1",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("remove creator = %d; want 409: %s", rec.Code, rec.Body.String())
@@ -120,15 +120,15 @@ func TestCreatorCannotBeRemovedAsGrant(t *testing.T) {
 func TestNonAuthorCannotManageGrants(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
-	publishAsBot(t, h, "docN")
+	key := publishAsBot(t, h, "docN")
 
 	// A non-author uid hitting the author-only grants routes must see 404.
 	for _, tc := range []struct {
 		method, path string
 	}{
-		{http.MethodGet, "/v1/docs/docN/grants"},
-		{http.MethodPut, "/v1/docs/docN/grants"},
-		{http.MethodDelete, "/v1/docs/docN/grants/x"},
+		{http.MethodGet, "/v1/docs/" + key + "/grants"},
+		{http.MethodPut, "/v1/docs/" + key + "/grants"},
+		{http.MethodDelete, "/v1/docs/" + key + "/grants/x"},
 	} {
 		rec := do(t, h, tc.method, tc.path,
 			map[string]string{octoUIDHeaderName: "stranger", "Content-Type": "application/json"},
@@ -150,13 +150,13 @@ func TestRemoveAdminGrantReturns409(t *testing.T) {
 	// admin-protection sentinel fires. Publish stamps owner-1 as creator, so
 	// we protect a separate admin uid ("admin-uid").
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docP2A": "dP2A"},
+		slugToDoc: map[string]string{service.DeriveDocKey("owner-1", "docP2A"): "dP2A"},
 		roles:     map[string]int{"dP2A|admin-uid": service.DocMemberRoleAdmin},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docP2A")
+	key := publishAsBot(t, h, "docP2A")
 
-	rec := do(t, h, http.MethodDelete, "/v1/docs/docP2A/grants/admin-uid",
+	rec := do(t, h, http.MethodDelete, "/v1/docs/"+key+"/grants/admin-uid",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("revoke admin = %d; want 409 (P2-A apperr.Conflict): %s", rec.Code, rec.Body.String())
@@ -168,13 +168,13 @@ func TestRemoveAdminGrantReturns409(t *testing.T) {
 func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docP2AA": "dP2AA"},
+		slugToDoc: map[string]string{service.DeriveDocKey("owner-1", "docP2AA"): "dP2AA"},
 		roles:     map[string]int{"dP2AA|admin-uid": service.DocMemberRoleAdmin},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docP2AA")
+	key := publishAsBot(t, h, "docP2AA")
 
-	rec := do(t, h, http.MethodPut, "/v1/docs/docP2AA/grants",
+	rec := do(t, h, http.MethodPut, "/v1/docs/"+key+"/grants",
 		map[string]string{octoUIDHeaderName: "owner-1", "Content-Type": "application/json"},
 		`{"uid":"admin-uid","role":"reader"}`)
 	if rec.Code != http.StatusConflict {
@@ -191,7 +191,7 @@ func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
 func TestListGrantsWiredNoCreatorDup(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docLD": "dLD"},
+		slugToDoc: map[string]string{service.DeriveDocKey("owner-1", "docLD"): "dLD"},
 		listMembers: map[string][]service.DocMember{
 			"dLD": {
 				{UID: "owner-1", Role: service.DocMemberRoleAdmin, GrantedBy: "system"},
@@ -200,9 +200,9 @@ func TestListGrantsWiredNoCreatorDup(t *testing.T) {
 		},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docLD")
+	key := publishAsBot(t, h, "docLD")
 
-	rec := do(t, h, http.MethodGet, "/v1/docs/docLD/grants",
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/grants",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list grants = %d: %s", rec.Code, rec.Body.String())
@@ -253,11 +253,11 @@ func TestListGrantsWiredNoCreatorDup(t *testing.T) {
 func TestListGrantsLegacyMetaSkipsCreator(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h, store := newTestServerWithStore(t, ownerAuthCfg())
-	publishAsBot(t, h, "docLegacy") // creator_uid = owner-1 (unwired path)
+	key := publishAsBot(t, h, "docLegacy") // creator_uid = owner-1 (unwired path)
 
 	// Plant a stray meta.grants[owner-1]=reader (M2 leftover / bad data / test).
 	ctx := context.Background()
-	meta, err := store.GetMeta(ctx, "docLegacy")
+	meta, err := store.GetMeta(ctx, key)
 	if err != nil || meta == nil {
 		t.Fatalf("seed lookup: meta=%v err=%v", meta, err)
 	}
@@ -272,11 +272,11 @@ func TestListGrantsLegacyMetaSkipsCreator(t *testing.T) {
 	grants["owner-1"] = map[string]any{"role": "reader"}
 	grants["friend-1"] = map[string]any{"role": "reader"}
 	extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants seed for P3 test
-	if err := store.PutMeta(ctx, "docLegacy", storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); err != nil {
+	if err := store.PutMeta(ctx, key, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}
 
-	rec := do(t, h, http.MethodGet, "/v1/docs/docLegacy/grants",
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/grants",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())

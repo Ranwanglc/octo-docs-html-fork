@@ -54,12 +54,12 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{} // no slugToDoc, no roles -> DocIDBySlug ok=false
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docW") // creator_uid = owner-1 (bot -> ownerUID stamp)
+	key := publishAsBot(t, h, "docW") // creator_uid = owner-1 (bot -> ownerUID stamp)
 
 	// Bot bearer session: selfUID=bot-1, ownerUID=owner-1. A3① misses (bot uid
 	// != creator=owner-1); A3② wired branch returns docRegistered=false and
 	// falls back to creator_uid==ownerUID via meta -> author.
-	rec := do(t, h, http.MethodPost, "/v1/docs/docW/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bot bearer share on unregistered doc = %d; want 200 (P1-A meta fallback): %s", rec.Code, rec.Body.String())
@@ -75,14 +75,14 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 // on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
 func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
-	mirror := &stubMirror{slugToDoc: map[string]string{"docReg": "dReg"}} // registered, no owner row
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey("owner-2", "docReg"): "dReg"}} // registered, no owner row
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docReg") // creator_uid = owner-2
+	key := publishAsBot(t, h, "docReg") // creator_uid = owner-2
 
 	// A3① misses (bot uid != owner-2); A3② wired returns docRegistered=true,
 	// ok=false; without the old gate, fallback proceeds and
 	// creator_uid==ownerUID lands owner-2 as CapAuthor.
-	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 200 (P1-a fallback restored): %s", rec.Code, rec.Body.String())
@@ -96,16 +96,16 @@ func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-3", botName: "Bot Three", botSpaceID: "s3", botOwnerUID: "owner-3"})
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docReg3": "dReg3"},
+		slugToDoc: map[string]string{service.DeriveDocKey("owner-3", "docReg3"): "dReg3"},
 		roles: map[string]int{
 			"dReg3|reader-x":   service.DocMemberRoleReader,
 			"dReg3|stranger-y": service.DocMemberRoleReader,
 		},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docReg3") // creator_uid = owner-3
+	key := publishAsBot(t, h, "docReg3") // creator_uid = owner-3
 
-	rec := do(t, h, http.MethodPost, "/v1/docs/docReg3/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 200 (creator_uid fallback wins): %s", rec.Code, rec.Body.String())
@@ -118,13 +118,13 @@ func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 func TestA3OwnerAdminInDocMemberStillWinsAfterFallback(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docWM": "dWM"},
+		slugToDoc: map[string]string{service.DeriveDocKey("owner-1", "docWM"): "dWM"},
 		roles:     map[string]int{"dWM|owner-1": service.DocMemberRoleAdmin},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docWM")
+	key := publishAsBot(t, h, "docWM")
 
-	rec := do(t, h, http.MethodPost, "/v1/docs/docWM/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bot bearer share via doc_member admin = %d; want 200: %s", rec.Code, rec.Body.String())
@@ -144,11 +144,12 @@ func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// Legacy grant seeded before doc_member registration lands.
-	seedLegacyReaderGrant(t, store, "docR", "reader-9")
+	seedLegacyReaderGrant(t, store, key, "reader-9")
 
-	rec = do(t, h, http.MethodGet, "/d/docR/v/1",
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "reader-9"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unregistered-doc reader read = %d; want 200 via legacy fallback: %s", rec.Code, rec.Body.String())
@@ -161,7 +162,7 @@ func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
 // /grants/{uid}). Fallback must be blocked so the read is 404 — otherwise
 // the revoke is silently a no-op.
 func TestA4RegisteredDocDeletedRowNoFallback(t *testing.T) {
-	mirror := &stubMirror{slugToDoc: map[string]string{"docR": "dR"}} // registered, no reader row
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey("owner-42", "docR"): "dR"}} // registered, no reader row
 	h, store := newServerWithMirrorAndBotAuth(t, mirror)
 
 	rec := do(t, h, http.MethodPost, "/v1/docs",
@@ -170,13 +171,14 @@ func TestA4RegisteredDocDeletedRowNoFallback(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// Stale legacy grant left behind after M2 migration / a prior revoke.
-	seedLegacyReaderGrant(t, store, "docR", "reader-9")
+	seedLegacyReaderGrant(t, store, key, "reader-9")
 
 	// reader-9 reads. A4 wired returns docRegistered=true, ok=false -> fallback
 	// blocked -> meta.grants[reader-9] IGNORED -> 404. Revoke bypass closed.
-	rec = do(t, h, http.MethodGet, "/d/docR/v/1",
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "reader-9"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("registered-no-row reader read = %d; want 404 (P1b revoke bypass close): %s", rec.Code, rec.Body.String())
@@ -218,7 +220,7 @@ func seedLegacyReaderGrant(t *testing.T, store *memory.Store, slug, uid string) 
 // With the P1a/P1b fix, docRegistered=true blocks the meta fallback and
 // the post-revoke read is 404. This is the "safety property" test.
 func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
-	mirror := &stubMirror{slugToDoc: map[string]string{"docM": "dM"}}
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey("owner-42", "docM"): "dM"}}
 	h, store := newServerWithMirrorAndBotAuth(t, mirror)
 
 	// Owner publishes; creator_uid = owner-42.
@@ -228,9 +230,10 @@ func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
 	// Owner grants reader-9 (writes doc_member).
-	rec = do(t, h, http.MethodPut, "/v1/docs/docM/grants",
+	rec = do(t, h, http.MethodPut, "/v1/docs/"+key+"/grants",
 		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
 		`{"uid":"reader-9","role":"reader"}`)
 	if rec.Code != http.StatusOK {
@@ -239,17 +242,17 @@ func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
 
 	// Simulate M2: the migration copied the same grant into meta.grants and
 	// never deleted the source. Plant that stale entry now.
-	seedLegacyReaderGrant(t, store, "docM", "reader-9")
+	seedLegacyReaderGrant(t, store, key, "reader-9")
 
 	// Pre-revoke sanity: reader-9 can read.
-	rec = do(t, h, http.MethodGet, "/d/docM/v/1",
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "reader-9"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pre-revoke read = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 
 	// Owner revokes. doc_member row is deleted; meta.grants[reader-9] lingers.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docM/grants/reader-9",
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key+"/grants/reader-9",
 		map[string]string{octoUIDHeaderName: "owner-42"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("revoke = %d; want 200: %s", rec.Code, rec.Body.String())
@@ -258,7 +261,7 @@ func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
 	// Post-revoke: A4 wired returns docRegistered=true, ok=false; fallback
 	// disabled; meta.grants[reader-9] IGNORED; render 404. Pre-fix this was
 	// still 200 and the revoke was a silent no-op.
-	rec = do(t, h, http.MethodGet, "/d/docM/v/1",
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "reader-9"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("post-revoke read = %d; want 404 (revoke bypass closed): %s", rec.Code, rec.Body.String())

@@ -50,28 +50,30 @@ func TestDocsPrivateByDefault(t *testing.T) {
 	auth := authorHdr()
 
 	// Publish a doc (author = creator uid stamped from the trust-header session).
+	// The doc is stored under the server-derived key, so address it by that key.
 	pub := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"doc","html":"<html><body><p>hi</p></body></html>"}`)
 	if pub.Code != http.StatusOK {
 		t.Fatalf("setup publish = %d: %s", pub.Code, pub.Body.String())
 	}
+	key := pubKey(t, pub)
 
 	// No credential → 404 on render, versions, and comments (existence hidden).
-	for _, target := range []string{"/d/doc/v/1", "/v1/docs/doc/versions", "/v1/comments?slug=doc"} {
+	for _, target := range []string{"/d/" + key + "/v/1", "/v1/docs/" + key + "/versions", "/v1/comments?slug=" + key} {
 		if rec := do(t, h, http.MethodGet, target, nil, ""); rec.Code != http.StatusNotFound {
 			t.Errorf("anonymous GET %s = %d; want 404 (private by default)", target, rec.Code)
 		}
 	}
 
 	// Author (creator uid) reads everything.
-	for _, target := range []string{"/d/doc/v/1", "/v1/docs/doc/versions", "/v1/comments?slug=doc"} {
+	for _, target := range []string{"/d/" + key + "/v/1", "/v1/docs/" + key + "/versions", "/v1/comments?slug=" + key} {
 		if rec := do(t, h, http.MethodGet, target, authorHdrNoCT(), ""); rec.Code == http.StatusNotFound {
 			t.Errorf("author GET %s = 404; creator uid should grant read", target)
 		}
 	}
 
 	// Mint a share code.
-	sh := do(t, h, http.MethodPost, "/v1/docs/doc/share", authorHdrNoCT(), "")
+	sh := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	if sh.Code != http.StatusOK {
 		t.Fatalf("share = %d: %s", sh.Code, sh.Body.String())
 	}
@@ -86,34 +88,34 @@ func TestDocsPrivateByDefault(t *testing.T) {
 	// READ-ONLY: it can neither create comments nor read the draft (plan §1 — the
 	// share code always has read capability only, never comment).
 	codeAuth := map[string]string{"Authorization": "Bearer " + code}
-	if rec := do(t, h, http.MethodGet, "/d/doc/v/1", codeAuth, ""); rec.Code != http.StatusOK {
+	if rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", codeAuth, ""); rec.Code != http.StatusOK {
 		t.Errorf("reader render with code = %d; want 200", rec.Code)
 	}
-	if rec := do(t, h, http.MethodGet, "/v1/comments?slug=doc", codeAuth, ""); rec.Code != http.StatusOK {
+	if rec := do(t, h, http.MethodGet, "/v1/comments?slug="+key, codeAuth, ""); rec.Code != http.StatusOK {
 		t.Errorf("reader list-comments with code = %d; want 200", rec.Code)
 	}
 	cm := do(t, h, http.MethodPost, "/v1/comments",
 		map[string]string{"Authorization": "Bearer " + code, "Content-Type": "application/json"},
-		`{"slug":"doc","version":1,"text":"nice"}`)
+		`{"slug":"`+key+`","version":1,"text":"nice"}`)
 	if cm.Code != http.StatusNotFound {
 		t.Errorf("reader comment with code = %d; want 404 (share code is read-only): %s", cm.Code, cm.Body.String())
 	}
 
 	// A wrong code is rejected (404) on read and comment.
 	bad := map[string]string{"Authorization": "Bearer deadbeefdeadbeef"}
-	if rec := do(t, h, http.MethodGet, "/d/doc/v/1", bad, ""); rec.Code != http.StatusNotFound {
+	if rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", bad, ""); rec.Code != http.StatusNotFound {
 		t.Errorf("wrong code render = %d; want 404", rec.Code)
 	}
 
 	// Rotating the code invalidates the old one.
-	sh2 := do(t, h, http.MethodPost, "/v1/docs/doc/share", authorHdrNoCT(), "")
+	sh2 := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var share2 map[string]any
 	_ = json.Unmarshal(sh2.Body.Bytes(), &share2)
 	newCode, _ := share2["data"].(map[string]any)["code"].(string)
 	if newCode == code || newCode == "" {
 		t.Fatalf("rotate did not mint a new code")
 	}
-	if rec := do(t, h, http.MethodGet, "/d/doc/v/1", codeAuth, ""); rec.Code != http.StatusNotFound {
+	if rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", codeAuth, ""); rec.Code != http.StatusNotFound {
 		t.Errorf("old code after rotate = %d; want 404", rec.Code)
 	}
 }
@@ -123,14 +125,15 @@ func TestDocsPrivateByDefault(t *testing.T) {
 func TestCodeCookieExchange(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"doc","html":"<html><body><p>hi</p></body></html>"}`)
-	sh := do(t, h, http.MethodPost, "/v1/docs/doc/share", authorHdrNoCT(), "")
+	key := pubKey(t, pb)
+	sh := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var share map[string]any
 	_ = json.Unmarshal(sh.Body.Bytes(), &share)
 	code, _ := share["data"].(map[string]any)["code"].(string)
 
-	rec := do(t, h, http.MethodGet, "/d/doc/v/1?code="+code, nil, "")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1?code="+code, nil, "")
 	if rec.Code != http.StatusFound {
 		t.Fatalf("?code= first hit = %d; want 302 redirect", rec.Code)
 	}
@@ -152,39 +155,40 @@ func TestCodeCookieExchange(t *testing.T) {
 func TestAuthorMutationsGatedByCreator(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"br","html":"<html><body><p>hi</p></body></html>"}`)
+	key := pubKey(t, pb)
 
 	// The creator (trust-header uid == stamped creator_uid) authorizes share.
-	rec := do(t, h, http.MethodPost, "/v1/docs/br/share", authorHdrNoCT(), "")
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("share as creator = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 
 	// A save-draft + promote as the creator must also work.
-	rec = do(t, h, http.MethodPut, "/v1/docs/br/draft", authorHdr(),
+	rec = do(t, h, http.MethodPut, "/v1/docs/"+key+"/draft", authorHdr(),
 		`{"html":"<html><body><h1>draft</h1></body></html>"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("draft save as creator = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, http.MethodPost, "/v1/docs/br/draft/promote", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("promote as creator = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 
 	// A reader code cookie must NOT authorize author mutations.
-	sh := do(t, h, http.MethodPost, "/v1/docs/br/share", authorHdrNoCT(), "")
+	sh := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var share map[string]any
 	_ = json.Unmarshal(sh.Body.Bytes(), &share)
 	readerCode, _ := share["data"].(map[string]any)["code"].(string)
-	readerCookie := capCookie("br", readerCode)
-	rec = do(t, h, http.MethodPost, "/v1/docs/br/draft/promote", map[string]string{"Cookie": readerCookie}, "")
+	readerCookie := capCookie(key, readerCode)
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote", map[string]string{"Cookie": readerCookie}, "")
 	if rec.Code == http.StatusOK {
 		t.Error("a reader code must not authorize promote")
 	}
 
 	// A different signed-in uid (not the creator) must NOT authorize mutations.
-	rec = do(t, h, http.MethodPost, "/v1/docs/br/draft/promote",
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/draft/promote",
 		map[string]string{octoUIDHeaderName: "someone-else"}, "")
 	if rec.Code == http.StatusOK {
 		t.Error("a non-creator session must not authorize promote")
@@ -199,11 +203,12 @@ func TestAuthorMutationsGatedByCreator(t *testing.T) {
 func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"rot","html":"<html><body><p>hi</p></body></html>"}`)
+	key := pubKey(t, pb)
 
 	mintCode := func() string {
-		sh := do(t, h, http.MethodPost, "/v1/docs/rot/share", authorHdrNoCT(), "")
+		sh := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 		var share map[string]any
 		_ = json.Unmarshal(sh.Body.Bytes(), &share)
 		code, _ := share["data"].(map[string]any)["code"].(string)
@@ -213,8 +218,8 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 	// (a) Rotate: an old code's cookie must not block a freshly rotated code link.
 	oldCode := mintCode()
 	newCode := mintCode() // rotation invalidates oldCode's hash
-	staleCookie := capCookie("rot", oldCode)
-	rec := do(t, h, http.MethodGet, "/d/rot/v/1?code="+newCode, map[string]string{"Cookie": staleCookie}, "")
+	staleCookie := capCookie(key, oldCode)
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1?code="+newCode, map[string]string{"Cookie": staleCookie}, "")
 	if rec.Code != http.StatusFound {
 		t.Fatalf("fresh code with stale cookie = %d; want 302 (code honored): %s", rec.Code, rec.Body.String())
 	}
@@ -227,9 +232,9 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 	// fresh ?code= link must still be honored (code wins over the now-stale
 	// cookie), re-issuing the cookie with the latest code. Write tokens are no
 	// longer a doc credential, so this precedence is exercised via share codes.
-	staleReaderCookie := capCookie("rot", newCode)
+	staleReaderCookie := capCookie(key, newCode)
 	newestCode := mintCode() // invalidates newCode's hash
-	rec = do(t, h, http.MethodGet, "/d/rot/v/1?code="+newestCode, map[string]string{"Cookie": staleReaderCookie}, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1?code="+newestCode, map[string]string{"Cookie": staleReaderCookie}, "")
 	if rec.Code != http.StatusFound {
 		t.Fatalf("fresh code with stale reader cookie = %d; want 302 (code honored): %s", rec.Code, rec.Body.String())
 	}
@@ -245,16 +250,17 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
+	pb := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"cap","html":"<html><body><p>hi</p></body></html>"}`)
-	sh := do(t, h, http.MethodPost, "/v1/docs/cap/share", authorHdrNoCT(), "")
+	key := pubKey(t, pb)
+	sh := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var share map[string]any
 	_ = json.Unmarshal(sh.Body.Bytes(), &share)
 	code, _ := share["data"].(map[string]any)["code"].(string)
 
 	// Author (creator uid via trust header) → manage tier: canManage/canEdit/
 	// canComment/canRead all true, role admin, isAuthor alias true.
-	rec := do(t, h, http.MethodGet, "/d/cap/v/1", authorHdrNoCT(), "")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("author render = %d", rec.Code)
 	}
@@ -266,7 +272,7 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	}
 
 	// Reader (share code cookie) → read-only: role reader, only canRead true.
-	rec = do(t, h, http.MethodGet, "/d/cap/v/1", map[string]string{"Cookie": capCookie("cap", code)}, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1", map[string]string{"Cookie": capCookie(key, code)}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reader render = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -285,8 +291,9 @@ func TestDraftRenderInjectsEditorCapabilityMarker(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("save draft = %d: %s", rec.Code, rec.Body.String())
 	}
+	key := pubKey(t, rec)
 
-	rec = do(t, h, http.MethodGet, "/d/draft-cap/draft", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/draft", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("draft render = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -340,13 +347,14 @@ func indexOf(s, sub string) int {
 // SAMEORIGIN when embedding is enabled (DENY would silently defeat the CSP),
 // and (c) 'none' still blocks framing (safe default for stand-alone deploys).
 func TestFrameAncestorsCSPHeader(t *testing.T) {
-	publish := func(h http.Handler) {
+	publish := func(h http.Handler) string {
 		auth := authorHdr()
 		pub := do(t, h, http.MethodPost, "/v1/docs", auth,
 			`{"slug":"embed","html":"<html><body><p>hi</p></body></html>"}`)
 		if pub.Code != http.StatusOK {
 			t.Fatalf("setup publish = %d: %s", pub.Code, pub.Body.String())
 		}
+		return pubKey(t, pub)
 	}
 
 	// (a) FRAME_ANCESTORS listing octo-web origins reaches the wire, and XFO
@@ -356,8 +364,8 @@ func TestFrameAncestorsCSPHeader(t *testing.T) {
 		FrameAncestors: "'self' http://localhost:3000 https://web.octo.example.com",
 	}
 	h := newTestServer(t, cfg)
-	publish(h)
-	rec := do(t, h, http.MethodGet, "/d/embed/v/1", authorHdrNoCT(), "")
+	key := publish(h)
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("render = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -376,8 +384,8 @@ func TestFrameAncestorsCSPHeader(t *testing.T) {
 		FrameAncestors: "'none'",
 	}
 	h = newTestServer(t, cfg)
-	publish(h)
-	rec = do(t, h, http.MethodGet, "/d/embed/v/1", authorHdrNoCT(), "")
+	key = publish(h)
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/v/1", authorHdrNoCT(), "")
 	if !contains(rec.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
 		t.Errorf("CSP should carry frame-ancestors 'none' by default; got %q", rec.Header().Get("Content-Security-Policy"))
 	}
@@ -401,10 +409,12 @@ func TestRateLimitIgnoresSpoofedXFF(t *testing.T) {
 	// Publish slug "d" so the creator has author cap; reactions are
 	// capability-gated, so without a real doc + credential they would 404 at the
 	// capability check before reaching the rate limiter.
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
-		`{"slug":"d","version":1,"html":"<html><body><p>x</p></body></html>"}`); rec.Code != http.StatusOK {
-		t.Fatalf("setup publish = %d: %s", rec.Code, rec.Body.String())
+	pb := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"d","version":1,"html":"<html><body><p>x</p></body></html>"}`)
+	if pb.Code != http.StatusOK {
+		t.Fatalf("setup publish = %d: %s", pb.Code, pb.Body.String())
 	}
+	key := pubKey(t, pb)
 
 	// Reactions are capability-gated now; use the creator's trust-header session
 	// (author) so the request reaches the rate limiter rather than 404ing at the
@@ -418,7 +428,7 @@ func TestRateLimitIgnoresSpoofedXFF(t *testing.T) {
 		for k, v := range base {
 			hdr[k] = v
 		}
-		rec := do(t, h, http.MethodPost, "/v1/reactions", hdr, `{"slug":"d","comment_id":"c","emoji":"x"}`)
+		rec := do(t, h, http.MethodPost, "/v1/reactions", hdr, `{"slug":"`+key+`","comment_id":"c","emoji":"x"}`)
 		if rec.Code == http.StatusTooManyRequests {
 			got429 = true
 			break

@@ -64,7 +64,11 @@ func TestFullLifecycle(t *testing.T) {
 
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	slug := "e2e-lifecycle"
+	// alias is the human name the client sends; the server derives the document's
+	// addressing key from it (per-creator namespace), so every later call must use
+	// the key returned by publish, not the alias.
+	alias := "e2e-lifecycle"
+	slug := alias
 	t.Cleanup(func() {
 		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/docs/"+slug, nil)
 		req.Header.Set("X-Octo-Uid", e2eUID)
@@ -73,10 +77,21 @@ func TestFullLifecycle(t *testing.T) {
 
 	// Publish. postJSON returns the unwrapped data object.
 	pub := postJSON(t, srv.URL+"/v1/docs", e2eUID,
-		`{"slug":"`+slug+`","html":"<html><body><h1>T</h1><svg viewBox=\"0 0 1 1\"></svg><p>anchor me here</p></body></html>","title":"E2E"}`)
+		`{"slug":"`+alias+`","html":"<html><body><h1>T</h1><svg viewBox=\"0 0 1 1\"></svg><p>anchor me here</p></body></html>","title":"E2E"}`)
 	if pub["version"].(float64) != 1 || pub["aids"].(float64) != 1 {
 		t.Fatalf("publish result = %v", pub)
 	}
+	key, ok := pub["slug"].(string)
+	if !ok || key == "" {
+		t.Fatalf("publish result carried no addressing slug: %v", pub)
+	}
+	if got, _ := pub["alias"].(string); got != alias {
+		t.Fatalf("publish alias = %q; want %q", got, alias)
+	}
+	if key == alias {
+		t.Fatalf("publish did not derive a document key: slug = %q", key)
+	}
+	slug = key
 
 	// Render — overlay + aids + persisted to S3.
 	body := getText(t, srv.URL+"/d/"+slug+"/v/1")

@@ -55,7 +55,7 @@ func newTestServerWithProxyIdentity(t *testing.T) http.Handler {
 // The creator uid (testUID) differs from the viewer uids the tests use, so
 // author access is only ever granted via superAdmin role or a share code, never
 // by accidentally matching the creator.
-func publish(t *testing.T, h http.Handler, slug string) {
+func publish(t *testing.T, h http.Handler, slug string) string {
 	t.Helper()
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		authorHdr(),
@@ -63,6 +63,7 @@ func publish(t *testing.T, h http.Handler, slug string) {
 	if rec.Code != 200 {
 		t.Fatalf("publish %s = %d: %s", slug, rec.Code, rec.Body.String())
 	}
+	return pubKey(t, rec)
 }
 
 // generateShareCode calls the author-only share endpoint (as the creator) and
@@ -113,9 +114,9 @@ func with(base map[string]string, extras ...map[string]string) map[string]string
 // without any share code or bearer, and the octo uid is the stamped author.
 func TestProxySuperAdminGrantsAuthor(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docA")
+	key := publish(t, h, "docA")
 
-	rec := do(t, h, http.MethodGet, "/d/docA/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxyHeaders("u-admin", "Admin", "superAdmin"), "")
 	if rec.Code != 200 {
 		t.Fatalf("superAdmin render = %d; want 200 (CapAuthor)", rec.Code)
@@ -124,7 +125,7 @@ func TestProxySuperAdminGrantsAuthor(t *testing.T) {
 	rec = do(t, h, http.MethodPost, "/v1/comments",
 		with(proxyHeaders("u-admin", "Admin", "superAdmin"),
 			map[string]string{"Content-Type": "application/json"}),
-		`{"slug":"docA","text":"admin note","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"admin note","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != 200 {
 		t.Fatalf("superAdmin comment = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -138,10 +139,10 @@ func TestProxySuperAdminGrantsAuthor(t *testing.T) {
 // / doc_binding to see the doc.
 func TestProxyAdminAndMemberDoNotGrantAuthor(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docB")
+	key := publish(t, h, "docB")
 
 	for _, role := range []string{"admin", "member"} {
-		rec := do(t, h, http.MethodGet, "/d/docB/v/1",
+		rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 			proxyHeaders("u-1", "User", role), "")
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("role=%q render = %d; want 404 (not superAdmin, no share code)", role, rec.Code)
@@ -154,11 +155,11 @@ func TestProxyAdminAndMemberDoNotGrantAuthor(t *testing.T) {
 // caller cannot create a comment: the mutation requires CapComment → hidden 404.
 func TestProxyIdentityPlusShareCodeGrantsReader(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docC")
-	code := generateShareCode(t, h, "docC")
+	key := publish(t, h, "docC")
+	code := generateShareCode(t, h, key)
 
 	// Read paths still work with the share code.
-	if rec := do(t, h, http.MethodGet, "/v1/comments?slug=docC",
+	if rec := do(t, h, http.MethodGet, "/v1/comments?slug="+key,
 		with(proxyHeaders("u-42", "User", "member"),
 			map[string]string{"Authorization": "Bearer " + code}), ""); rec.Code != 200 {
 		t.Fatalf("reader+identity list-comments = %d: %s", rec.Code, rec.Body.String())
@@ -168,7 +169,7 @@ func TestProxyIdentityPlusShareCodeGrantsReader(t *testing.T) {
 	rec := do(t, h, http.MethodPost, "/v1/comments",
 		with(proxyHeaders("u-42", "User", "member"),
 			map[string]string{"Authorization": "Bearer " + code, "Content-Type": "application/json"}),
-		`{"slug":"docC","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("reader+identity comment = %d; want 404 (share code is read-only): %s", rec.Code, rec.Body.String())
 	}
@@ -177,9 +178,9 @@ func TestProxyIdentityPlusShareCodeGrantsReader(t *testing.T) {
 // §C.4: no identity headers, no share code → 404 (hidden existence).
 func TestProxyNoIdentityNoCred404(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docD")
+	key := publish(t, h, "docD")
 
-	rec := do(t, h, http.MethodGet, "/d/docD/v/1", nil, "")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1", nil, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("anonymous render = %d; want 404", rec.Code)
 	}
@@ -190,9 +191,9 @@ func TestProxyNoIdentityNoCred404(t *testing.T) {
 // cannot grant CapAuthor.
 func TestProxyEmptyUIDNoIdentity(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docE")
+	key := publish(t, h, "docE")
 
-	rec := do(t, h, http.MethodGet, "/d/docE/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxyHeaders("", "Admin", "superAdmin"), "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("empty-uid render = %d; want 404 (no identity → no superAdmin grant)", rec.Code)
@@ -204,9 +205,9 @@ func TestProxyEmptyUIDNoIdentity(t *testing.T) {
 // raw share codes cookieise, session grants never do.
 func TestProxySuperAdminDoesNotSetCookie(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docF")
+	key := publish(t, h, "docF")
 
-	rec := do(t, h, http.MethodGet, "/d/docF/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxyHeaders("u-admin", "Admin", "superAdmin"), "")
 	if rec.Code != 200 {
 		t.Fatalf("superAdmin render = %d", rec.Code)
@@ -288,10 +289,10 @@ func TestProxyIdentityBeatsLegacyCookieSession(t *testing.T) {
 // never lands in a cookie.
 func TestProxySuperAdminStripsShareCodeFromURL(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
-	publish(t, h, "docG")
-	code := generateShareCode(t, h, "docG")
+	key := publish(t, h, "docG")
+	code := generateShareCode(t, h, key)
 
-	rec := do(t, h, http.MethodGet, "/d/docG/v/1?code="+code,
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1?code="+code,
 		proxyHeaders("u-admin", "Admin", "superAdmin"), "")
 	if rec.Code != http.StatusFound {
 		t.Fatalf("admin + ?code render = %d; want 302 (code must not linger in URL)", rec.Code)
@@ -300,7 +301,7 @@ func TestProxySuperAdminStripsShareCodeFromURL(t *testing.T) {
 		t.Fatalf("redirect Location still carries code: %q", loc)
 	}
 	setCookie := rec.Header().Get("Set-Cookie")
-	wantName := capCookieNameForTest("docG")
+	wantName := capCookieNameForTest(key)
 	if !strings.Contains(setCookie, wantName+"=") {
 		t.Fatalf("Set-Cookie missing share code under %s: %q", wantName, setCookie)
 	}
@@ -454,18 +455,18 @@ func TestBotAuthEnabledProviderDisabledWriteTokenNoLongerAuthorizes(t *testing.T
 		OctoServerBaseURL: "http://octo.example",
 		BotAuthEnabled:    true,
 	})
-	publish(t, h, "botFallbackWrite")
+	key := publish(t, h, "botFallbackWrite")
 
 	// Write tokens no longer grant author. With the bot provider disabled there is
 	// no session behind Bearer test-token, so the author-only delete is hidden
 	// (404) rather than authorized.
-	rec := do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", map[string]string{"Authorization": "Bearer test-token"}, "")
+	rec := do(t, h, http.MethodDelete, "/v1/docs/"+key, map[string]string{"Authorization": "Bearer test-token"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("delete with write token (retired) = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
 	// The creator (trust-header uid == stamped creator_uid) still authorizes it.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodDelete, "/v1/docs/"+key, authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("delete as creator = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -481,10 +482,10 @@ func TestBotAuthNilIdentityAllowsShareCodeReader(t *testing.T) {
 		OctoServerBaseURL: "http://octo.example",
 		BotAuthEnabled:    true,
 	})
-	publish(t, h, "botFallbackReader")
-	code := generateShareCode(t, h, "botFallbackReader")
+	key := publish(t, h, "botFallbackReader")
+	code := generateShareCode(t, h, key)
 
-	rec := do(t, h, http.MethodGet, "/v1/docs/botFallbackReader/versions", map[string]string{"Authorization": "Bearer " + code}, "")
+	rec := do(t, h, http.MethodGet, "/v1/docs/"+key+"/versions", map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("versions with share code and nil bot identity = %d: %s", rec.Code, rec.Body.String())
 	}

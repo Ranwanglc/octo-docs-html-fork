@@ -17,19 +17,19 @@ import (
 // them through.
 func TestA4ReaderRowLiftsCapReader(t *testing.T) {
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docE": "d5"},
+		slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docE"): "d5"},
 		roles:     map[string]int{"d5|reader-1": service.DocMemberRoleReader},
 	}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docE")
+	key := publish(t, h, "docE")
 	// reader-1 hits the HTML read gate — must succeed (200, HTML).
-	rec := do(t, h, http.MethodGet, "/d/docE/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "reader-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("A4 reader HTML read = %d; want 200", rec.Code)
 	}
 	// Author endpoint must still refuse reader-1 (A4 does not smuggle author).
-	rec = do(t, h, http.MethodPost, "/v1/docs/docE/share",
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{octoUIDHeaderName: "reader-1"}, "")
 	if rec.Code == http.StatusOK {
 		t.Fatalf("A4 reader unexpectedly got author on share op")
@@ -39,10 +39,10 @@ func TestA4ReaderRowLiftsCapReader(t *testing.T) {
 // A4 miss: doc_member has no row for the caller → CapReader path drops
 // through; stranger stays hidden (404 on HTML gate).
 func TestA4NoRowStrangerHidden(t *testing.T) {
-	mirror := &stubMirror{slugToDoc: map[string]string{"docF": "d6"}}
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docF"): "d6"}}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docF")
-	rec := do(t, h, http.MethodGet, "/d/docF/v/1",
+	key := publish(t, h, "docF")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "outsider"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("A4 stranger read = %d; want 404 (no cap)", rec.Code)
@@ -54,13 +54,13 @@ func TestA4NoRowStrangerHidden(t *testing.T) {
 // regression the plan calls out explicitly.
 func TestA4AdminRowStillAuthorsViaA3(t *testing.T) {
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docG": "d7"},
+		slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docG"): "d7"},
 		roles:     map[string]int{"d7|admin-1": service.DocMemberRoleAdmin},
 	}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docG")
+	key := publish(t, h, "docG")
 	// admin-1 tries an author-only op — must succeed via A3② (not A4).
-	rec := do(t, h, http.MethodPost, "/v1/docs/docG/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{octoUIDHeaderName: "admin-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("A3②/A4 order: admin share = %d; want 200 (A3② wins)", rec.Code)

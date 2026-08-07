@@ -38,15 +38,18 @@ func TestAssetLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	authJSON := authorHdr()
 
-	// Publish a doc so it exists (and to mint a share code from).
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
-		`{"slug":"pics","html":"<html><body><p>gallery</p></body></html>"}`); rec.Code != 200 {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	// Publish a doc so it exists (and to mint a share code from). Address it by
+	// the returned server-derived key.
+	pb := do(t, h, http.MethodPost, "/v1/docs", authJSON,
+		`{"slug":"pics","html":"<html><body><p>gallery</p></body></html>"}`)
+	if pb.Code != 200 {
+		t.Fatalf("publish = %d: %s", pb.Code, pb.Body.String())
 	}
+	key := pubKey(t, pb)
 
 	// Upload an asset (author, multipart).
 	body, ct := multipartFile(t, "cat.gif", gifBytes)
-	rec := do(t, h, http.MethodPost, "/v1/docs/pics/assets",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/assets",
 		map[string]string{octoUIDHeaderName: testUID, "Content-Type": ct}, body)
 	if rec.Code != 200 {
 		t.Fatalf("upload = %d: %s", rec.Code, rec.Body.String())
@@ -63,7 +66,7 @@ func TestAssetLifecycle(t *testing.T) {
 	}
 
 	// Mint a share code for reader-capability access.
-	rec = do(t, h, http.MethodPost, "/v1/docs/pics/share", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	if rec.Code != 200 {
 		t.Fatalf("share = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -76,7 +79,7 @@ func TestAssetLifecycle(t *testing.T) {
 	}
 
 	// List assets with the reader code (Bearer).
-	rec = do(t, h, http.MethodGet, "/v1/docs/pics/assets", map[string]string{"Authorization": "Bearer " + code}, "")
+	rec = do(t, h, http.MethodGet, "/v1/docs/"+key+"/assets", map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != 200 {
 		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -86,7 +89,7 @@ func TestAssetLifecycle(t *testing.T) {
 
 	// Serve the raw bytes with the reader code as Bearer (the agent/CLI transport;
 	// no cookie-exchange redirect on this path).
-	rec = do(t, h, http.MethodGet, "/d/pics/assets/"+sha, map[string]string{"Authorization": "Bearer " + code}, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha, map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != 200 {
 		t.Fatalf("serve = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -114,29 +117,29 @@ func TestAssetLifecycle(t *testing.T) {
 
 	// A browser's first hit carries ?code= and gets the 302 cookie-exchange (the
 	// code leaves the URL). This mirrors the version-render reader flow.
-	rec = do(t, h, http.MethodGet, "/d/pics/assets/"+sha+"?code="+code, nil, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha+"?code="+code, nil, "")
 	if rec.Code != 302 {
 		t.Fatalf("browser first-hit serve = %d; want 302 cookie exchange", rec.Code)
 	}
 
 	// A request with no credential must 404 (existence hidden), not serve bytes.
-	if rec := do(t, h, http.MethodGet, "/d/pics/assets/"+sha, nil, ""); rec.Code != 404 {
+	if rec := do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha, nil, ""); rec.Code != 404 {
 		t.Fatalf("uncredentialed serve = %d; want 404", rec.Code)
 	}
 
 	// A reader cannot delete (author-only) — hidden as 404.
-	if rec := do(t, h, http.MethodDelete, "/v1/docs/pics/assets/"+sha,
+	if rec := do(t, h, http.MethodDelete, "/v1/docs/"+key+"/assets/"+sha,
 		map[string]string{"Authorization": "Bearer " + code}, ""); rec.Code != 404 {
 		t.Fatalf("reader delete = %d; want 404", rec.Code)
 	}
 
 	// Author deletes it.
-	if rec := do(t, h, http.MethodDelete, "/v1/docs/pics/assets/"+sha,
+	if rec := do(t, h, http.MethodDelete, "/v1/docs/"+key+"/assets/"+sha,
 		authorHdrNoCT(), ""); rec.Code != 200 {
 		t.Fatalf("author delete = %d: %s", rec.Code, rec.Body.String())
 	}
 	// Now gone.
-	if rec := do(t, h, http.MethodGet, "/d/pics/assets/"+sha,
+	if rec := do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha,
 		map[string]string{"Authorization": "Bearer " + code}, ""); rec.Code != 404 {
 		t.Fatalf("serve after delete = %d; want 404", rec.Code)
 	}
@@ -144,13 +147,11 @@ func TestAssetLifecycle(t *testing.T) {
 
 func TestAssetUploadRejectsDisallowedType(t *testing.T) {
 	h := newTestServer(t, nil)
-	authJSON := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", authJSON,
-		`{"slug":"d","html":"<html><body><p>x</p></body></html>"}`)
+	key := mustPublish(t, h, "d", "<html><body><p>x</p></body></html>")
 
 	// A plain-text payload sniffs as text/plain, which is not in the allowlist.
 	body, ct := multipartFile(t, "notreally.png", []byte("this is just text, not an image"))
-	rec := do(t, h, http.MethodPost, "/v1/docs/d/assets",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/assets",
 		map[string]string{octoUIDHeaderName: testUID, "Content-Type": ct}, body)
 	if rec.Code != 400 {
 		t.Fatalf("upload text = %d; want 400: %s", rec.Code, rec.Body.String())
@@ -162,13 +163,11 @@ func TestAssetUploadRejectsDisallowedType(t *testing.T) {
 
 func TestAssetUploadRequiresAuthor(t *testing.T) {
 	h := newTestServer(t, nil)
-	authJSON := authorHdr()
-	_ = do(t, h, http.MethodPost, "/v1/docs", authJSON,
-		`{"slug":"d","html":"<html><body><p>x</p></body></html>"}`)
+	key := mustPublish(t, h, "d", "<html><body><p>x</p></body></html>")
 
 	// No credential → author-only upload route hides as 404.
 	body, ct := multipartFile(t, "cat.gif", gifBytes)
-	rec := do(t, h, http.MethodPost, "/v1/docs/d/assets", map[string]string{"Content-Type": ct}, body)
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/assets", map[string]string{"Content-Type": ct}, body)
 	if rec.Code != 404 {
 		t.Fatalf("uncredentialed upload = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
@@ -176,15 +175,16 @@ func TestAssetUploadRequiresAuthor(t *testing.T) {
 
 // uploadAssetForRange publishes a doc, uploads an asset, and returns the sha and a
 // reader share code — the setup shared by the Range tests.
-func uploadAssetForRange(t *testing.T, h http.Handler, slug string, data []byte) (sha, code string) {
+func uploadAssetForRange(t *testing.T, h http.Handler, slug string, data []byte) (sha, code, key string) {
 	t.Helper()
-	authJSON := authorHdr()
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
-		`{"slug":"`+slug+`","html":"<html><body><p>x</p></body></html>"}`); rec.Code != 200 {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	pb := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"`+slug+`","html":"<html><body><p>x</p></body></html>"}`)
+	if pb.Code != 200 {
+		t.Fatalf("publish = %d: %s", pb.Code, pb.Body.String())
 	}
+	key = pubKey(t, pb)
 	body, ct := multipartFile(t, "clip.gif", data)
-	rec := do(t, h, http.MethodPost, "/v1/docs/"+slug+"/assets",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/assets",
 		map[string]string{octoUIDHeaderName: testUID, "Content-Type": ct}, body)
 	if rec.Code != 200 {
 		t.Fatalf("upload = %d: %s", rec.Code, rec.Body.String())
@@ -193,14 +193,14 @@ func uploadAssetForRange(t *testing.T, h http.Handler, slug string, data []byte)
 	_ = json.Unmarshal(rec.Body.Bytes(), &up)
 	sha, _ = up["data"].(map[string]any)["sha256"].(string)
 
-	rec = do(t, h, http.MethodPost, "/v1/docs/"+slug+"/share", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var sh map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &sh)
 	code, _ = sh["data"].(map[string]any)["code"].(string)
 	if sha == "" || code == "" {
 		t.Fatalf("setup failed: sha=%q code=%q", sha, code)
 	}
-	return sha, code
+	return sha, code, key
 }
 
 func TestAssetServeRangeRequest(t *testing.T) {
@@ -208,10 +208,10 @@ func TestAssetServeRangeRequest(t *testing.T) {
 	// A payload long enough to slice; still sniffs as image/gif via the header.
 	data := append([]byte(nil), gifBytes...)
 	data = append(data, []byte("0123456789ABCDEF0123456789")...)
-	sha, code := uploadAssetForRange(t, h, "vid", data)
+	sha, code, key := uploadAssetForRange(t, h, "vid", data)
 
 	// Request bytes 5-9 (inclusive) → 5 bytes, 206 Partial Content.
-	rec := do(t, h, http.MethodGet, "/d/vid/assets/"+sha,
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha,
 		map[string]string{"Authorization": "Bearer " + code, "Range": "bytes=5-9"}, "")
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("range GET = %d; want 206", rec.Code)
@@ -235,10 +235,10 @@ func TestAssetServeAdvertisesAcceptRanges(t *testing.T) {
 	h := newTestServer(t, nil)
 	data := append([]byte(nil), gifBytes...)
 	data = append(data, []byte("more-bytes-here")...)
-	sha, code := uploadAssetForRange(t, h, "vid2", data)
+	sha, code, key := uploadAssetForRange(t, h, "vid2", data)
 
 	// A full GET advertises range support so players know they can seek.
-	rec := do(t, h, http.MethodGet, "/d/vid2/assets/"+sha,
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha,
 		map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != 200 {
 		t.Fatalf("full GET = %d; want 200", rec.Code)
@@ -254,10 +254,10 @@ func TestAssetServeAdvertisesAcceptRanges(t *testing.T) {
 func TestAssetServeUnsatisfiableRange(t *testing.T) {
 	h := newTestServer(t, nil)
 	data := append([]byte(nil), gifBytes...)
-	sha, code := uploadAssetForRange(t, h, "vid3", data)
+	sha, code, key := uploadAssetForRange(t, h, "vid3", data)
 
 	// A range past the end → 416 Range Not Satisfiable.
-	rec := do(t, h, http.MethodGet, "/d/vid3/assets/"+sha,
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha,
 		map[string]string{"Authorization": "Bearer " + code, "Range": "bytes=99999-"}, "")
 	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("out-of-range GET = %d; want 416", rec.Code)
@@ -282,14 +282,16 @@ func TestAssetPDFEmbedPath(t *testing.T) {
 	}
 	h := newTestServer(t, cfg)
 	authJSON := authorHdr()
-	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
-		`{"slug":"paper","html":"<html><body><p>doc</p></body></html>"}`); rec.Code != 200 {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	pb := do(t, h, http.MethodPost, "/v1/docs", authJSON,
+		`{"slug":"paper","html":"<html><body><p>doc</p></body></html>"}`)
+	if pb.Code != 200 {
+		t.Fatalf("publish = %d: %s", pb.Code, pb.Body.String())
 	}
+	key := pubKey(t, pb)
 
 	// Upload the PDF (author).
 	body, ct := multipartFile(t, "report.pdf", pdfBytes)
-	rec := do(t, h, http.MethodPost, "/v1/docs/paper/assets",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/assets",
 		map[string]string{octoUIDHeaderName: testUID, "Content-Type": ct}, body)
 	if rec.Code != 200 {
 		t.Fatalf("upload pdf = %d: %s", rec.Code, rec.Body.String())
@@ -303,12 +305,12 @@ func TestAssetPDFEmbedPath(t *testing.T) {
 	}
 
 	// Mint a reader code and fetch it back.
-	rec = do(t, h, http.MethodPost, "/v1/docs/paper/share", authorHdrNoCT(), "")
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	var sh map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &sh)
 	code, _ := sh["data"].(map[string]any)["code"].(string)
 
-	rec = do(t, h, http.MethodGet, "/d/paper/assets/"+sha, map[string]string{"Authorization": "Bearer " + code}, "")
+	rec = do(t, h, http.MethodGet, "/d/"+key+"/assets/"+sha, map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != 200 {
 		t.Fatalf("serve pdf = %d: %s", rec.Code, rec.Body.String())
 	}

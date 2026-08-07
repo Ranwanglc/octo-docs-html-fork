@@ -153,11 +153,14 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
 		PublisherToken: botTokenFromCtx(r.Context()),
-	}, func(exists bool) error {
+	}, func(key string, exists bool) error {
 		if !exists {
 			return nil
 		}
-		return s.requireDocEditSlug(r, slug)
+		// Gate the RESOLVED key, not the client identifier: for a derived-key doc the
+		// two differ, and authorizing the alias would check capabilities on a
+		// document that is not the write target.
+		return s.requireDocEditSlug(r, key)
 	})
 	if err != nil {
 		return err

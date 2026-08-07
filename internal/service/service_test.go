@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -90,7 +91,10 @@ func TestPublishAuthorizationRunsUnderSlugLockWithCurrentExistence(t *testing.T)
 
 			_, err := docs.PublishAuthorized(context.Background(), service.PublishInput{
 				Slug: "claimed", HTML: "<html>new</html>",
-			}, func(exists bool) error {
+			}, func(key string, exists bool) error {
+				if key != "claimed" {
+					t.Fatalf("authorization saw key %q; want the existing doc's key", key)
+				}
 				if !exists {
 					t.Fatal("authorization saw an empty slug")
 				}
@@ -265,6 +269,33 @@ func TestPublishRegistersGroupMountedDoc(t *testing.T) {
 	}
 	if _, ok := req.Body["spaceId"]; ok {
 		t.Fatalf("spaceId must not be sent, body = %#v", req.Body)
+	}
+}
+
+// Load-bearing item 5: when the publish carries a CreatorUID, the doc-key
+// derivation drives the docs-backend registration's octoDocSlug — it MUST be the
+// derived key (which backend echoes back and equality-checks), never the bare
+// alias. This is what keeps the html-side identity and the backend's octoDocSlug
+// in agreement under the new scheme.
+func TestPublishRegistrationOctoDocSlugIsDerivedKey(t *testing.T) {
+	ts, reqs := newDocsBackendStub(t, http.StatusOK)
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+
+	result, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "weekly-report", HTML: "<html><body><p>x</p></body></html>", Title: "Weekly",
+		MountType: "group", GroupNo: "g-1", CreatorUID: "bot-A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := service.DeriveDocKey("bot-A", "weekly-report")
+	if result.Slug != wantKey {
+		t.Fatalf("result slug = %q; want derived key %q", result.Slug, wantKey)
+	}
+	req := waitDocsBackendRequest(t, reqs)
+	if req.Body["octoDocSlug"] != wantKey {
+		t.Fatalf("registration octoDocSlug = %v; want derived key %q (backend echoes+checks this)", req.Body["octoDocSlug"], wantKey)
 	}
 }
 
@@ -796,6 +827,149 @@ func TestConcurrentPublishConsistent(t *testing.T) {
 	}
 }
 
+// TestConcurrentFirstPublishSameCreatorAlias covers the case the lock-scope
+// redesign exists for: N callers concurrently publishing the SAME alias as the
+// SAME creator. All of them derive one key, so all of them must serialize on that
+// key's lock — exactly one creates the document, the rest append versions. A
+// regression that locked the client identifier instead of the resolved key, or
+// that re-stamped key_scheme on the losers, shows up here as lost/duplicate
+// versions or a second document.
+func TestConcurrentFirstPublishSameCreatorAlias(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	const n = 30
+	const creator = "bot-A"
+	const alias = "weekly-report"
+	key := service.DeriveDocKey(creator, alias)
+
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			_, err := ds.Publish(ctx, service.PublishInput{
+				Slug: alias, HTML: "<html><body><p>x</p></body></html>", CreatorUID: creator,
+			})
+			errs <- err
+		}()
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+
+	// Every publish landed on the one derived key, with a dense 1..n version list.
+	vl, err := ds.ListVersions(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vl.Versions) != n {
+		t.Fatalf("got %d versions under %s, want %d (a publish was lost)", len(vl.Versions), key, n)
+	}
+	seen := map[int]bool{}
+	for _, v := range vl.Versions {
+		if seen[v.N] {
+			t.Fatalf("duplicate version %d", v.N)
+		}
+		seen[v.N] = true
+	}
+	for i := 1; i <= n; i++ {
+		if !seen[i] {
+			t.Fatalf("missing version %d", i)
+		}
+	}
+
+	// No second document was created under the alias itself.
+	if aliasMeta, merr := store.GetMeta(ctx, alias); merr != nil {
+		t.Fatal(merr)
+	} else if aliasMeta != nil {
+		t.Fatalf("concurrent publishes also created a doc under the raw alias %q", alias)
+	}
+
+	// key_scheme/alias were stamped exactly once, and the title never degraded to
+	// the hex key.
+	meta, err := store.GetMeta(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta == nil {
+		t.Fatalf("no meta under derived key %s", key)
+	}
+	if meta.KeyScheme() != "dockey" {
+		t.Fatalf("key_scheme = %q; want dockey", meta.KeyScheme())
+	}
+	if meta.Alias() != alias {
+		t.Fatalf("alias = %q; want %q", meta.Alias(), alias)
+	}
+	if meta.Title != alias {
+		t.Fatalf("title = %q; want the alias %q", meta.Title, alias)
+	}
+}
+
+// TestConcurrentPublishMixedAddressingSameDoc is the fail-before guard for the
+// lock scope. Half the callers address the document by its human alias, half by
+// its derived key — the SAME document either way. If the critical section locked
+// the client identifier instead of the resolved key, the two halves would take
+// two different locks, run unserialized, and lose or duplicate versions.
+func TestConcurrentPublishMixedAddressingSameDoc(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	const creator = "bot-A"
+	const alias = "mixed-addressing"
+	key := service.DeriveDocKey(creator, alias)
+
+	// Seed v1 so both addressing forms resolve to an existing document.
+	if _, err := ds.Publish(ctx, service.PublishInput{
+		Slug: alias, HTML: "<html><body><p>seed</p></body></html>", CreatorUID: creator,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 30 // 15 by alias + 15 by key
+	errs := make(chan error, n)
+	for i := range n {
+		identifier := alias
+		if i%2 == 0 {
+			identifier = key
+		}
+		go func(identifier string) {
+			_, err := ds.Publish(ctx, service.PublishInput{
+				Slug: identifier, HTML: "<html><body><p>x</p></body></html>", CreatorUID: creator,
+			})
+			errs <- err
+		}(identifier)
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+
+	vl, err := ds.ListVersions(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vl.Versions) != n+1 {
+		t.Fatalf("got %d versions under %s, want %d (mixed addressing was not serialized)", len(vl.Versions), key, n+1)
+	}
+	seen := map[int]bool{}
+	for _, v := range vl.Versions {
+		if seen[v.N] {
+			t.Fatalf("duplicate version %d", v.N)
+		}
+		seen[v.N] = true
+	}
+	for i := 1; i <= n+1; i++ {
+		if !seen[i] {
+			t.Fatalf("missing version %d", i)
+		}
+	}
+	if aliasMeta, merr := store.GetMeta(ctx, alias); merr != nil {
+		t.Fatal(merr)
+	} else if aliasMeta != nil {
+		t.Fatalf("alias-addressed publishes created a second doc under %q", alias)
+	}
+}
+
 // TestConcurrentPublishAndRemove exercises Publish and Remove of the same slug
 // racing through the shared per-slug lock; it must not panic or deadlock and must
 // leave a self-consistent final state (either fully removed, or a valid version
@@ -917,5 +1091,245 @@ func TestReplaceElementConcurrentNoLostUpdate(t *testing.T) {
 	}
 	if strings.Contains(rd.HTML, "alpha-base") || strings.Contains(rd.HTML, "beta-base") {
 		t.Errorf("final version still shows base content (an edit was lost): %s", rd.HTML)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Doc-key identity model (feat/doc-key-identity). These merge into the existing
+// service test file per the change spec. They exercise DeriveDocKey/IsDocKey and
+// the publish/draft identity resolution: new docs land under a per-creator
+// derived key, the client slug becomes a per-creator alias, and legacy bare-slug
+// docs keep their exact pre-change behaviour.
+
+// newDocWithStore is newDoc but also returns the backing memory store so a test
+// can inspect the meta that publish/draft wrote (creator_uid, alias, key_scheme).
+func newDocWithStore(t *testing.T) (*service.DocService, *memory.Store) {
+	t.Helper()
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	cs := service.NewCommentService(store, locker)
+	ds := service.NewDocService(store, store, cs, locker, "", 5<<20)
+	return ds, store
+}
+
+// TestDeriveDocKeyShapeAndDeterminism locks the key format: prefix k_, total
+// length 28, 26 trailing lowercase hex, IsDocKey true, and deterministic per
+// (creator, alias). It also proves the key passes the shared slug validator so
+// URLs/CLI need no change, and that different creators or aliases diverge.
+func TestDeriveDocKeyShapeAndDeterminism(t *testing.T) {
+	k := service.DeriveDocKey("bot-A", "weekly-report")
+	if len(k) != 28 || k[:2] != "k_" {
+		t.Fatalf("key = %q; want k_ + 26 hex (len 28)", k)
+	}
+	if !service.IsDocKey(k) {
+		t.Fatalf("IsDocKey(%q) = false; want true", k)
+	}
+	if got := config.SafeSlug(k); got != k {
+		t.Fatalf("derived key %q not slug-safe (SafeSlug=%q)", k, got)
+	}
+	// Deterministic: same inputs → same key (idempotency契约 depends on this).
+	if k2 := service.DeriveDocKey("bot-A", "weekly-report"); k2 != k {
+		t.Fatalf("non-deterministic key: %q vs %q", k, k2)
+	}
+	// Different creator OR different alias → different key.
+	if service.DeriveDocKey("bot-B", "weekly-report") == k {
+		t.Fatal("different creator produced same key (namespace collision)")
+	}
+	if service.DeriveDocKey("bot-A", "quarterly") == k {
+		t.Fatal("different alias produced same key")
+	}
+	// A legacy bare slug is not a doc key.
+	if service.IsDocKey("weekly-report") {
+		t.Fatal("bare slug misclassified as doc key")
+	}
+	// Guard the exact-length / non-hex cases IsDocKey must reject.
+	if service.IsDocKey("k_short") || service.IsDocKey("k_"+strings.Repeat("g", 26)) {
+		t.Fatal("IsDocKey accepted a malformed key")
+	}
+}
+
+// Acceptance 1 & 3-new: bot A first publish of "weekly-report" lands under a
+// derived key (not the bare slug), returns url /d/<key>/v/1, alias=weekly-report,
+// title defaults to the alias (never the hex key).
+func TestPublishNewDocLandsUnderDerivedKey(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	res, err := ds.Publish(ctx, service.PublishInput{
+		Slug: "weekly-report", HTML: "<html><body><p>w1</p></body></html>", CreatorUID: "bot-A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := service.DeriveDocKey("bot-A", "weekly-report")
+	if res.Slug != wantKey {
+		t.Fatalf("result slug = %q; want derived key %q", res.Slug, wantKey)
+	}
+	if res.Version != 1 || res.Alias != "weekly-report" {
+		t.Fatalf("result = %+v; want v1, alias=weekly-report", res)
+	}
+	// The doc lives under the key, not the bare alias.
+	if meta, _ := store.GetMeta(ctx, "weekly-report"); meta != nil {
+		t.Fatalf("bare slug should hold no meta; got %+v", meta)
+	}
+	meta, err := store.GetMeta(ctx, wantKey)
+	if err != nil || meta == nil {
+		t.Fatalf("meta under key missing: %v", err)
+	}
+	if meta.Alias() != "weekly-report" || meta.KeyScheme() != "dockey" || meta.CreatorUID() != "bot-A" {
+		t.Fatalf("meta extras = alias=%q scheme=%q creator=%q; want weekly-report/dockey/bot-A",
+			meta.Alias(), meta.KeyScheme(), meta.CreatorUID())
+	}
+	// Title must default to the alias, never the hex key.
+	if meta.Title != "weekly-report" {
+		t.Fatalf("title = %q; want alias weekly-report (never the hex key)", meta.Title)
+	}
+}
+
+// Acceptance 2: bot A re-publishing the same alias appends v2 on the SAME key —
+// no second document is created (idempotency contract preserved).
+func TestPublishSameCreatorSameAliasAppendsSameKey(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	in := service.PublishInput{Slug: "weekly-report", HTML: "<html><body><p>v1</p></body></html>", CreatorUID: "bot-A"}
+	r1, err := ds.Publish(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.HTML = "<html><body><p>v2</p></body></html>"
+	r2, err := ds.Publish(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.Slug != r1.Slug {
+		t.Fatalf("second publish key = %q; want same as first %q (no new doc)", r2.Slug, r1.Slug)
+	}
+	if r2.Version != 2 {
+		t.Fatalf("second version = %d; want 2 (append)", r2.Version)
+	}
+	vers, _ := store.ListVersions(ctx, r1.Slug)
+	if len(vers) != 2 {
+		t.Fatalf("versions under key = %v; want exactly 2", vers)
+	}
+}
+
+// Acceptance 3: bot B publishing the SAME alias lands on a DIFFERENT key — each
+// creator gets its own document, so squatting and cross-owner collision are both
+// eliminated. Each starts at v1 and neither disturbs the other.
+func TestPublishDifferentCreatorSameAliasDistinctKeys(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	a, err := ds.Publish(ctx, service.PublishInput{Slug: "weekly-report", HTML: "<html><body><p>A</p></body></html>", CreatorUID: "bot-A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ds.Publish(ctx, service.PublishInput{Slug: "weekly-report", HTML: "<html><body><p>B</p></body></html>", CreatorUID: "bot-B"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Slug == b.Slug {
+		t.Fatalf("two creators collided on key %q (squatting not resolved)", a.Slug)
+	}
+	if a.Version != 1 || b.Version != 1 {
+		t.Fatalf("versions = A%d B%d; want both v1", a.Version, b.Version)
+	}
+	// Each doc holds exactly its own single version.
+	for who, k := range map[string]string{"A": a.Slug, "B": b.Slug} {
+		if v, _ := store.ListVersions(ctx, k); len(v) != 1 {
+			t.Fatalf("doc %s versions = %v; want exactly 1 (no cross-contamination)", who, v)
+		}
+	}
+}
+
+// Acceptance 4: a legacy doc (meta keyed by the bare slug, no key_scheme) keeps
+// EXACTLY today's append behaviour — even when the same creator republishes the
+// same name, resolution ① targets the existing bare-slug doc rather than deriving
+// a new key. No new document, no scheme stamped.
+func TestPublishLegacyBareSlugAppendsInPlace(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	// Seed a legacy doc directly: bare-slug key, a v1 blob + meta, NO key_scheme,
+	// creator_uid = bot-A (the shape a pre-change publish produced).
+	if _, err := store.PutDoc(ctx, "legacy-doc", 1, "<html><body><p>old</p></body></html>"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeta(ctx, "legacy-doc", memoryLegacyMeta("legacy-doc", "bot-A")); err != nil {
+		t.Fatal(err)
+	}
+	// Same creator republishes the same name → append onto the bare-slug doc.
+	res, err := ds.Publish(ctx, service.PublishInput{Slug: "legacy-doc", HTML: "<html><body><p>new</p></body></html>", CreatorUID: "bot-A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Slug != "legacy-doc" {
+		t.Fatalf("legacy republish key = %q; want the bare slug legacy-doc (no derivation)", res.Slug)
+	}
+	if res.Version != 2 {
+		t.Fatalf("legacy republish version = %d; want 2 (append in place)", res.Version)
+	}
+	// The derived key must NOT have been created.
+	if meta, _ := store.GetMeta(ctx, service.DeriveDocKey("bot-A", "legacy-doc")); meta != nil {
+		t.Fatalf("legacy republish leaked a derived-key doc: %+v", meta)
+	}
+	// key_scheme stays absent ⇒ still legacy.
+	meta, _ := store.GetMeta(ctx, "legacy-doc")
+	if meta.KeyScheme() != "" {
+		t.Fatalf("legacy doc gained a key_scheme %q; must stay absent", meta.KeyScheme())
+	}
+}
+
+// Acceptance 5: with no creator identity the resolver never derives — a publish
+// lands on the bare slug exactly as before (legacy path unchanged).
+func TestPublishNoCreatorDoesNotDerive(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	res, err := ds.Publish(ctx, service.PublishInput{Slug: "anon-doc", HTML: "<html><body><p>x</p></body></html>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Slug != "anon-doc" {
+		t.Fatalf("no-creator publish key = %q; want bare slug (no derivation)", res.Slug)
+	}
+	if meta, _ := store.GetMeta(ctx, "anon-doc"); meta == nil || meta.KeyScheme() != "" {
+		t.Fatalf("no-creator publish meta = %+v; want bare-slug legacy (no scheme)", meta)
+	}
+}
+
+// Acceptance 6: draft-first creation shares the SAME identity resolution as
+// publish, so the draft lands under the derived key and a later publish of the
+// same alias by the same creator promotes onto that same key.
+func TestDraftFirstAndPublishShareDerivedKey(t *testing.T) {
+	ds, store := newDocWithStore(t)
+	ctx := context.Background()
+	dr, err := ds.SaveDraft(ctx, "weekly-report", "<html><body><p>draft</p></body></html>", "Draft Title", "bot-A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := service.DeriveDocKey("bot-A", "weekly-report")
+	if dr.Slug != wantKey {
+		t.Fatalf("draft slug = %q; want derived key %q", dr.Slug, wantKey)
+	}
+	meta, _ := store.GetMeta(ctx, wantKey)
+	if meta == nil || meta.KeyScheme() != "dockey" || meta.Alias() != "weekly-report" {
+		t.Fatalf("draft meta = %+v; want dockey scheme + alias weekly-report", meta)
+	}
+	// A later publish of the same alias by the same creator resolves to the same
+	// key (append onto the draft-created doc, not a fresh document).
+	res, err := ds.Publish(ctx, service.PublishInput{Slug: "weekly-report", HTML: "<html><body><p>v1</p></body></html>", CreatorUID: "bot-A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Slug != wantKey {
+		t.Fatalf("publish-after-draft key = %q; want same derived key %q", res.Slug, wantKey)
+	}
+}
+
+// memoryLegacyMeta builds the DocMeta shape a pre-doc-key publish produced: bare
+// slug key, one version, a creator_uid, and NO key_scheme (⇒ legacy).
+func memoryLegacyMeta(slug, creatorUID string) storage.DocMeta {
+	return storage.DocMeta{
+		Slug:     slug,
+		Title:    slug,
+		Versions: []storage.VersionRef{{N: 1}},
+		Extra:    map[string]any{storage.CreatorUIDExtraKey: creatorUID},
 	}
 }

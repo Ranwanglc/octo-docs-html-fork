@@ -129,11 +129,19 @@ type PublishInput struct {
 	pinnedAID         string
 	pinnedTag         string
 	anchorMigrations  map[string]string
+
+	// alias is the human-readable client name recorded on the doc (the old slug).
+	// stampScheme marks a brand-new doc whose key is server-derived, so upsertMeta
+	// stamps key_scheme="dockey". Both are set by resolveDocIdentity inside the
+	// lock; Slug is rewritten to the resolved key before publishLocked runs.
+	alias       string
+	stampScheme bool
 }
 
 // PublishResult is the result of a successful publish.
 type PublishResult struct {
 	Slug           string `json:"slug"`
+	Alias          string `json:"alias,omitempty"`
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
 	DocID          string `json:"doc_id"`
@@ -180,9 +188,11 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 	return s.PublishAuthorized(ctx, in, nil)
 }
 
-// PublishAuthorized publishes after authorize checks the slug's current
-// existence while the per-slug lock is held.
-func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(exists bool) error) (*PublishResult, error) {
+// PublishAuthorized publishes after authorize vets the RESOLVED document key and
+// its current existence, while that key's lock is held. authorize receives the
+// resolved key (not the client identifier) so the gate always judges the document
+// that is actually about to be written.
+func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(key string, exists bool) error) (*PublishResult, error) {
 	if in.HTML == "" {
 		return nil, apperr.Validation("html (file) required", "html_required")
 	}
@@ -201,21 +211,42 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 
 	stamped := core.StampAids(in.HTML)
 
-	// Hold the per-slug lock across the whole critical section: version resolution,
-	// the immutable blob write, the version-list bump, and the comment merge must be
-	// atomic, or two concurrent publishes of the same slug can resolve to the same
-	// version and clobber each other (and drift meta vs blobs).
+	// Map the client identifier to the actual document key (a legacy bare slug, an
+	// existing derived key, or a freshly derived one). Resolution is deterministic
+	// for a given (creator, alias) pair, so the resolved key — not the client
+	// identifier — is the correct lock scope: two concurrent first publishes of the
+	// same alias by the same creator derive the SAME key and therefore serialize,
+	// and a caller addressing the doc by its key serializes against a caller
+	// addressing it by alias (they would take different locks if we kept locking
+	// the identifier).
+	ident, err := s.resolveDocIdentity(ctx, in.Slug, in.CreatorUID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hold the per-key lock across the whole critical section: existence re-check,
+	// authorization, version resolution, the immutable blob write, the version-list
+	// bump, and the comment merge must be atomic, or two concurrent publishes of the
+	// same doc can resolve to the same version and clobber each other (and drift
+	// meta vs blobs).
 	var result *PublishResult
-	err = s.lock.With(ctx, in.Slug, func() error {
+	err = s.lock.With(ctx, ident.key, func() error {
+		// Re-read existence of the resolved target INSIDE the lock (PR#30 TOCTOU
+		// protection): a check-then-delete-then-recreate between resolution and the
+		// write must not let an unauthorized caller take over the document, and a
+		// doc created since resolution must not be stamped as brand-new.
+		exists, xerr := s.slugExists(ctx, ident.key)
+		if xerr != nil {
+			return xerr
+		}
 		if authorize != nil {
-			exists, xerr := s.slugExists(ctx, in.Slug)
-			if xerr != nil {
-				return xerr
-			}
-			if aerr := authorize(exists); aerr != nil {
+			if aerr := authorize(ident.key, exists); aerr != nil {
 				return aerr
 			}
 		}
+		in.Slug = ident.key
+		in.alias = ident.alias
+		in.stampScheme = ident.scheme && !exists
 		r, perr := s.publishLocked(ctx, in, stamped)
 		result = r
 		return perr
@@ -286,6 +317,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 
 	return &PublishResult{
 		Slug:              in.Slug,
+		Alias:             metaResult.alias,
 		Version:           version,
 		Status:            publishStatusPublished,
 		Size:              size,
@@ -539,18 +571,34 @@ func (s *DocService) SaveDraft(ctx context.Context, slug, html, title, creatorUI
 		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 	}
 	stamped := core.StampAids(html)
+	// Resolve before locking, then lock the resolved key — same rationale as
+	// Publish: alias and key must contend for one lock, or a concurrent publish and
+	// draft-save of the same document would run unserialized.
+	ident, err := s.resolveDocIdentity(ctx, slug, creatorUID)
+	if err != nil {
+		return nil, err
+	}
+	key := ident.key
 	var result *DraftResult
-	err := s.lock.With(ctx, slug, func() error {
-		size, perr := s.blobs.PutDraft(ctx, slug, stamped.HTML)
+	err = s.lock.With(ctx, key, func() error {
+		// Draft-first creation shares the SAME identity resolution as publish, so a
+		// draft and a later publish of the same alias by the same creator land on one
+		// key (and thus one document). Re-check existence under the lock so a doc
+		// created since resolution is not re-stamped as brand-new (PR#30 TOCTOU).
+		exists, xerr := s.slugExists(ctx, key)
+		if xerr != nil {
+			return xerr
+		}
+		size, perr := s.blobs.PutDraft(ctx, key, stamped.HTML)
 		if perr != nil {
 			return apperr.Upstream("draft write failed", "draft_write_failed", perr)
 		}
-		if merr := s.setDraftMeta(ctx, slug, title, creatorUID); merr != nil {
+		if merr := s.setDraftMeta(ctx, key, title, creatorUID, ident.alias, ident.scheme && !exists); merr != nil {
 			return merr
 		}
 		result = &DraftResult{
-			Slug: slug,
-			URL:  fmt.Sprintf("%s/d/%s/draft", s.baseURL, slug),
+			Slug: key,
+			URL:  fmt.Sprintf("%s/d/%s/draft", s.baseURL, key),
 			Size: size,
 			AIDs: len(stamped.AIDs),
 		}
@@ -636,26 +684,38 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string) error {
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID, alias string, stampScheme bool) error {
 	prev, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
 		return err
 	}
+	displayName := slug
+	if alias != "" {
+		displayName = alias
+	}
 	if prev == nil {
-		prev = &storage.DocMeta{Slug: slug, Title: slug, Versions: []storage.VersionRef{}}
+		prev = &storage.DocMeta{Slug: slug, Title: displayName, Versions: []storage.VersionRef{}}
 	}
 	metaTitle := prev.Title
 	if title != "" {
 		metaTitle = title
 	}
 	if metaTitle == "" {
-		metaTitle = slug
+		metaTitle = displayName
 	}
 	extra := map[string]any{}
 	maps.Copy(extra, prev.Extra)
 	extra[storage.DraftExtraKey] = map[string]any{"updated_at": time.Now().UTC().Format(time.RFC3339)}
 	if creatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = creatorUID
+	}
+	// Stamp the derived-key alias/scheme on first create only (absent scheme on a
+	// legacy doc stays absent ⇒ still legacy).
+	if stampScheme && prev.KeyScheme() == "" {
+		if alias != "" {
+			extra[storage.AliasExtraKey] = alias
+		}
+		extra[storage.KeySchemeExtraKey] = "dockey"
 	}
 	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 		Slug:     slug,
@@ -696,6 +756,12 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 	meta, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
 		return PublishInput{}, err
+	}
+	// Carry the recorded alias so republish via promote/replace keeps the human
+	// title/alias rather than degrading to the doc key. This path never creates a
+	// new doc (slug is already the resolved key), so stampScheme stays false.
+	if meta != nil {
+		in.alias = meta.Alias()
 	}
 	if mountType, ok := meta.MountType(); ok {
 		normalized, normalizeErr := normalizeMountType(mountType)
@@ -980,6 +1046,7 @@ func (s *DocService) resolveVersion(ctx context.Context, slug string, explicit i
 
 type publishMetaResult struct {
 	title        string
+	alias        string
 	hadMeta      bool
 	titleChanged bool
 }
@@ -990,8 +1057,14 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 		return publishMetaResult{}, err
 	}
 	hadMeta := prev != nil
+	// displayName is the human name to fall back to for the title: the client
+	// alias for a derived-key doc (never the hex key), else the key/slug itself.
+	displayName := in.Slug
+	if in.alias != "" {
+		displayName = in.alias
+	}
 	if prev == nil {
-		prev = &storage.DocMeta{Slug: in.Slug, Title: in.Slug, Versions: []storage.VersionRef{}}
+		prev = &storage.DocMeta{Slug: in.Slug, Title: displayName, Versions: []storage.VersionRef{}}
 	}
 	versions := append([]storage.VersionRef{}, prev.Versions...)
 	found := false
@@ -1012,12 +1085,13 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 		title = in.Title
 	}
 	if title == "" {
-		title = in.Slug
+		title = displayName
 	}
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") {
+	stampScheme := in.stampScheme && !hadMeta && prev.KeyScheme() == ""
+	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") || stampScheme {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
@@ -1026,6 +1100,14 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
+	}
+	// Record the alias + key_scheme on first create of a derived-key doc only, so
+	// a legacy bare-slug doc keeps its absent scheme (⇒ legacy) untouched.
+	if stampScheme {
+		if in.alias != "" {
+			extra[storage.AliasExtraKey] = in.alias
+		}
+		extra[storage.KeySchemeExtraKey] = "dockey"
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,
@@ -1037,9 +1119,19 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	return publishMetaResult{
 		title:        title,
+		alias:        prevOrNewAlias(prev, in.alias),
 		hadMeta:      hadMeta,
 		titleChanged: hadMeta && strings.TrimSpace(prev.Title) != "" && prev.Title != title,
 	}, nil
+}
+
+// prevOrNewAlias returns the alias to surface in the result: the persisted alias
+// when the doc already carried one, else the resolved alias for this publish.
+func prevOrNewAlias(prev *storage.DocMeta, resolved string) string {
+	if a := prev.Alias(); a != "" {
+		return a
+	}
+	return resolved
 }
 
 func sortVersions(v []storage.VersionRef) {

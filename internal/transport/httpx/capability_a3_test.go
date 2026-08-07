@@ -104,10 +104,10 @@ func newServerWithMirror(t *testing.T, mirror *stubMirror) http.Handler {
 // A3① (real user visiting own doc): creator_uid == selfUID → CapAuthor.
 // Publish stamps testUID as creator; the same trust-header uid gets author.
 func TestA3SelfUIDMatchesCreatorRealUser(t *testing.T) {
-	mirror := &stubMirror{slugToDoc: map[string]string{"docA": "d1"}}
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docA"): "d1"}}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docA")
-	rec := do(t, h, http.MethodPost, "/v1/docs/docA/share", authorHdrNoCT(), "")
+	key := publish(t, h, "docA")
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("A3① real-user own doc share = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -118,14 +118,14 @@ func TestA3SelfUIDMatchesCreatorRealUser(t *testing.T) {
 // but doc_member has an admin (role=3) row for that user. Author must hold.
 func TestA3OwnerAdminInDocMember(t *testing.T) {
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docB": "d2"},
+		slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docB"): "d2"},
 		roles:     map[string]int{"d2|owner-1": service.DocMemberRoleAdmin},
 	}
 	h := newServerWithMirror(t, mirror)
 	// Seed the doc as testUID so creator_uid == testUID, NOT owner-1.
-	publish(t, h, "docB")
+	key := publish(t, h, "docB")
 	// owner-1 (trust-header, no bot session) tries an author-only op.
-	rec := do(t, h, http.MethodPost, "/v1/docs/docB/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("A3② owner-admin share = %d: %s", rec.Code, rec.Body.String())
@@ -138,13 +138,13 @@ func TestA3OwnerAdminInDocMember(t *testing.T) {
 // via A3①, not silently promoted through A3② with someone else’s row.
 func TestA3SelfUIDOrderBeforeDocMember(t *testing.T) {
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{"docC": "d3"},
+		slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docC"): "d3"},
 		// An unrelated admin exists; must not affect this caller’s decision.
 		roles: map[string]int{"d3|someone-else": service.DocMemberRoleAdmin},
 	}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docC") // creator_uid = testUID
-	rec := do(t, h, http.MethodPost, "/v1/docs/docC/share", authorHdrNoCT(), "")
+	key := publish(t, h, "docC") // creator_uid = testUID
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("A3 order guard share = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -155,10 +155,10 @@ func TestA3SelfUIDOrderBeforeDocMember(t *testing.T) {
 // still hidden when neither creator match nor doc_member admin nor doc_binding
 // fires.
 func TestA3AllTiersMissStrangerHidden(t *testing.T) {
-	mirror := &stubMirror{slugToDoc: map[string]string{"docD": "d4"}}
+	mirror := &stubMirror{slugToDoc: map[string]string{service.DeriveDocKey(testUID, "docD"): "d4"}}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, "docD")
-	rec := do(t, h, http.MethodGet, "/d/docD/v/1",
+	key := publish(t, h, "docD")
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{octoUIDHeaderName: "stranger"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("stranger render = %d; want 404 (no cap)", rec.Code)

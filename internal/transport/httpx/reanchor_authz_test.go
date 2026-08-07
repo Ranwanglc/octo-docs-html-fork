@@ -43,8 +43,9 @@ func reanchor(t *testing.T, h http.Handler, slug, id, uid string) int {
 // its author / CapManage.
 func TestReanchorAuthorOnlyWriterCannotMoveOthersAnchor(t *testing.T) {
 	slug := "reanchor-doc"
+	key := service.DeriveDocKey(testUID, slug)
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{slug: "d-ra"},
+		slugToDoc: map[string]string{key: "d-ra"},
 		roles: map[string]int{
 			// A commenter (the author) and an unrelated writer + admin.
 			"d-ra|author-1": service.DocMemberRoleCommenter,
@@ -53,29 +54,31 @@ func TestReanchorAuthorOnlyWriterCannotMoveOthersAnchor(t *testing.T) {
 		},
 	}
 	h := newServerWithMirror(t, mirror)
-	publish(t, h, slug) // creator_uid = testUID (not any of the actors below)
+	if k := publish(t, h, slug); k != key { // creator_uid = testUID (not any of the actors below)
+		t.Fatalf("derived key mismatch: got %s want %s", k, key)
+	}
 
-	id := createComment(t, h, slug, "author-1")
+	id := createComment(t, h, key, "author-1")
 
 	// An ordinary writer (CapEdit) must be refused: cannot move another
 	// author's anchor.
-	if code := reanchor(t, h, slug, id, "writer-2"); code != http.StatusForbidden {
+	if code := reanchor(t, h, key, id, "writer-2"); code != http.StatusForbidden {
 		t.Fatalf("writer re-anchoring another author's comment = %d; want 403", code)
 	}
 
 	// A total stranger (no row) is hidden/refused too.
-	if code := reanchor(t, h, slug, id, "stranger"); code == http.StatusOK {
+	if code := reanchor(t, h, key, id, "stranger"); code == http.StatusOK {
 		t.Fatalf("stranger re-anchor unexpectedly allowed (got 200)")
 	}
 
 	// The comment's own author may re-anchor their own comment.
-	if code := reanchor(t, h, slug, id, "author-1"); code != http.StatusOK {
+	if code := reanchor(t, h, key, id, "author-1"); code != http.StatusOK {
 		t.Fatalf("author re-anchoring own comment = %d; want 200", code)
 	}
 
 	// An admin (CapManage) may re-anchor any comment (moderation reserved to
 	// admin for the anchor-move op).
-	if code := reanchor(t, h, slug, id, "admin-3"); code != http.StatusOK {
+	if code := reanchor(t, h, key, id, "admin-3"); code != http.StatusOK {
 		t.Fatalf("admin re-anchor = %d; want 200", code)
 	}
 }
@@ -84,17 +87,18 @@ func TestReanchorAuthorOnlyWriterCannotMoveOthersAnchor(t *testing.T) {
 // short-circuit, unchanged by the tightened moderation tier.
 func TestReanchorSuperAdminAllowed(t *testing.T) {
 	slug := "reanchor-sa"
+	key := service.DeriveDocKey(testUID, slug)
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{slug: "d-sa"},
+		slugToDoc: map[string]string{key: "d-sa"},
 		roles:     map[string]int{"d-sa|author-1": service.DocMemberRoleCommenter},
 	}
 	h := newServerWithMirror(t, mirror)
 	publish(t, h, slug)
-	id := createComment(t, h, slug, "author-1")
+	id := createComment(t, h, key, "author-1")
 
 	rec := do(t, h, http.MethodPatch, "/v1/comments",
 		map[string]string{octoUIDHeaderName: "admin-uid", octoRoleHeaderName: "superAdmin", "Content-Type": "application/json"},
-		`{"slug":"`+slug+`","id":"`+id+`","anchor":{"kind":"text","text":"moved"},"version":1}`)
+		`{"slug":"`+key+`","id":"`+id+`","anchor":{"kind":"text","text":"moved"},"version":1}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("superAdmin re-anchor = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -104,8 +108,9 @@ func TestReanchorSuperAdminAllowed(t *testing.T) {
 // this documents that only the anchor-move op was tightened, not delete.
 func TestWriterMayModerateDeleteOthersComment(t *testing.T) {
 	slug := "moddel-doc"
+	key := service.DeriveDocKey(testUID, slug)
 	mirror := &stubMirror{
-		slugToDoc: map[string]string{slug: "d-md"},
+		slugToDoc: map[string]string{key: "d-md"},
 		roles: map[string]int{
 			"d-md|author-1": service.DocMemberRoleCommenter,
 			"d-md|writer-2": service.DocMemberRoleWriter,
@@ -113,9 +118,9 @@ func TestWriterMayModerateDeleteOthersComment(t *testing.T) {
 	}
 	h := newServerWithMirror(t, mirror)
 	publish(t, h, slug)
-	id := createComment(t, h, slug, "author-1")
+	id := createComment(t, h, key, "author-1")
 
-	rec := do(t, h, http.MethodDelete, "/v1/comments?slug="+slug+"&id="+id+"&version=1",
+	rec := do(t, h, http.MethodDelete, "/v1/comments?slug="+key+"&id="+id+"&version=1",
 		map[string]string{octoUIDHeaderName: "writer-2"}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("writer moderation delete = %d: %s (writers keep the delete escape)", rec.Code, rec.Body.String())

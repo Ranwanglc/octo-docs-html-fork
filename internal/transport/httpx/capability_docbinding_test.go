@@ -94,13 +94,14 @@ func proxiedSuperAdmin(uid, tok string) map[string]string {
 // FEAT-3 §hook: non-superAdmin identity + doc_binding creator match →
 // CapAuthor. Author-only op (rotate share) must succeed with no share code.
 func TestDocBindingCreatorGrantsAuthor(t *testing.T) {
+	keyG := service.DeriveDocKey(testUID, "docG")
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{
-		"tok-creator|docG": {Slug: "docG", MountType: "group", GroupNo: "g1", CreatorUID: "u-creator"},
+		"tok-creator|" + keyG: {Slug: keyG, MountType: "group", GroupNo: "g1", CreatorUID: "u-creator"},
 	}}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docG")
+	key := publish(t, h, "docG")
 
-	rec := do(t, h, http.MethodPost, "/v1/docs/docG/share",
+	rec := do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		proxiedMember("u-creator", "tok-creator"), "")
 	if rec.Code != 200 {
 		t.Fatalf("binding creator share rotate = %d: %s", rec.Code, rec.Body.String())
@@ -111,13 +112,14 @@ func TestDocBindingCreatorGrantsAuthor(t *testing.T) {
 // → CapRead. A read (render/list) succeeds without any share code, but a
 // binding reader is read-only — comment and author ops are hidden 404.
 func TestDocBindingMemberGrantsReader(t *testing.T) {
+	keyH := service.DeriveDocKey(testUID, "docH")
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{
-		"tok-member|docH": {Slug: "docH", MountType: "group", GroupNo: "g1", CreatorUID: "u-other"},
+		"tok-member|" + keyH: {Slug: keyH, MountType: "group", GroupNo: "g1", CreatorUID: "u-other"},
 	}}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docH")
+	key := publish(t, h, "docH")
 
-	rec := do(t, h, http.MethodGet, "/d/docH/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxiedMember("u-member", "tok-member"), "")
 	if rec.Code != 200 {
 		t.Fatalf("binding member render = %d; want 200 (CapRead)", rec.Code)
@@ -126,14 +128,14 @@ func TestDocBindingMemberGrantsReader(t *testing.T) {
 	// A binding-derived reader is read-only: creating a comment needs CapComment.
 	rec = do(t, h, http.MethodPost, "/v1/comments",
 		merge(proxiedMember("u-member", "tok-member"), map[string]string{"Content-Type": "application/json"}),
-		`{"slug":"docH","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
+		`{"slug":"`+key+`","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("binding member comment = %d; want 404 (read-only binding): %s", rec.Code, rec.Body.String())
 	}
 
 	// A binding-derived reader must NOT be able to hit author-only ops —
 	// otherwise the reader mapping would leak write authority.
-	rec = do(t, h, http.MethodPost, "/v1/docs/docH/share",
+	rec = do(t, h, http.MethodPost, "/v1/docs/"+key+"/share",
 		proxiedMember("u-member", "tok-member"), "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("reader-binding share rotate = %d; want 404 (must not upgrade to author)", rec.Code)
@@ -145,9 +147,9 @@ func TestDocBindingMemberGrantsReader(t *testing.T) {
 func TestDocBindingHiddenNotFoundFallsThrough(t *testing.T) {
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{}}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docI")
+	key := publish(t, h, "docI")
 
-	rec := do(t, h, http.MethodGet, "/d/docI/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxiedMember("u-outsider", "tok-outsider"), "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("hidden-binding render = %d; want 404 (no cap)", rec.Code)
@@ -160,15 +162,16 @@ func TestDocBindingHiddenNotFoundFallsThrough(t *testing.T) {
 // FEAT-3 §hook: octo-server error (5xx / timeout) must not fail the doc
 // request. The share-code fallback still works.
 func TestDocBindingErrorFallsThroughToShareCode(t *testing.T) {
+	keyJ := service.DeriveDocKey(testUID, "docJ")
 	bf := &stubBindingFetcher{
 		byKey:   map[string]*service.DocBindingInfo{},
-		errKeys: map[string]bool{"tok-flaky|docJ": true},
+		errKeys: map[string]bool{"tok-flaky|" + keyJ: true},
 	}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docJ")
-	code := generateShareCode(t, h, "docJ")
+	key := publish(t, h, "docJ")
+	code := generateShareCode(t, h, key)
 
-	rec := do(t, h, http.MethodGet, "/d/docJ/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		merge(proxiedMember("u-flaky", "tok-flaky"),
 			map[string]string{"Authorization": "Bearer " + code}), "")
 	if rec.Code != 200 {
@@ -182,9 +185,9 @@ func TestDocBindingErrorFallsThroughToShareCode(t *testing.T) {
 func TestDocBindingSkipsForSuperAdmin(t *testing.T) {
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{}}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docK")
+	key := publish(t, h, "docK")
 
-	rec := do(t, h, http.MethodGet, "/d/docK/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		proxiedSuperAdmin("u-admin", "tok-admin"), "")
 	if rec.Code != 200 {
 		t.Fatalf("admin render = %d", rec.Code)
@@ -200,11 +203,11 @@ func TestDocBindingSkipsForSuperAdmin(t *testing.T) {
 func TestDocBindingSkipsWithoutOctoToken(t *testing.T) {
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{}}
 	h := newTestServerWithBinding(t, bf)
-	publish(t, h, "docL")
-	code := generateShareCode(t, h, "docL")
+	key := publish(t, h, "docL")
+	code := generateShareCode(t, h, key)
 
 	// Share-code-only request: doc_binding must not be hit.
-	rec := do(t, h, http.MethodGet, "/d/docL/v/1",
+	rec := do(t, h, http.MethodGet, "/d/"+key+"/v/1",
 		map[string]string{"Authorization": "Bearer " + code}, "")
 	if rec.Code != 200 {
 		t.Fatalf("share-code render = %d", rec.Code)
