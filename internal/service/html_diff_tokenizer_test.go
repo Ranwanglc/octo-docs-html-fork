@@ -1,7 +1,6 @@
 package service
 
 import (
-	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -391,8 +390,8 @@ func TestDiffScannerRawOffsetsAreExact(t *testing.T) {
 
 func TestDiffTokenizerMalformedAndForeignSemantics(t *testing.T) {
 	for _, source := range []string{"<!--", "<div><!-- never closes", "<!--!>"} {
-		if err := scanDiffHTML(source, func(diffHTMLToken) error { return nil }); !errors.Is(err, errDiffLimit) {
-			t.Fatalf("scanDiffHTML(%q) err = %v, want errDiffLimit", source, err)
+		if err := scanDiffHTML(source, func(diffHTMLToken) error { return nil }); err != nil {
+			t.Fatalf("scanDiffHTML(%q) err = %v", source, err)
 		}
 	}
 

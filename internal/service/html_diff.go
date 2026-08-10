@@ -143,10 +143,6 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 		raw := source[offset : offset+len(rawBytes)]
 		token := diffHTMLToken{type_: type_, raw: raw, start: offset, end: offset + len(raw)}
 		offset = token.end
-		terminatedComment := strings.HasSuffix(raw, "-->") || len(raw) >= 8 && strings.HasSuffix(raw, "--!>") || raw == "<!-->" || raw == "<!--->"
-		if type_ == xhtml.CommentToken && strings.HasPrefix(raw, "<!--") && !terminatedComment {
-			return errDiffLimit
-		}
 		if type_ == xhtml.TextToken {
 			token.text = string(z.Text())
 		}
@@ -240,12 +236,6 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 		matchedAfter[afterIndex] = beforeIndex
 		beforeNode, afterNode := beforeNodes[beforeIndex], afterNodes[afterIndex]
 		if diffNodeSignature(beforeNode) == diffNodeSignature(afterNode) {
-			continue
-		}
-		// html/head/body carry no visual identity of their own, so their children
-		// report structural edits — except loose text directly inside them, which has
-		// no child to carry it.
-		if isDiffWrapper(beforeNode.tag) && beforeNode.compareText == afterNode.compareText {
 			continue
 		}
 		changes = append(changes, ElementChange{
@@ -1082,6 +1072,9 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		return changed, nil
 	}
 	if len(beforeChildren) > (maxDiffComparisons-budget.comparisons)/len(afterChildren) {
+		if isDiffWrapper(before[beforeParent].tag) && isDiffWrapper(after[afterParent].tag) {
+			return matchUniqueChildSignatures(before, after, beforeChildren, afterChildren, matches, used), nil
+		}
 		return false, errDiffLimit
 	}
 	width := len(afterChildren) + 1
@@ -1124,6 +1117,39 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		}
 	}
 	return changed, nil
+}
+
+// matchUniqueChildSignatures avoids quadratic LCS work created only by parser
+// wrappers while leaving ambiguous repetitions to the bounded matcher.
+func matchUniqueChildSignatures(before, after []htmlDiffNode, beforeChildren, afterChildren []int, matches map[int]int, used map[int]bool) bool {
+	type signatureEntry struct {
+		index int
+		count int
+	}
+	afterBySignature := make(map[string]signatureEntry, len(afterChildren))
+	for _, index := range afterChildren {
+		signature := diffNodeSignature(after[index])
+		entry := afterBySignature[signature]
+		entry.index = index
+		entry.count++
+		afterBySignature[signature] = entry
+	}
+	beforeCounts := make(map[string]int, len(beforeChildren))
+	for _, index := range beforeChildren {
+		beforeCounts[diffNodeSignature(before[index])]++
+	}
+	changed := false
+	for _, beforeIndex := range beforeChildren {
+		signature := diffNodeSignature(before[beforeIndex])
+		entry := afterBySignature[signature]
+		if beforeCounts[signature] != 1 || entry.count != 1 || used[entry.index] {
+			continue
+		}
+		matches[beforeIndex] = entry.index
+		used[entry.index] = true
+		changed = true
+	}
+	return changed
 }
 
 func diffSignaturesEqual(before, after htmlDiffNode, budget *diffMatchBudget) (bool, error) {

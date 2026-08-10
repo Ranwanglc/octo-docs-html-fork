@@ -439,7 +439,7 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 			}
 		}()
 	}
-	// The source-byte layer rejects comments that the tree builder accepts to EOF.
+	// Both views accept the tokenizer's EOF recovery for an open comment.
 	for _, source := range []string{"<!--", "<!--unterminated comment"} {
 		func() {
 			defer func() {
@@ -447,11 +447,11 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 					t.Fatalf("parse panicked on %q: %v", source, r)
 				}
 			}()
-			if _, ok := normalizedHTMLLines(source); ok {
-				t.Fatalf("normalizedHTMLLines(%q) returned ok=true for an unterminated comment", source)
+			if _, ok := normalizedHTMLLines(source); !ok {
+				t.Fatalf("normalizedHTMLLines(%q) returned ok=false", source)
 			}
-			if _, err := buildVersionDiff(1, 2, source, source+"x"); !errors.Is(err, errDiffLimit) {
-				t.Fatalf("buildVersionDiff(%q) err = %v, want errDiffLimit", source, err)
+			if _, err := buildVersionDiff(1, 2, source, source+"x"); err != nil {
+				t.Fatalf("buildVersionDiff(%q) err = %v", source, err)
 			}
 		}()
 	}
@@ -2605,26 +2605,23 @@ func TestDiffCommentQuoteDoesNotSwallowSourceEdit(t *testing.T) {
 	}
 }
 
-// An unterminated comment runs to EOF, so nothing after it is markup and no
-// structural result is complete. Returning a partial tree as success let a
-// consumer read summary=0 for a document whose source changed, so both layers
-// fail closed instead.
-func TestDiffUnterminatedCommentFailsClosed(t *testing.T) {
-	_, err := buildVersionDiff(1, 2,
+// EOF closes an open comment in both parser views, so source-only edits remain
+// code-only while one-sided recovery still returns a usable diff.
+func TestDiffUnterminatedCommentRecoversAtEOF(t *testing.T) {
+	result, err := buildVersionDiff(1, 2,
 		`<html><body><!-- TODO<p>old</p></body></html>`,
 		`<html><body><!-- TODO<p>new</p></body></html>`)
-	if !errors.Is(err, errDiffLimit) {
-		t.Fatalf("unterminated comment err = %v, want errDiffLimit", err)
+	if err != nil || len(result.Changes) != 0 || len(result.CodeHunks) == 0 {
+		t.Fatalf("EOF comment recovery = (%+v, %v)", result, err)
 	}
-	// One side malformed is enough.
-	_, err = buildVersionDiff(1, 2,
+	result, err = buildVersionDiff(1, 2,
 		`<html><body><p>old</p></body></html>`,
 		`<html><body><!-- TODO<p>new</p></body></html>`)
-	if !errors.Is(err, errDiffLimit) {
-		t.Fatalf("one-sided unterminated comment err = %v, want errDiffLimit", err)
+	if err != nil || len(result.Changes) == 0 {
+		t.Fatalf("one-sided EOF comment recovery = (%+v, %v)", result, err)
 	}
 	// A properly closed comment stays a normal, fully reported diff.
-	result, err := buildVersionDiff(1, 2,
+	result, err = buildVersionDiff(1, 2,
 		`<html><body><!-- TODO --><p>old</p></body></html>`,
 		`<html><body><!-- TODO --><p>new</p></body></html>`)
 	if err != nil {
@@ -2641,9 +2638,7 @@ func TestDiffUnterminatedCommentFailsClosed(t *testing.T) {
 	}
 }
 
-// The fail-closed unterminated-comment path must reach the caller as the same
-// 413 the service already uses for a diff it cannot safely complete.
-func TestDiffMapsUnterminatedCommentToPayloadTooLarge(t *testing.T) {
+func TestDiffServiceAcceptsUnterminatedComment(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()
 	docs := NewDocService(store, store, NewCommentService(store, sluglock.NewMemory()), sluglock.NewMemory(), "", 5<<20)
@@ -2659,9 +2654,8 @@ func TestDiffMapsUnterminatedCommentToPayloadTooLarge(t *testing.T) {
 	if err := store.PutMeta(ctx, "bad-comment", storage.DocMeta{Slug: "bad-comment", Versions: []storage.VersionRef{{N: 1}, {N: 2}}}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := docs.Diff(ctx, "bad-comment", 1, 2)
-	var appErr *apperr.Error
-	if !errors.As(err, &appErr) || appErr.Status != 413 || appErr.Code != "diff_too_complex" {
-		t.Fatalf("error = %#v; want 413 diff_too_complex", err)
+	result, err := docs.Diff(ctx, "bad-comment", 1, 2)
+	if err != nil || len(result.CodeHunks) == 0 {
+		t.Fatalf("service diff = (%+v, %v)", result, err)
 	}
 }

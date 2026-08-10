@@ -1,6 +1,7 @@
 package httpx_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -33,5 +34,26 @@ func TestVersionDiffHandlesMalformedHTMLEndToEnd(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("malformed diff = %d: %s (want 200; parser should treat tail as text)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVersionDiffAcceptsEOFRecoveredCommentEndToEnd(t *testing.T) {
+	h := newTestServer(t, nil)
+	for _, source := range []string{
+		`<html><body><p>old</p><!-- draft`,
+		`<html><body><p>new</p><!-- draft`,
+	} {
+		payload, err := json.Marshal(map[string]string{"slug": "open-comment", "html": source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(payload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/open-comment/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EOF-recovered comment diff = %d: %s", rec.Code, rec.Body.String())
 	}
 }

@@ -121,19 +121,17 @@ func TestDiffCommentTerminatorMatrix(t *testing.T) {
 	if probe.modified != 1 {
 		t.Fatalf("swallow case Summary.Modified = %d, want 1", probe.modified)
 	}
-	// The source-byte layer rejects comments that the tree builder accepts to EOF. "<!--!>" belongs
-	// here, not above: in the comment state a bare '>' is comment data, so only
-	// "-->" or "--!>" closes it.
+	// The tokenizer and tree builder both recover an open comment at EOF.
 	for _, marker := range []string{"<!-- TODO", "<!--!>", "<!-- x --"} {
 		unterminated := func(target string) string {
 			return `<html><body><div>` + marker + `<p>` + target + `</p></div></body></html>`
 		}
 		probe = probeDiff(t, unterminated("TARGET-OLD"), unterminated("TARGET-NEW"))
-		if probe.sourceLinesOK {
-			t.Fatalf("%q normalizedHTMLLines ok = true, want false", marker)
+		if !probe.sourceLinesOK {
+			t.Fatalf("%q normalizedHTMLLines ok = false, want true", marker)
 		}
-		if !errors.Is(probe.diffErr, errDiffLimit) {
-			t.Fatalf("%q buildVersionDiff err = %v, want errDiffLimit", marker, probe.diffErr)
+		if probe.diffErr != nil {
+			t.Fatalf("%q buildVersionDiff err = %v, want nil", marker, probe.diffErr)
 		}
 	}
 }
@@ -309,13 +307,12 @@ func TestDiffMarkupScannerInvariants(t *testing.T) {
 				t.Fatalf("structural layer rejected %q: %v", seed, structuralErr)
 			}
 			_, linesOK := normalizedHTMLLines(seed)
-			if !linesOK && !isUnterminatedDiffComment(seed) {
-				t.Fatalf("%q failed closed but is not an unterminated comment", seed)
+			if !linesOK {
+				t.Fatalf("source layer rejected bounded recovered markup %q", seed)
 			}
-			// Source-byte rejection fails the whole diff closed.
 			_, diffErr := buildVersionDiff(1, 2, seed, seed+"x")
-			if failedClosed := errors.Is(diffErr, errDiffLimit); failedClosed != !linesOK {
-				t.Fatalf("buildVersionDiff(%q) err = %v, sourceLinesOK = %v", seed, diffErr, linesOK)
+			if diffErr != nil {
+				t.Fatalf("buildVersionDiff(%q) err = %v", seed, diffErr)
 			}
 		}()
 	}
@@ -429,10 +426,13 @@ func TestDiffScannerCommentBoundariesMatchCoreRule(t *testing.T) {
 			}
 			return nil
 		})
-		if (err == nil) != wantTerminated {
-			t.Fatalf("%q: scanner err = %v, terminated = %v", source, err, wantTerminated)
+		if err != nil {
+			t.Fatalf("%q: scanner err = %v", source, err)
 		}
 		if !wantTerminated {
+			if gotEnd != len(source) || gotRaw != source[start:] {
+				t.Fatalf("%q: EOF recovery raw=%q end=%d", source, gotRaw, gotEnd)
+			}
 			return
 		}
 		wantEnd := referenceCommentEnd(source, start)
@@ -451,8 +451,8 @@ func TestDiffScannerCommentBoundariesMatchCoreRule(t *testing.T) {
 }
 
 // FuzzDiffMarkupScanner holds the invariants the two scanning layers must keep on
-// arbitrary input: no panic, both layers agree on fail-closed, and only a
-// genuinely unterminated comment triggers it.
+// arbitrary input: no panic, bounded parser recovery, and only documented
+// resource limits may fail closed.
 func FuzzDiffMarkupScanner(f *testing.F) {
 	seeds := []string{
 		"<!--",
