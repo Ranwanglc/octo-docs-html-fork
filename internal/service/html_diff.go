@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 	xhtml "golang.org/x/net/html"
@@ -37,7 +36,6 @@ const (
 	maxDiffOpeningBytes = 1024
 	maxDiffOutputBytes  = 512 << 10
 	diffContextLines    = 3
-	diffLineTimeout     = 50 * time.Millisecond
 )
 
 // VersionDiff is a bounded structural and source-level comparison of two HTML versions.
@@ -79,7 +77,6 @@ type CodeHunk struct {
 
 type htmlDiffNode struct {
 	tag         string
-	pathTag     string
 	aid         string
 	attrs       map[string]string
 	text        string
@@ -89,7 +86,8 @@ type htmlDiffNode struct {
 	compareText string
 	signature   string
 	path        string
-	outer       string
+	element     *xhtml.Node
+	literalText bool
 	parent      int
 	children    []int
 	childTags   []string
@@ -97,23 +95,15 @@ type htmlDiffNode struct {
 	order       int
 }
 
-type diffOpenNode struct {
-	index int
-	start int
-}
-
 type diffHTMLToken struct {
-	type_       xhtml.TokenType
-	raw         string
-	text        string
-	start, end  int
-	tag         string
-	pathTag     string
-	attrs       map[string]string
-	rawTextTag  string
-	namespace   string
-	parentDepth int
-	forceClose  bool
+	type_      xhtml.TokenType
+	raw        string
+	text       string
+	start, end int
+	tag        string
+	attrs      map[string]string
+	rawTextTag string
+	namespace  string
 }
 
 type diffNamespaceEntry struct {
@@ -121,8 +111,7 @@ type diffNamespaceEntry struct {
 	integration    bool
 }
 
-// scanDiffHTML is the sole HTML boundary/attribute/raw-text front-end used by
-// both diff views. Tokens are ephemeral and raw aliases the original source.
+// scanDiffHTML tokenizes original bytes for code hunks; it does not infer DOM structure.
 func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 	z := xhtml.NewTokenizer(strings.NewReader(source))
 	z.SetMaxBuf(maxDiffRawScanBytes)
@@ -164,7 +153,6 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken || type_ == xhtml.EndTagToken {
 			name, more := z.TagName()
 			token.tag = string(name)
-			token.pathTag = diffPathTag(token.tag)
 			token.attrs = map[string]string{}
 			for more {
 				key, value, next := z.TagAttr()
@@ -177,15 +165,7 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 		if type_ == xhtml.TextToken && len(stack) > 0 && stack[len(stack)-1].namespace == "" && isDiffRawTextTag(stack[len(stack)-1].tag) {
 			token.rawTextTag = stack[len(stack)-1].tag
 		}
-		if type_ == xhtml.EndTagToken && (token.tag == "p" || token.tag == "br") && diffTokenInForeignContent(stack, type_, token.tag) {
-			type_ = xhtml.StartTagToken
-			token.type_ = type_
-			token.forceClose = true
-		}
 		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken {
-			for len(stack) > 0 && stack[len(stack)-1].namespace == "" && impliedDiffEndTag(stack[len(stack)-1].tag, token.tag) {
-				stack = stack[:len(stack)-1]
-			}
 			foreign := diffTokenInForeignContent(stack, type_, token.tag)
 			if foreign && diffForeignBreakout(token.tag, token.attrs) {
 				for len(stack) > 0 {
@@ -210,10 +190,9 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 				}
 			}
 			token.namespace = namespace
-			token.parentDepth = len(stack)
 			entry := diffNamespaceEntry{tag: token.tag, namespace: namespace}
 			entry.integration = diffHTMLIntegrationPoint(entry, token.attrs)
-			selfClosing := token.forceClose || namespace != "" && type_ == xhtml.SelfClosingTagToken || namespace == "" && isDiffVoidTag(token.tag)
+			selfClosing := namespace != "" && type_ == xhtml.SelfClosingTagToken || namespace == "" && isDiffVoidTag(token.tag)
 			if foreign {
 				z.NextIsNotRawText()
 			}
@@ -243,11 +222,11 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 	if before == after {
 		return &VersionDiff{From: fromVersion, To: toVersion, Changes: []ElementChange{}, CodeHunks: []CodeHunk{}}, nil
 	}
-	beforeNodes, beforeLines, err := scanDiffDocument(before, true)
+	beforeNodes, beforeLines, err := scanDiffVersion(before)
 	if err != nil {
 		return nil, err
 	}
-	afterNodes, afterLines, err := scanDiffDocument(after, true)
+	afterNodes, afterLines, err := scanDiffVersion(after)
 	if err != nil {
 		return nil, err
 	}
@@ -331,126 +310,143 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 	return result, nil
 }
 
-func parseDiffHTML(source string) ([]htmlDiffNode, error) {
-	nodes, _, err := scanDiffDocument(source, false)
-	return nodes, err
-}
-
-func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSourceLine, error) {
-	nodes := make([]htmlDiffNode, 0, 128)
-	stack := make([]diffOpenNode, 0, 32)
-	rootCounts := map[string]int{}
-	childCounts := map[int]map[string]int{}
-	pathBytes := 0
-	var lineConsumer *diffLineConsumer
-	if withLines {
-		lineConsumer = newDiffLineConsumer(source)
-	}
-	err := scanDiffHTML(source, func(token diffHTMLToken) error {
-		if lineConsumer != nil && !lineConsumer.consume(token) {
-			return errDiffLimit
-		}
-		switch token.type_ {
-		case xhtml.TextToken:
-			text := token.text
-			if token.rawTextTag != "" && isDiffLiteralRawTextTag(token.rawTextTag) {
-				text = token.raw
-			}
-			appendDiffText(nodes, stack, text)
-		case xhtml.EndTagToken:
-			for pos := len(stack) - 1; pos >= 0; pos-- {
-				entry := stack[pos]
-				if nodes[entry.index].tag != token.tag {
-					continue
-				}
-				for popped := len(stack) - 1; popped > pos; popped-- {
-					open := stack[popped]
-					nodes[open.index].outer = source[open.start:token.start]
-				}
-				nodes[entry.index].outer = source[entry.start:token.end]
-				stack = stack[:pos]
-				break
-			}
-		case xhtml.StartTagToken, xhtml.SelfClosingTagToken:
-			tag := token.tag
-			pathTag := token.pathTag
-			if len(stack) > token.parentDepth {
-				for _, entry := range stack[token.parentDepth:] {
-					nodes[entry.index].outer = source[entry.start:token.start]
-				}
-				stack = stack[:token.parentDepth]
-			}
-			if len(tag) > maxDiffTagBytes {
-				return errDiffLimit
-			}
-			for len(stack) > 0 && impliedDiffEndTag(nodes[stack[len(stack)-1].index].tag, tag) {
-				entry := stack[len(stack)-1]
-				nodes[entry.index].outer = source[entry.start:token.start]
-				stack = stack[:len(stack)-1]
-			}
-			if len(nodes) >= maxDiffNodes || len(stack) >= maxDiffDepth {
-				return errDiffLimit
-			}
-			parent := -1
-			counts := rootCounts
-			if len(stack) > 0 {
-				parent = stack[len(stack)-1].index
-				counts = childCounts[parent]
-				if counts == nil {
-					counts = map[string]int{}
-					childCounts[parent] = counts
-				}
-			}
-			counts[pathTag]++
-			segment := "/" + pathTag + fmt.Sprintf("[%d]", counts[pathTag])
-			pathLen := len(segment)
-			if parent >= 0 {
-				pathLen += len(nodes[parent].path)
-			}
-			if pathLen > maxDiffPathBytes || pathBytes > maxDiffPathsBytes-pathLen {
-				return errDiffLimit
-			}
-			path := segment
-			if parent >= 0 {
-				path = nodes[parent].path + segment
-			}
-			pathBytes += pathLen
-			siblingPos := counts[tag] - 1
-			if parent >= 0 {
-				siblingPos = len(nodes[parent].children)
-			}
-			node := htmlDiffNode{tag: tag, pathTag: pathTag, aid: token.attrs["data-odoc-aid"], attrs: token.attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
-			nodes = append(nodes, node)
-			index := len(nodes) - 1
-			if parent >= 0 {
-				nodes[parent].textBounds = append(nodes[parent].textBounds, len(nodes[parent].textParts))
-				nodes[parent].children = append(nodes[parent].children, index)
-				nodes[parent].childTags = append(nodes[parent].childTags, tag)
-			}
-			selfClosing := token.forceClose || token.namespace == "" && isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
-			if selfClosing {
-				nodes[index].outer = source[token.start:token.end]
-			} else {
-				stack = append(stack, diffOpenNode{index: index, start: token.start})
-			}
-		}
-		return nil
-	})
+// scanDiffVersion keeps source-byte and parsed-DOM views independent.
+func scanDiffVersion(source string) ([]htmlDiffNode, []diffSourceLine, error) {
+	lines, err := scanDiffLines(source)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, entry := range stack {
-		nodes[entry.index].outer = source[entry.start:]
-	}
-	finalizeDiffNodes(nodes)
-	if lineConsumer == nil {
-		return nodes, nil, nil
-	}
-	lines, ok := lineConsumer.finish()
-	if !ok {
-		return nil, nil, errDiffLimit
+	nodes, err := parseDiffHTML(source)
+	if err != nil {
+		return nil, nil, err
 	}
 	return nodes, lines, nil
+}
+
+func scanDiffLines(source string) ([]diffSourceLine, error) {
+	consumer := newDiffLineConsumer(source)
+	if err := scanDiffHTML(source, func(token diffHTMLToken) error {
+		if !consumer.consume(token) {
+			return errDiffLimit
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	lines, ok := consumer.finish()
+	if !ok {
+		return nil, errDiffLimit
+	}
+	return lines, nil
+}
+
+// parseDiffHTML uses the tree builder as the sole authority for document structure.
+func parseDiffHTML(source string) ([]htmlDiffNode, error) {
+	root, err := xhtml.Parse(strings.NewReader(source))
+	if err != nil {
+		return nil, errDiffLimit
+	}
+	builder := diffTreeBuilder{nodes: make([]htmlDiffNode, 0, 128), rootCounts: map[string]int{}, childCounts: map[int]map[string]int{}}
+	if err := builder.appendChildren(root, -1, 0); err != nil {
+		return nil, err
+	}
+	finalizeDiffNodes(builder.nodes)
+	return builder.nodes, nil
+}
+
+// diffTreeBuilder flattens the parsed tree while enforcing path budgets.
+type diffTreeBuilder struct {
+	nodes       []htmlDiffNode
+	rootCounts  map[string]int
+	childCounts map[int]map[string]int
+	pathBytes   int
+}
+
+// appendChildren skips non-structural nodes without merging adjacent text nodes.
+func (builder *diffTreeBuilder) appendChildren(parentElement *xhtml.Node, parent, depth int) error {
+	for child := parentElement.FirstChild; child != nil; child = child.NextSibling {
+		switch child.Type {
+		case xhtml.TextNode:
+			if parent >= 0 {
+				appendDiffNodeText(&builder.nodes[parent], child.Data)
+			}
+		case xhtml.ElementNode:
+			index, err := builder.appendElement(child, parent, depth)
+			if err != nil {
+				return err
+			}
+			if err := builder.appendChildren(child, index, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (builder *diffTreeBuilder) appendElement(element *xhtml.Node, parent, depth int) (int, error) {
+	if len(builder.nodes) >= maxDiffNodes || depth >= maxDiffDepth {
+		return 0, errDiffLimit
+	}
+	tag := element.Data
+	if len(tag) > maxDiffTagBytes {
+		return 0, errDiffLimit
+	}
+	pathTag := diffPathTag(tag)
+	counts := builder.rootCounts
+	if parent >= 0 {
+		counts = builder.childCounts[parent]
+		if counts == nil {
+			counts = map[string]int{}
+			builder.childCounts[parent] = counts
+		}
+	}
+	counts[pathTag]++
+	segment := "/" + pathTag + fmt.Sprintf("[%d]", counts[pathTag])
+	pathLen := len(segment)
+	if parent >= 0 {
+		pathLen += len(builder.nodes[parent].path)
+	}
+	if pathLen > maxDiffPathBytes || builder.pathBytes > maxDiffPathsBytes-pathLen {
+		return 0, errDiffLimit
+	}
+	path := segment
+	if parent >= 0 {
+		path = builder.nodes[parent].path + segment
+	}
+	builder.pathBytes += pathLen
+	siblingPos := counts[pathTag] - 1
+	if parent >= 0 {
+		siblingPos = len(builder.nodes[parent].children)
+	}
+	attrs := diffElementAttrs(element)
+	node := htmlDiffNode{
+		tag: tag, aid: attrs["data-odoc-aid"], attrs: attrs, path: path,
+		element: element, literalText: element.Namespace == "" && isDiffLiteralRawTextTag(tag),
+		parent: parent, siblingPos: siblingPos, order: len(builder.nodes),
+	}
+	builder.nodes = append(builder.nodes, node)
+	index := len(builder.nodes) - 1
+	if parent >= 0 {
+		builder.nodes[parent].textBounds = append(builder.nodes[parent].textBounds, len(builder.nodes[parent].textParts))
+		builder.nodes[parent].children = append(builder.nodes[parent].children, index)
+		builder.nodes[parent].childTags = append(builder.nodes[parent].childTags, tag)
+	}
+	return index, nil
+}
+
+// diffElementAttrs keeps namespaces so xlink:href and href remain distinct.
+func diffElementAttrs(element *xhtml.Node) map[string]string {
+	attrs := make(map[string]string, len(element.Attr))
+	for _, attr := range element.Attr {
+		key := attr.Key
+		if attr.Namespace != "" {
+			key = attr.Namespace + ":" + attr.Key
+		}
+		if _, exists := attrs[key]; !exists {
+			attrs[key] = attr.Val
+		}
+	}
+	return attrs
 }
 
 func finalizeDiffNodes(nodes []htmlDiffNode) {
@@ -469,7 +465,7 @@ func finalizeDiffNodes(nodes []htmlDiffNode) {
 		preformattedNode[index] = mode
 	}
 	for index := range nodes {
-		literalRawText := isDiffLiteralRawTextTag(nodes[index].tag)
+		literalRawText := nodes[index].literalText
 		whiteSpace := preformattedNode[index]
 		preserveWhitespace := whiteSpace == whiteSpacePreserve
 		fullText := ""
@@ -520,14 +516,6 @@ func finalizeDiffNodes(nodes []htmlDiffNode) {
 		}
 		nodes[index].signature = computeDiffNodeSignature(nodes[index])
 	}
-}
-
-func appendDiffText(nodes []htmlDiffNode, stack []diffOpenNode, text string) {
-	if len(stack) == 0 {
-		return
-	}
-	index := stack[len(stack)-1].index
-	appendDiffNodeText(&nodes[index], text)
 }
 
 func appendDiffNodeText(node *htmlDiffNode, text string) {
@@ -784,45 +772,27 @@ func writeDiffFrame(builder interface{ Write([]byte) (int, error) }, value strin
 	_, _ = builder.Write([]byte(value))
 }
 
-func impliedDiffEndTag(open, next string) bool {
-	switch open {
-	case "p":
-		switch next {
-		case "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol", "p", "pre", "search", "section", "table", "ul":
-			return true
-		}
-	case "li":
-		return next == "li"
-	case "dt", "dd":
-		return next == "dt" || next == "dd"
-	case "option":
-		return next == "option" || next == "optgroup"
-	case "optgroup":
-		return next == "optgroup"
-	case "thead":
-		return next == "tbody" || next == "tfoot"
-	case "tbody":
-		return next == "tbody" || next == "tfoot"
-	case "tfoot":
-		return next == "tbody"
-	case "tr":
-		return next == "tr" || next == "thead" || next == "tbody" || next == "tfoot"
-	case "td", "th":
-		return next == "td" || next == "th" || next == "tr" || next == "thead" || next == "tbody" || next == "tfoot"
-	}
-	return false
-}
-
 func diffPathTag(tag string) string {
-	for index := range tag {
+	cut := len(tag)
+	folded := false
+	for index := 0; index < len(tag); index++ {
 		char := tag[index]
+		if char >= 'A' && char <= 'Z' {
+			char += 'a' - 'A'
+			folded = true
+		}
 		letter := char >= 'a' && char <= 'z'
 		validSuffix := index > 0 && (char == '-' || char == ':' || char >= '0' && char <= '9')
 		if !letter && !validSuffix {
-			return tag[:index]
+			cut = index
+			break
 		}
 	}
-	return tag
+	if !folded {
+		return tag[:cut]
+	}
+	// Tree-builder-adjusted foreign names must not change path casing.
+	return strings.ToLower(tag[:cut])
 }
 
 func diffTokenInForeignContent(stack []diffNamespaceEntry, type_ xhtml.TokenType, tag string) bool {
@@ -1348,19 +1318,60 @@ func normalizeCompareText(value string) string {
 	return strings.ToLower(collapseHTMLASCIIWhitespace(value))
 }
 
+// diffNodeSnippet renders a bounded normalized DOM subtree.
 func diffNodeSnippet(node htmlDiffNode) string {
-	if len(node.outer) <= maxDiffSnippetBytes {
-		return node.outer
+	if node.element == nil {
+		return ""
 	}
-	openingEnd := strings.IndexByte(node.outer, '>')
-	opening := "<" + node.tag + ">"
-	if openingEnd >= 0 && openingEnd < maxDiffOpeningBytes {
-		opening = node.outer[:openingEnd+1]
+	writer := boundedDiffWriter{limit: maxDiffSnippetBytes}
+	if err := xhtml.Render(&writer, node.element); err == nil {
+		return string(writer.buf)
 	}
+	opening := diffNodeOpeningTag(node)
 	if isDiffVoidTag(node.tag) {
 		return opening
 	}
-	return opening + "<!-- omitted " + strconv.Itoa(len(node.outer)) + " bytes -->" + "</" + node.tag + ">"
+	return opening + "<!-- omitted -->" + "</" + node.tag + ">"
+}
+
+// diffNodeOpeningTag delegates attribute escaping to the renderer.
+func diffNodeOpeningTag(node htmlDiffNode) string {
+	shallow := xhtml.Node{Type: xhtml.ElementNode, DataAtom: node.element.DataAtom, Data: node.element.Data, Namespace: node.element.Namespace, Attr: node.element.Attr}
+	writer := boundedDiffWriter{limit: maxDiffOpeningBytes}
+	if err := xhtml.Render(&writer, &shallow); err != nil {
+		return "<" + node.tag + ">"
+	}
+	return strings.TrimSuffix(string(writer.buf), "</"+node.element.Data+">")
+}
+
+// boundedDiffWriter aborts rendering before a subtree exceeds its output limit.
+type boundedDiffWriter struct {
+	buf   []byte
+	limit int
+}
+
+func (writer *boundedDiffWriter) Write(bytes []byte) (int, error) {
+	if len(writer.buf)+len(bytes) > writer.limit {
+		return 0, errDiffLimit
+	}
+	writer.buf = append(writer.buf, bytes...)
+	return len(bytes), nil
+}
+
+func (writer *boundedDiffWriter) WriteString(value string) (int, error) {
+	if len(writer.buf)+len(value) > writer.limit {
+		return 0, errDiffLimit
+	}
+	writer.buf = append(writer.buf, value...)
+	return len(value), nil
+}
+
+func (writer *boundedDiffWriter) WriteByte(value byte) error {
+	if len(writer.buf) >= writer.limit {
+		return errDiffLimit
+	}
+	writer.buf = append(writer.buf, value)
+	return nil
 }
 
 func normalizeDiffHTML(value string) string {
@@ -1400,11 +1411,11 @@ func normalizeDiffHTML(value string) string {
 }
 
 func diffCodeHunks(before, after string) ([]CodeHunk, error) {
-	_, oldLines, err := scanDiffDocument(before, true)
+	oldLines, err := scanDiffLines(before)
 	if err != nil {
 		return nil, errDiffLimit
 	}
-	_, newLines, err := scanDiffDocument(after, true)
+	newLines, err := scanDiffLines(after)
 	if err != nil {
 		return nil, errDiffLimit
 	}
@@ -1508,12 +1519,8 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 	oldText := diffIdentityText(oldLines)
 	newText := diffIdentityText(newLines)
 	dmp := diffmatchpatch.New()
-	// go-diff enforces DiffTimeout internally but does not report whether the
-	// deadline produced a coarse diff. Accept that valid result; elapsed wall
-	// time after return cannot distinguish a timeout from a scheduler pause. The
-	// 50ms deadline is unreachable for any input that can return 200 (a coarse
-	// diff needs enough lines that maxDiffHunkLines rejects it first).
-	dmp.DiffTimeout = diffLineTimeout
+	// Wall-clock deadlines can turn scheduler load into different successful diffs.
+	dmp.DiffTimeout = 0
 	oldTokens, newTokens, tokenLines := dmp.DiffLinesToRunes(oldText, newText)
 	diffs := dmp.DiffMainRunes(oldTokens, newTokens, false)
 
@@ -1727,7 +1734,7 @@ func newWhitespaceFingerprintLine(digest string) diffSourceLine {
 }
 
 func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
-	_, lines, err := scanDiffDocument(source, true)
+	lines, err := scanDiffLines(source)
 	return lines, err == nil
 }
 

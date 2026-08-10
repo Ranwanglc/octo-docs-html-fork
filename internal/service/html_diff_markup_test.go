@@ -121,7 +121,7 @@ func TestDiffCommentTerminatorMatrix(t *testing.T) {
 	if probe.modified != 1 {
 		t.Fatalf("swallow case Summary.Modified = %d, want 1", probe.modified)
 	}
-	// Genuinely unterminated: still fail closed at both layers. "<!--!>" belongs
+	// The source-byte layer rejects comments that the tree builder accepts to EOF. "<!--!>" belongs
 	// here, not above: in the comment state a bare '>' is comment data, so only
 	// "-->" or "--!>" closes it.
 	for _, marker := range []string{"<!-- TODO", "<!--!>", "<!-- x --"} {
@@ -129,9 +129,6 @@ func TestDiffCommentTerminatorMatrix(t *testing.T) {
 			return `<html><body><div>` + marker + `<p>` + target + `</p></div></body></html>`
 		}
 		probe = probeDiff(t, unterminated("TARGET-OLD"), unterminated("TARGET-NEW"))
-		if !errors.Is(probe.structuralErr, errDiffLimit) {
-			t.Fatalf("%q parseDiffHTML err = %v, want errDiffLimit", marker, probe.structuralErr)
-		}
 		if probe.sourceLinesOK {
 			t.Fatalf("%q normalizedHTMLLines ok = true, want false", marker)
 		}
@@ -308,16 +305,17 @@ func TestDiffMarkupScannerInvariants(t *testing.T) {
 				}
 			}()
 			_, structuralErr := parseDiffHTML(seed)
-			_, linesOK := normalizedHTMLLines(seed)
-			failedClosed := errors.Is(structuralErr, errDiffLimit)
-			if failedClosed != !linesOK {
-				t.Fatalf("layers disagree on %q: structuralErr=%v sourceLinesOK=%v", seed, structuralErr, linesOK)
+			if structuralErr != nil {
+				t.Fatalf("structural layer rejected %q: %v", seed, structuralErr)
 			}
-			if failedClosed && !isUnterminatedDiffComment(seed) {
+			_, linesOK := normalizedHTMLLines(seed)
+			if !linesOK && !isUnterminatedDiffComment(seed) {
 				t.Fatalf("%q failed closed but is not an unterminated comment", seed)
 			}
-			if _, err := buildVersionDiff(1, 2, seed, seed+"x"); err != nil && !errors.Is(err, errDiffLimit) {
-				t.Fatalf("buildVersionDiff(%q) err = %v", seed, err)
+			// Source-byte rejection fails the whole diff closed.
+			_, diffErr := buildVersionDiff(1, 2, seed, seed+"x")
+			if failedClosed := errors.Is(diffErr, errDiffLimit); failedClosed != !linesOK {
+				t.Fatalf("buildVersionDiff(%q) err = %v, sourceLinesOK = %v", seed, diffErr, linesOK)
 			}
 		}()
 	}

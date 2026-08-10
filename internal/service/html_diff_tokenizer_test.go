@@ -49,10 +49,10 @@ func TestDiffForeignIntegrationPointsFollowParserOracle(t *testing.T) {
 	tests := []struct {
 		name, source, wantPath string
 	}{
-		{"svg_foreignObject", `<svg><foreignObject><p>x</p></foreignObject></svg>`, `/svg[1]/foreignobject[1]/p[1]`},
-		{"svg_desc", `<svg><desc><p>x</p></desc></svg>`, `/svg[1]/desc[1]/p[1]`},
-		{"math_annotation_html", `<math><annotation-xml encoding="text/html"><p>x</p></annotation-xml></math>`, `/math[1]/annotation-xml[1]/p[1]`},
-		{"math_annotation_xhtml", `<math><annotation-xml encoding="APPLICATION/XHTML+XML"><p>x</p></annotation-xml></math>`, `/math[1]/annotation-xml[1]/p[1]`},
+		{"svg_foreignObject", `<svg><foreignObject><p>x</p></foreignObject></svg>`, `/html[1]/body[1]/svg[1]/foreignobject[1]/p[1]`},
+		{"svg_desc", `<svg><desc><p>x</p></desc></svg>`, `/html[1]/body[1]/svg[1]/desc[1]/p[1]`},
+		{"math_annotation_html", `<math><annotation-xml encoding="text/html"><p>x</p></annotation-xml></math>`, `/html[1]/body[1]/math[1]/annotation-xml[1]/p[1]`},
+		{"math_annotation_xhtml", `<math><annotation-xml encoding="APPLICATION/XHTML+XML"><p>x</p></annotation-xml></math>`, `/html[1]/body[1]/math[1]/annotation-xml[1]/p[1]`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -110,7 +110,7 @@ func TestDiffMathMLTextIntegrationPointsFollowParserOracle(t *testing.T) {
 			if strings.Join(gotPaths, "\n") != strings.Join(wantPaths, "\n") {
 				t.Fatalf("self-closing paths = %v, explicit paths = %v", gotPaths, wantPaths)
 			}
-			wantP := "/math[1]/" + tag + "[1]/div[1]/p[1]"
+			wantP := "/html[1]/body[1]/math[1]/" + tag + "[1]/div[1]/p[1]"
 			if !hasDiffPath(gotPaths, wantP) {
 				t.Fatalf("paths = %v, want p nested under div at %s", gotPaths, wantP)
 			}
@@ -176,8 +176,8 @@ func TestDiffForeignStartTagsDoNotLeakRawTextMode(t *testing.T) {
 		name, source string
 		want         []string
 	}{
-		{"self_closing_title", `<svg><title/>tail<circle/></svg><p>A</p>`, []string{"/svg[1]/circle[1]", "/p[1]"}},
-		{"plaintext", `<div><svg><plaintext>a</plaintext><circle/></svg><p>A</p></div>`, []string{"/div[1]/svg[1]/circle[1]", "/div[1]/p[1]"}},
+		{"self_closing_title", `<svg><title/>tail<circle/></svg><p>A</p>`, []string{"/html[1]/body[1]/svg[1]/circle[1]", "/html[1]/body[1]/p[1]"}},
+		{"plaintext", `<div><svg><plaintext>a</plaintext><circle/></svg><p>A</p></div>`, []string{"/html[1]/body[1]/div[1]/svg[1]/circle[1]", "/html[1]/body[1]/div[1]/p[1]"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -195,9 +195,9 @@ func TestDiffConstrainsDOMPathTagBytes(t *testing.T) {
 	tests := []struct {
 		source, want string
 	}{
-		{`<div><b){x=1}<>y</div>`, `/div[1]/b[1]`},
-		{`<div><a"onerror=alert(1)">y</div>`, `/div[1]/a[1]`},
-		{`<A!>x</A!>`, `/a[1]`},
+		{`<div><b){x=1}<>y</div>`, `/html[1]/body[1]/div[1]/b[1]`},
+		{`<div><a"onerror=alert(1)">y</div>`, `/html[1]/body[1]/div[1]/a[1]`},
+		{`<A!>x</A!>`, `/html[1]/body[1]/a[1]`},
 	}
 	for _, test := range tests {
 		paths := diffNodePaths(t, test.source)
@@ -232,8 +232,8 @@ func TestDiffForeignEndTagBreakoutMatchesParserOracle(t *testing.T) {
 		if !strings.Contains(parserTree, ":p\n") && !strings.Contains(parserTree, ":br\n") {
 			t.Fatalf("parser oracle did not create breakout element: %s", parserTree)
 		}
-		if !hasDiffPath(paths, "/x[1]") {
-			t.Fatalf("paths = %v, want breakout sibling /x[1]", paths)
+		if !hasDiffPath(paths, "/html[1]/body[1]/x[1]") {
+			t.Fatalf("paths = %v, want breakout sibling /html[1]/body[1]/x[1]", paths)
 		}
 	}
 }
@@ -409,7 +409,8 @@ func TestDiffTokenizerMalformedAndForeignSemantics(t *testing.T) {
 	}
 }
 
-func TestDiffSnippetUsesOriginalSourceBytes(t *testing.T) {
+// TestDiffSnippetUsesNormalizedRendering keeps raw bytes exclusive to source hunks.
+func TestDiffSnippetUsesNormalizedRendering(t *testing.T) {
 	before := `<html><body><DIV DATA-X='&amp;>z' weird="a  b">old</DIV></body></html>`
 	after := `<html><body><DIV DATA-X='&amp;>z' weird="a  b">new</DIV></body></html>`
 	result, err := buildVersionDiff(1, 2, before, after)
@@ -420,8 +421,8 @@ func TestDiffSnippetUsesOriginalSourceBytes(t *testing.T) {
 		if change.DOMPath != "/html[1]/body[1]/div[1]" {
 			continue
 		}
-		if change.BeforeHTML != `<DIV DATA-X='&amp;>z' weird="a  b">old</DIV>` {
-			t.Fatalf("BeforeHTML = %q; original spelling/quotes/entities were not preserved", change.BeforeHTML)
+		if change.BeforeHTML != `<div data-x="&amp;&gt;z" weird="a  b">old</div>` {
+			t.Fatalf("BeforeHTML = %q; want the renderer's normalized spelling", change.BeforeHTML)
 		}
 		return
 	}
@@ -442,14 +443,11 @@ func TestParseDiffHTMLLargeTokenAcrossFormerPrefixBoundary(t *testing.T) {
 }
 
 func TestDiffTextUsesTokenizerRCDATAAndRAWTEXTSemantics(t *testing.T) {
-	nodes, err := parseDiffHTML(`<textarea>&amp;amp;</textarea><script>&amp;amp;</script>`)
-	if err != nil {
-		t.Fatal(err)
+	source := `<textarea>&amp;amp;</textarea><script>&amp;amp;</script>`
+	if got := diffNodeWithTag(t, source, "textarea").text; got != "&amp;" {
+		t.Fatalf("textarea text = %q, want one tokenizer entity decode", got)
 	}
-	if nodes[0].text != "&amp;" {
-		t.Fatalf("textarea text = %q, want one tokenizer entity decode", nodes[0].text)
-	}
-	if nodes[1].text != "&amp;amp;" {
-		t.Fatalf("script text = %q, want literal raw text", nodes[1].text)
+	if got := diffNodeWithTag(t, source, "script").text; got != "&amp;amp;" {
+		t.Fatalf("script text = %q, want literal raw text", got)
 	}
 }

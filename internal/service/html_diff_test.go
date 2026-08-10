@@ -32,32 +32,35 @@ func TestBuildVersionDiffDetectsTextChangePastDisplayLimit(t *testing.T) {
 	}
 }
 
+// TestParseDiffHTMLImpliedEndTagsHavePathsAndSnippets prevents sibling swallowing.
 func TestParseDiffHTMLImpliedEndTagsHavePathsAndSnippets(t *testing.T) {
 	source := `<p>one<main>two</main><p>three<hgroup>head</hgroup><p>four<search>find</search><ul><li>a<li>b</ul><dl><dt>term<dd>value</dl><select><option>a<option>b</select><table><thead><tr><th>h<tbody><tr><td>x<td>y</table>`
 	nodes, err := parseDiffHTML(source)
 	if err != nil {
 		t.Fatal(err)
 	}
+	const body = "/html[1]/body[1]"
 	want := map[string]string{
-		"/p[1]":                          "<p>one",
-		"/p[2]":                          "<p>three",
-		"/p[3]":                          "<p>four",
-		"/ul[1]/li[1]":                   "<li>a",
-		"/dl[1]/dt[1]":                   "<dt>term",
-		"/dl[1]/dd[1]":                   "<dd>value",
-		"/select[1]/option[1]":           "<option>a",
-		"/table[1]/thead[1]":             "<thead><tr><th>h",
-		"/table[1]/tbody[1]/tr[1]/td[1]": "<td>x",
+		body + "/p[1]":                          "<p>one</p>",
+		body + "/p[2]":                          "<p>three</p>",
+		body + "/p[3]":                          "<p>four</p>",
+		body + "/ul[1]/li[1]":                   "<li>a</li>",
+		body + "/dl[1]/dt[1]":                   "<dt>term</dt>",
+		body + "/dl[1]/dd[1]":                   "<dd>value</dd>",
+		body + "/select[1]/option[1]":           "<option>a</option>",
+		body + "/table[1]/thead[1]":             "<thead><tr><th>h</th></tr></thead>",
+		body + "/table[1]/tbody[1]/tr[1]/td[1]": "<td>x</td>",
 	}
 	for _, node := range nodes {
+		snippet := diffNodeSnippet(node)
 		if expected, ok := want[node.path]; ok {
-			if node.outer != expected {
-				t.Errorf("%s outer = %q; want %q", node.path, node.outer, expected)
+			if snippet != expected {
+				t.Errorf("%s snippet = %q; want %q", node.path, snippet, expected)
 			}
 			delete(want, node.path)
 		}
-		if node.outer == "" {
-			t.Errorf("%s has no outer snippet", node.path)
+		if snippet == "" {
+			t.Errorf("%s has no snippet", node.path)
 		}
 	}
 	if len(want) != 0 {
@@ -66,16 +69,10 @@ func TestParseDiffHTMLImpliedEndTagsHavePathsAndSnippets(t *testing.T) {
 }
 
 func TestDiffTextDigestUsesCompleteCanonicalSemantics(t *testing.T) {
-	before, err := parseDiffHTML(`<p>A &amp; B   &#x63;` + strings.Repeat(" ", 20) + `tail</p>`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	after, err := parseDiffHTML(`<p>A &#38; B c tail</p>`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before[0].textDigest != after[0].textDigest || diffNodeSignature(before[0]) != diffNodeSignature(after[0]) {
-		t.Fatalf("semantically equivalent text differs: %q / %q", before[0].text, after[0].text)
+	before := diffNodeWithTag(t, `<p>A &amp; B   &#x63;`+strings.Repeat(" ", 20)+`tail</p>`, "p")
+	after := diffNodeWithTag(t, `<p>A &#38; B c tail</p>`, "p")
+	if before.textDigest != after.textDigest || diffNodeSignature(before) != diffNodeSignature(after) {
+		t.Fatalf("semantically equivalent text differs: %q / %q", before.text, after.text)
 	}
 
 	var split htmlDiffNode
@@ -87,11 +84,27 @@ func TestDiffTextDigestUsesCompleteCanonicalSemantics(t *testing.T) {
 }
 
 func TestDiffRawTextDigestPreservesBytes(t *testing.T) {
-	before, _ := parseDiffHTML(`<script>let x = 1</script>`)
-	after, _ := parseDiffHTML(`<script>let  x = 1</script>`)
-	if before[0].textDigest == after[0].textDigest {
+	before := diffNodeWithTag(t, `<script>let x = 1</script>`, "script")
+	after := diffNodeWithTag(t, `<script>let  x = 1</script>`, "script")
+	if before.textDigest == after.textDigest {
 		t.Fatal("script whitespace change was lost")
 	}
+}
+
+// diffNodeWithTag ignores synthetic document wrappers in tests.
+func diffNodeWithTag(t *testing.T, source, tag string) htmlDiffNode {
+	t.Helper()
+	nodes, err := parseDiffHTML(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range nodes {
+		if node.tag == tag {
+			return node
+		}
+	}
+	t.Fatalf("no %s node in %q", tag, source)
+	return htmlDiffNode{}
 }
 
 func TestParseDiffAttrsDuplicateNamesUseFirstValue(t *testing.T) {
@@ -332,7 +345,9 @@ func TestMatchDiffNodesBoundsAsymmetricSiblingWork(t *testing.T) {
 }
 
 func TestMatchManyIdenticalSiblingsDoesNotExhaustBudget(t *testing.T) {
-	for _, siblings := range []int{700, maxDiffNodes - 1} {
+	// Leave room for the tree builder's html/head/body wrappers.
+	const wrappers = 3
+	for _, siblings := range []int{700, maxDiffNodes - wrappers - 1} {
 		t.Run(strconv.Itoa(siblings), func(t *testing.T) {
 			source := `<main>` + strings.Repeat(`<span>same</span>`, siblings) + `</main>`
 			before, err := parseDiffHTML(source)
@@ -347,8 +362,8 @@ func TestMatchManyIdenticalSiblingsDoesNotExhaustBudget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(matches) != siblings+1 {
-				t.Fatalf("matches = %d; want %d", len(matches), siblings+1)
+			if len(matches) != siblings+1+wrappers {
+				t.Fatalf("matches = %d; want %d", len(matches), siblings+1+wrappers)
 			}
 		})
 	}
@@ -424,8 +439,7 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 			}
 		}()
 	}
-	// Unterminated comments are the one malformed shape that fails closed rather
-	// than degrading to text; see TestDiffUnterminatedCommentFailsClosed.
+	// The source-byte layer rejects comments that the tree builder accepts to EOF.
 	for _, source := range []string{"<!--", "<!--unterminated comment"} {
 		func() {
 			defer func() {
@@ -433,9 +447,6 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 					t.Fatalf("parse panicked on %q: %v", source, r)
 				}
 			}()
-			if _, err := parseDiffHTML(source); !errors.Is(err, errDiffLimit) {
-				t.Fatalf("parseDiffHTML(%q) err = %v, want errDiffLimit", source, err)
-			}
 			if _, ok := normalizedHTMLLines(source); ok {
 				t.Fatalf("normalizedHTMLLines(%q) returned ok=true for an unterminated comment", source)
 			}
@@ -760,8 +771,9 @@ func TestParseDiffHTMLBoundsDeepLongTagPaths(t *testing.T) {
 		t.Fatalf("error = %v; want diff limit", err)
 	}
 	runtime.ReadMemStats(&after)
-	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 6<<20 {
-		t.Fatalf("parse allocated %d bytes before rejecting oversized paths", allocated)
+	// Parse must materialize the tree before the path walk can reject it.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 16*uint64(len(htmlSource)) {
+		t.Fatalf("parse allocated %d bytes for a %d-byte document before rejecting oversized paths", allocated, len(htmlSource))
 	}
 }
 
@@ -932,12 +944,22 @@ func TestParseDiffHTMLBoundsCommentSeparatedTextStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 {
-		t.Fatalf("nodes = %d", len(nodes))
+	main := diffMainNode(t, nodes)
+	if len(main.text) > maxDiffCompareText || len(main.compareText) > maxDiffCompareText {
+		t.Fatalf("stored text sizes = %d, %d", len(main.text), len(main.compareText))
 	}
-	if len(nodes[0].text) > maxDiffCompareText || len(nodes[0].compareText) > maxDiffCompareText {
-		t.Fatalf("stored text sizes = %d, %d", len(nodes[0].text), len(nodes[0].compareText))
+}
+
+// diffMainNode skips synthetic document wrappers.
+func diffMainNode(t *testing.T, nodes []htmlDiffNode) htmlDiffNode {
+	t.Helper()
+	if len(nodes) != 4 {
+		t.Fatalf("nodes = %d; want html/head/body/main", len(nodes))
 	}
+	if nodes[3].tag != "main" {
+		t.Fatalf("nodes[3].tag = %q; want main", nodes[3].tag)
+	}
+	return nodes[3]
 }
 
 func TestParseDiffHTMLCommentSeparatedTextAllocationsStayLinear(t *testing.T) {
@@ -956,9 +978,7 @@ func TestParseDiffHTMLCommentSeparatedTextAllocationsStayLinear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 {
-		t.Fatalf("nodes = %d; want 1", len(nodes))
-	}
+	diffMainNode(t, nodes)
 	runtime.ReadMemStats(&after)
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
 		t.Fatalf("parse allocated %d bytes for %d-byte input", allocated, source.Len())
@@ -982,9 +1002,7 @@ func TestParseDiffHTMLFiveMiBCommentSeparatedTextAllocationAndResult(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 || nodes[0].tag != "main" {
-		t.Fatalf("nodes = %+v", nodes)
-	}
+	diffMainNode(t, nodes)
 	allocated := after.TotalAlloc - before.TotalAlloc
 	t.Logf("5MiB comment-separated parse: input=%d nodes=%d allocated=%d", source.Len(), len(nodes), allocated)
 	if allocated > 256<<20 {
