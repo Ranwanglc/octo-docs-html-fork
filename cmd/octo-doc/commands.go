@@ -72,7 +72,7 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 	docs := service.NewDocService(blobs, meta, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes)
 	if cfg.DocsBackendRegisterURL != "" {
 		docs = docs.WithDocsBackendRegistration(
-			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, nil),
+			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken, nil),
 			nil,
 		)
 		// Drain legacy meta.grants into doc_member after each registration so

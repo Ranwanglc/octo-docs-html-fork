@@ -2,6 +2,7 @@ package httpx_test
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -77,6 +78,32 @@ func TestPublishNewSlugAllowsAuthenticatedIdentity(t *testing.T) {
 	rec := do(t, h, http.MethodPost, "/v1/docs", headers, publishBody("publish-new", "new-v1"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first publish = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUserPublishSpaceMembership(t *testing.T) {
+	withStubIdentity(t, stubIdentity{uid: "new-author", spaces: map[string]bool{"space-1": true}})
+	h := newTestServer(t, nil)
+	base := map[string]string{octoUIDHeaderName: "new-author", "Content-Type": "application/json"}
+	for _, tc := range []struct {
+		name, space, token string
+		want               int
+	}{
+		{"forged", "space-2", "user-token", http.StatusForbidden},
+		{"missing token", "space-1", "", http.StatusForbidden},
+		{"member", "space-1", "user-token", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := maps.Clone(base)
+			if tc.token != "" {
+				headers["token"] = tc.token
+			}
+			body := fmt.Sprintf(`{"slug":%q,"html":"<html><body>x</body></html>","space_id":%q}`, "space-"+strings.ReplaceAll(tc.name, " ", "-"), tc.space)
+			rec := do(t, h, http.MethodPost, "/v1/docs", headers, body)
+			if rec.Code != tc.want {
+				t.Fatalf("publish = %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
 	}
 }
 

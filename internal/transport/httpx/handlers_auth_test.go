@@ -22,6 +22,7 @@ type stubIdentity struct {
 	botName     string
 	botSpaceID  string
 	botOwnerUID string
+	spaces      map[string]bool
 }
 
 func (s stubIdentity) VerifyToken(_ context.Context, tok string) (*octoidentity.User, error) {
@@ -44,6 +45,9 @@ func (s stubIdentity) VerifyBot(_ context.Context, tok string) (*octoidentity.Bo
 }
 func (s stubIdentity) GetUser(_ context.Context, uid, _ string) (*octoidentity.User, error) {
 	return &octoidentity.User{UID: uid}, nil
+}
+func (s stubIdentity) IsSpaceMember(_ context.Context, uid, spaceID, token string) bool {
+	return token != "" && uid == s.uid && s.spaces[spaceID]
 }
 
 func withStubIdentity(t *testing.T, stub octoidentity.Identity) {

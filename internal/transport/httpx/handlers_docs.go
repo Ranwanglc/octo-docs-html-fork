@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
@@ -31,6 +32,8 @@ type publishBody struct {
 	MountTypePresent bool
 	GroupNo          string
 	ThreadID         string
+	SpaceID          string
+	SpaceIDPresent   bool
 }
 
 func (s *Server) readPublishBody(w http.ResponseWriter, r *http.Request) (publishBody, error) {
@@ -55,6 +58,8 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	_, b.MountTypePresent = r.MultipartForm.Value["mount_type"]
 	b.GroupNo = r.FormValue("group_no")
 	b.ThreadID = r.FormValue("thread_id")
+	b.SpaceID = r.FormValue("space_id")
+	_, b.SpaceIDPresent = r.MultipartForm.Value["space_id"]
 	if file, _, err := r.FormFile("file"); err == nil {
 		defer func() { _ = file.Close() }()
 		data, rerr := io.ReadAll(file)
@@ -83,6 +88,7 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		MountType *string `json:"mount_type"`
 		GroupNo   string  `json:"group_no"`
 		ThreadID  string  `json:"thread_id"`
+		SpaceID   *string `json:"space_id"`
 	}
 	if r.Body != nil {
 		// Publish bodies carry the document HTML, so cap at the HTML limit plus JSON
@@ -108,6 +114,10 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 	body := publishBody{
 		Slug: raw.Slug, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
 		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
+	}
+	if raw.SpaceID != nil {
+		body.SpaceID = *raw.SpaceID
+		body.SpaceIDPresent = true
 	}
 	if raw.MountType != nil {
 		body.MountType = *raw.MountType
@@ -147,12 +157,21 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
+	userPublish := botSessionFromCtx(r.Context()) == nil && body.SpaceIDPresent
+	if userPublish {
+		provider, providerErr := octoidentity.Get()
+		if providerErr != nil || !provider.IsSpaceMember(r.Context(), creatorUID, strings.TrimSpace(body.SpaceID), userToken(r)) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+	}
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
 		PublisherToken: botTokenFromCtx(r.Context()),
+		SpaceID:        body.SpaceID,
+		UserPublish:    userPublish,
 	}, func(exists bool) error {
 		if !exists {
 			return nil

@@ -41,6 +41,17 @@ func publishAsBot(t *testing.T, h http.Handler, slug string) {
 	}
 }
 
+func TestBotPublishWithSpaceIDDoesNotUseUserMembershipGate(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
+	h := newTestServer(t, ownerAuthCfg())
+	rec := do(t, h, http.MethodPost, "/v1/docs",
+		map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"},
+		`{"slug":"bot-space","html":"<html><body>x</body></html>","space_id":"s1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bot publish with space_id = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // 验收1: bot 发布 → creator = bot 的 OwnerUID（用户 uid），不是 bot uid。
 func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})

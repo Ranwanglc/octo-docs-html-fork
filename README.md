@@ -110,7 +110,7 @@ the server behaves as a standalone deploy.
 | **Login (http provider)** | `OCTO_SERVER_BASE_URL`, `LOGIN_ENABLED` | `/v1/auth/login` verifies a viewer against octo-server and populates the session |
 | **Bot-token auth** | `BOT_AUTH_ENABLED` (+ `OCTO_SERVER_BASE_URL`) | accepts an Octo bot token; the bot's owner uid becomes the doc creator/author |
 | **Doc-binding channel** | `OCTO_DOC_BINDING_URL`, `OCTO_DOC_BINDING_TTL_MS` | asks octo-server whether a uid may see a slug's binding (per-uid visibility), cached briefly |
-| **Web-docs registration** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN` | registers each published HTML doc into the docs-backend sidebar |
+| **Web-docs registration** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN`, `DOCS_BACKEND_INTERNAL_REGISTER_TOKEN` | bot calls use the Bearer token; user HTML upserts use the separate internal token |
 | **Comment-event webhook** | `OCTO_WEBHOOK_URL`, `OCTO_DOC_EVENT_WEBHOOK_TOKEN` | pushes new-comment events to Octo IM (token required, sent as `X-Octo-Doc-Webhook-Token`) |
 | **Superadmin/owner** | `OWNER` | designates which signed-in Login sees the `/me` catalog |
 

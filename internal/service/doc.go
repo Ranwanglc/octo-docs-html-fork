@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"reflect"
+	"regexp"
 	"strings"
 	"time"
 
@@ -124,6 +125,8 @@ type PublishInput struct {
 	// docs-backend registration so the doc is attributed to whoever published it.
 	// Empty ⇒ the registrar falls back to its process-configured token.
 	PublisherToken string
+	SpaceID        string
+	UserPublish    bool
 
 	mountContextKnown bool
 	pinnedAID         string
@@ -154,6 +157,9 @@ type PublishResult struct {
 
 	// publisherToken authenticates synchronous registration as the publisher.
 	publisherToken string
+	spaceID        string
+	owner          string
+	userPublish    bool
 }
 
 // RenderData is the render payload for a document version.
@@ -175,6 +181,8 @@ const (
 	publishStatusRegisterFailed  = "registration_failed"
 )
 
+var spaceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
 // Publish publishes a new (or explicitly-versioned) document.
 func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResult, error) {
 	return s.PublishAuthorized(ctx, in, nil)
@@ -188,6 +196,14 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	}
 	if int64(len(in.HTML)) > s.maxBytes {
 		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
+	}
+	if in.UserPublish {
+		in.SpaceID = strings.TrimSpace(in.SpaceID)
+		if !spaceIDRe.MatchString(in.SpaceID) {
+			return nil, apperr.Validation("valid space_id required", "space_id_invalid")
+		}
+		in.MountType = "space"
+		in.MountTypePresent = true
 	}
 	if in.MountType != "" {
 		in.MountTypePresent = true
@@ -297,6 +313,9 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		mountType:         in.MountType,
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
+		spaceID:           in.SpaceID,
+		owner:             in.CreatorUID,
+		userPublish:       in.UserPublish,
 	}, nil
 }
 
@@ -776,6 +795,11 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 		return
 	}
 	reg, ok := s.registrationForMount(result.Slug, result.title, result.mountType)
+	if result.userPublish {
+		reg.SpaceID = result.spaceID
+		reg.Owner = result.owner
+		reg.Internal = true
+	}
 	if !ok {
 		if result.mountContextKnown {
 			result.Status = publishStatusUnregistered
@@ -823,7 +847,7 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 	result.URL = registration.ShareURL
 	result.ShareURL = registration.ShareURL
 	result.Registered = true
-	if result.hadMeta && result.titleChanged {
+	if result.hadMeta && result.titleChanged && !result.userPublish {
 		s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
 	}
 	if ctx.Err() != nil {

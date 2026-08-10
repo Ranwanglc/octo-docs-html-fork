@@ -94,6 +94,9 @@ type Config struct {
 	// DocsBackendRegisterToken is the bot Bearer token used for registration
 	// calls and the matching binding lookup. Never logged.
 	DocsBackendRegisterToken string
+	// DocsBackendInternalRegisterToken authenticates user HTML upserts with
+	// X-Internal-Token. It is intentionally separate from the bot Bearer token.
+	DocsBackendInternalRegisterToken string
 	// TrustProxyHeaders enables honoring X-Forwarded-For / X-Real-IP for the client
 	// IP (rate limiting). Enable ONLY when the server sits behind a trusted reverse
 	// proxy that sets these; otherwise a client can spoof them to evade limits.
@@ -162,10 +165,11 @@ func Load() (*Config, error) {
 
 		// OCT-137/B doc-side comment-event webhook. URL unset ⇒ webhook off;
 		// token unset with URL set ⇒ server rejects (503) — logged, not fatal.
-		OctoWebhookURL:           strings.TrimSpace(env("OCTO_WEBHOOK_URL", "")),
-		OctoDocEventWebhookToken: env("OCTO_DOC_EVENT_WEBHOOK_TOKEN", ""),
-		DocsBackendRegisterURL:   strings.TrimRight(strings.TrimSpace(env("DOCS_BACKEND_REGISTER_URL", "")), "/"),
-		DocsBackendRegisterToken: env("DOCS_BACKEND_REGISTER_TOKEN", ""),
+		OctoWebhookURL:                   strings.TrimSpace(env("OCTO_WEBHOOK_URL", "")),
+		OctoDocEventWebhookToken:         env("OCTO_DOC_EVENT_WEBHOOK_TOKEN", ""),
+		DocsBackendRegisterURL:           strings.TrimRight(strings.TrimSpace(env("DOCS_BACKEND_REGISTER_URL", "")), "/"),
+		DocsBackendRegisterToken:         env("DOCS_BACKEND_REGISTER_TOKEN", ""),
+		DocsBackendInternalRegisterToken: env("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN", ""),
 
 		TrustProxyHeaders: envBool("TRUST_PROXY_HEADERS", false),
 		CORSOrigins:       splitList(env("CORS_ORIGINS", "")),

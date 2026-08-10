@@ -168,6 +168,7 @@ type docsBackendRequest struct {
 	Method        string
 	Path          string
 	Authorization string
+	InternalToken string
 	Body          map[string]any
 }
 
@@ -183,6 +184,7 @@ func newDocsBackendStub(t *testing.T, status int) (*httptest.Server, <-chan docs
 			Method:        r.Method,
 			Path:          r.URL.Path,
 			Authorization: r.Header.Get("Authorization"),
+			InternalToken: r.Header.Get("X-Internal-Token"),
 			Body:          body,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -226,7 +228,7 @@ func newDocWithDocsBackend(t *testing.T, registerURL string) *service.DocService
 	locker := sluglock.NewMemory()
 	cs := service.NewCommentService(store, locker)
 	return service.NewDocService(store, store, cs, locker, "", 5<<20).
-		WithDocsBackendRegistration(docsbackend.New(registerURL, "bot-token", nil), nil)
+		WithDocsBackendRegistration(docsbackend.New(registerURL, "bot-token", "internal-token", nil), nil)
 }
 
 func TestPublishRegistersGroupMountedDoc(t *testing.T) {
@@ -294,6 +296,71 @@ func TestPublishRegistersUnderPublisherToken(t *testing.T) {
 // TestPublishRegisterFallsBackToConfiguredToken verifies that when no
 // PublisherToken is supplied, the registration falls back to the
 // process-configured token — preserving pre-route-B behaviour.
+func TestUserPublishRegistersThroughInternalEndpoint(t *testing.T) {
+	ts, reqs := newDocsBackendStub(t, http.StatusOK)
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+
+	result, err := ds.Publish(context.Background(), service.PublishInput{
+		Slug: "user-doc", HTML: "<html><body>x</body></html>", Title: "User Title",
+		CreatorUID: "user-1", SpaceID: "space-1", UserPublish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Registered || result.Status != "published" {
+		t.Fatalf("result = %+v", result)
+	}
+	req := waitDocsBackendRequest(t, reqs)
+	if req.Path != "/internal/html/register" {
+		t.Fatalf("path = %q, want /internal/html/register", req.Path)
+	}
+	if req.InternalToken != "internal-token" || req.Authorization != "" {
+		t.Fatalf("headers = internal %q authorization %q", req.InternalToken, req.Authorization)
+	}
+	if req.Body["octoDocSlug"] != "user-doc" || req.Body["spaceId"] != "space-1" || req.Body["owner"] != "user-1" || req.Body["title"] != "User Title" || req.Body["mountType"] != "space" {
+		t.Fatalf("registration body = %#v", req.Body)
+	}
+}
+
+func TestUserPublishDoesNotUseBotRename(t *testing.T) {
+	ts, reqs := newDocsBackendStub(t, http.StatusOK)
+	defer ts.Close()
+	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
+	for _, title := range []string{"first", "updated"} {
+		result, err := ds.Publish(context.Background(), service.PublishInput{
+			Slug: "user-rename", HTML: "<html><body>" + title + "</body></html>", Title: title,
+			CreatorUID: "user-1", SpaceID: "space-1", UserPublish: true,
+		})
+		if err != nil || !result.Registered {
+			t.Fatalf("publish %q = %+v, %v", title, result, err)
+		}
+		req := waitDocsBackendRequest(t, reqs)
+		if req.Method != http.MethodPost || req.Path != "/internal/html/register" {
+			t.Fatalf("request = %s %s; user upsert must not Bot Rename", req.Method, req.Path)
+		}
+	}
+	select {
+	case req := <-reqs:
+		t.Fatalf("unexpected extra request: %s %s", req.Method, req.Path)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestUserPublishRejectsMissingOrInvalidSpaceID(t *testing.T) {
+	for _, spaceID := range []string{"", "bad space"} {
+		t.Run(spaceID, func(t *testing.T) {
+			ds, _ := newDoc(t)
+			_, err := ds.Publish(context.Background(), service.PublishInput{
+				Slug: "user-space", HTML: "<html><body>x</body></html>", CreatorUID: "user-1", SpaceID: spaceID, UserPublish: true,
+			})
+			if err == nil {
+				t.Fatal("expected invalid space_id error")
+			}
+		})
+	}
+}
+
 func TestPublishRegisterFallsBackToConfiguredToken(t *testing.T) {
 	ts, reqs := newDocsBackendStub(t, http.StatusOK)
 	defer ts.Close()
@@ -323,7 +390,7 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	defer ts.CloseClientConnections()
 	defer close(unblock)
 
-	client := docsbackend.New(ts.URL+"/v1/bot/docs", "bot-token", nil)
+	client := docsbackend.New(ts.URL+"/v1/bot/docs", "bot-token", "internal-token", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})
