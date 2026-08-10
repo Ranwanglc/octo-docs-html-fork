@@ -561,7 +561,7 @@ func (r *cancelRegistrar) Rename(context.Context, string, string, string) {
 	r.mu.Unlock()
 }
 
-func (*cancelRegistrar) Delete(context.Context, string, string) {}
+func (*cancelRegistrar) Delete(context.Context, docsbackend.Deletion, string) error { return nil }
 
 func TestPublishCancellationStopsRegistrationRetries(t *testing.T) {
 	store := memory.New()
@@ -687,8 +687,8 @@ func (r *timeoutRegistrar) Register(context.Context, docsbackend.Registration, s
 	return nil, context.DeadlineExceeded
 }
 
-func (*timeoutRegistrar) Rename(context.Context, string, string, string) {}
-func (*timeoutRegistrar) Delete(context.Context, string, string)         {}
+func (*timeoutRegistrar) Rename(context.Context, string, string, string)             {}
+func (*timeoutRegistrar) Delete(context.Context, docsbackend.Deletion, string) error { return nil }
 
 func TestPublishRetriesRegistrationTimeoutWithoutRepublish(t *testing.T) {
 	store := memory.New()

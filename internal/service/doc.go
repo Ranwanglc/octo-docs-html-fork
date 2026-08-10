@@ -45,7 +45,7 @@ type GrantReconciler func(ctx context.Context, slug string) error
 type DocRegistrar interface {
 	Register(ctx context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error)
 	Rename(ctx context.Context, slug, title, token string)
-	Delete(ctx context.Context, slug, token string)
+	Delete(ctx context.Context, deletion docsbackend.Deletion, token string) error
 }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
@@ -182,6 +182,9 @@ const (
 )
 
 var spaceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// ValidSpaceID reports whether a space id is valid for user publishing.
+func ValidSpaceID(spaceID string) bool { return spaceIDRe.MatchString(strings.TrimSpace(spaceID)) }
 
 // Publish publishes a new (or explicitly-versioned) document.
 func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResult, error) {
@@ -320,9 +323,6 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 }
 
 func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) error {
-	if in.mountContextKnown && in.MountType != "" {
-		return nil
-	}
 	meta, err := s.meta.GetMeta(ctx, in.Slug)
 	if err != nil {
 		return err
@@ -332,10 +332,23 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 		if normalizeErr != nil {
 			return normalizeErr
 		}
-		if normalized != "" || !in.mountContextKnown {
-			in.MountType = normalized
-			in.mountContextKnown = true
+		userPublish, spaceID, groupNo, threadID := meta.PublishProvenance()
+		if in.mountContextKnown && in.MountType != "" && in.MountType != normalized {
+			return apperr.Conflict("document mount is immutable", "mount_conflict")
 		}
+		if in.SpaceID != "" && spaceID != "" && in.SpaceID != spaceID {
+			return apperr.Conflict("document space is immutable", "space_conflict")
+		}
+		if in.GroupNo != "" && groupNo != "" && in.GroupNo != groupNo {
+			return apperr.Conflict("document group is immutable", "mount_conflict")
+		}
+		if in.ThreadID != "" && threadID != "" && in.ThreadID != threadID {
+			return apperr.Conflict("document thread is immutable", "mount_conflict")
+		}
+		in.MountType, in.mountContextKnown = normalized, true
+		in.UserPublish, in.SpaceID = userPublish, spaceID
+		in.GroupNo, in.ThreadID = groupNo, threadID
+		in.CreatorUID = meta.CreatorUID()
 		return nil
 	}
 	if meta == nil {
@@ -551,6 +564,12 @@ type DraftResult struct {
 // exactly like Publish; a later save by a different caller never reassigns it,
 // and the stamped creator carries through to the promoted version.
 func (s *DocService) SaveDraft(ctx context.Context, slug, html, title, creatorUID string) (*DraftResult, error) {
+	return s.SaveDraftWithProvenance(ctx, slug, html, title, PublishInput{CreatorUID: creatorUID})
+}
+
+// SaveDraftWithProvenance saves a draft and durable publishing identity so a
+// later promote follows the same registration lifecycle as direct publish.
+func (s *DocService) SaveDraftWithProvenance(ctx context.Context, slug, html, title string, provenance PublishInput) (*DraftResult, error) {
 	if html == "" {
 		return nil, apperr.Validation("html required", "html_required")
 	}
@@ -560,11 +579,15 @@ func (s *DocService) SaveDraft(ctx context.Context, slug, html, title, creatorUI
 	stamped := core.StampAids(html)
 	var result *DraftResult
 	err := s.lock.With(ctx, slug, func() error {
+		prev, normalized, validationErr := s.prepareDraftProvenance(ctx, slug, provenance)
+		if validationErr != nil {
+			return validationErr
+		}
 		size, perr := s.blobs.PutDraft(ctx, slug, stamped.HTML)
 		if perr != nil {
 			return apperr.Upstream("draft write failed", "draft_write_failed", perr)
 		}
-		if merr := s.setDraftMeta(ctx, slug, title, creatorUID); merr != nil {
+		if merr := s.setDraftMeta(ctx, slug, title, prev, normalized); merr != nil {
 			return merr
 		}
 		result = &DraftResult{
@@ -579,6 +602,62 @@ func (s *DocService) SaveDraft(ctx context.Context, slug, html, title, creatorUI
 		return nil, err
 	}
 	return result, nil
+}
+
+// prepareDraftProvenance validates identity while the caller holds the slug
+// lock. Existing provenance is inherited and can never be converted or moved.
+func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in PublishInput) (*storage.DocMeta, PublishInput, error) {
+	if in.UserPublish {
+		in.SpaceID = strings.TrimSpace(in.SpaceID)
+		if !ValidSpaceID(in.SpaceID) {
+			return nil, PublishInput{}, apperr.Validation("valid space_id required", "space_id_invalid")
+		}
+		in.MountType, in.MountTypePresent = "space", true
+	}
+	if in.MountType != "" {
+		in.MountTypePresent = true
+	}
+	mountType, err := normalizeMountType(in.MountType)
+	if err != nil {
+		return nil, PublishInput{}, err
+	}
+	in.MountType = mountType
+	prev, err := s.meta.GetMeta(ctx, slug)
+	if err != nil || prev == nil {
+		return prev, in, err
+	}
+	existingUser, existingSpace, existingGroup, existingThread := prev.PublishProvenance()
+	existingMount, hasMount := prev.MountType()
+	if hasMount {
+		existingMount, err = normalizeMountType(existingMount)
+		if err != nil {
+			return nil, PublishInput{}, err
+		}
+	}
+	if in.UserPublish && !existingUser {
+		return nil, PublishInput{}, apperr.Conflict("document publishing identity is immutable", "publish_provenance_conflict")
+	}
+	if in.SpaceID != "" && existingSpace != "" && in.SpaceID != existingSpace {
+		return nil, PublishInput{}, apperr.Conflict("document space is immutable", "space_conflict")
+	}
+	if in.MountTypePresent && hasMount && in.MountType != "" && in.MountType != existingMount {
+		return nil, PublishInput{}, apperr.Conflict("document mount is immutable", "mount_conflict")
+	}
+	if in.GroupNo != "" && existingGroup != "" && in.GroupNo != existingGroup {
+		return nil, PublishInput{}, apperr.Conflict("document group is immutable", "mount_conflict")
+	}
+	if in.ThreadID != "" && existingThread != "" && in.ThreadID != existingThread {
+		return nil, PublishInput{}, apperr.Conflict("document thread is immutable", "mount_conflict")
+	}
+	in.UserPublish, in.SpaceID = existingUser, existingSpace
+	in.GroupNo, in.ThreadID = existingGroup, existingThread
+	if hasMount {
+		in.MountType, in.MountTypePresent = existingMount, true
+	}
+	if creator := prev.CreatorUID(); creator != "" {
+		in.CreatorUID = creator
+	}
+	return prev, in, nil
 }
 
 // GetDraft fetches the draft HTML + version list for rendering, or nil if absent.
@@ -655,11 +734,7 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string) error {
-	prev, err := s.meta.GetMeta(ctx, slug)
-	if err != nil {
-		return err
-	}
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev *storage.DocMeta, provenance PublishInput) error {
 	if prev == nil {
 		prev = &storage.DocMeta{Slug: slug, Title: slug, Versions: []storage.VersionRef{}}
 	}
@@ -673,8 +748,17 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID s
 	extra := map[string]any{}
 	maps.Copy(extra, prev.Extra)
 	extra[storage.DraftExtraKey] = map[string]any{"updated_at": time.Now().UTC().Format(time.RFC3339)}
-	if creatorUID != "" && prev.CreatorUID() == "" {
-		extra[storage.CreatorUIDExtraKey] = creatorUID
+	if provenance.CreatorUID != "" && prev.CreatorUID() == "" {
+		extra[storage.CreatorUIDExtraKey] = provenance.CreatorUID
+	}
+	if provenance.UserPublish {
+		extra[storage.UserPublishExtraKey] = true
+		extra[storage.SpaceIDExtraKey] = provenance.SpaceID
+	}
+	if provenance.MountTypePresent {
+		extra[storage.MountTypeExtraKey] = provenance.MountType
+		extra[storage.GroupNoExtraKey] = provenance.GroupNo
+		extra[storage.ThreadIDExtraKey] = provenance.ThreadID
 	}
 	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 		Slug:     slug,
@@ -724,6 +808,10 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 		in.MountType = normalized
 		in.mountContextKnown = true
 	}
+	if meta != nil {
+		in.UserPublish, in.SpaceID, in.GroupNo, in.ThreadID = meta.PublishProvenance()
+		in.CreatorUID = meta.CreatorUID()
+	}
 	return in, nil
 }
 
@@ -761,7 +849,38 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 // interleave with a publish and leave orphaned blobs or meta pointing at a
 // missing blob.
 func (s *DocService) Remove(ctx context.Context, slug string) error {
+	deletion := docsbackend.Deletion{OctoDocSlug: slug}
 	err := s.lock.With(ctx, slug, func() error {
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		if meta != nil {
+			deletion.OctoDocSlug = slug
+			deletion.Owner = meta.CreatorUID()
+			deletion.UserPublish, deletion.SpaceID, _, _ = meta.PublishProvenance()
+		}
+		// Preserve local state until the internal user registration is confirmed
+		// deleted; otherwise a transient backend fault loses the retry provenance.
+		if deletion.UserPublish {
+			if s.register == nil {
+				return apperr.Upstream("docs-backend delete unavailable", "registration_delete_failed", nil)
+			}
+			deleteCtx, cancel := context.WithTimeout(ctx, docsBackendSideEffectTimeout)
+			defer cancel()
+			var deleteErr error
+			for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
+				attemptCtx, attemptCancel := context.WithTimeout(deleteCtx, docsBackendAttemptTimeout)
+				deleteErr = s.register.Delete(attemptCtx, deletion, "")
+				attemptCancel()
+				if deleteErr == nil || attempt == docsBackendRegisterAttempts || !waitForRetry(deleteCtx, docsBackendRegisterDelay) {
+					break
+				}
+			}
+			if deleteErr != nil {
+				return apperr.Upstream("docs-backend delete failed", "registration_delete_failed", deleteErr)
+			}
+		}
 		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
 			return err
 		}
@@ -786,7 +905,9 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 	if err != nil {
 		return err
 	}
-	s.afterRemoved(slug)
+	if !deletion.UserPublish {
+		s.afterRemoved(deletion)
+	}
 	return nil
 }
 
@@ -887,7 +1008,7 @@ func waitForRetry(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (s *DocService) afterRemoved(slug string) {
+func (s *DocService) afterRemoved(deletion docsbackend.Deletion) {
 	if s.register == nil {
 		return
 	}
@@ -899,7 +1020,7 @@ func (s *DocService) afterRemoved(slug string) {
 		// call it unconditionally rather than re-deriving a registration. No
 		// publisher token is available on the remove path, so "" falls back to the
 		// process-configured token.
-		s.register.Delete(ctx, slug, "")
+		_ = s.register.Delete(ctx, deletion, "")
 	}()
 }
 
@@ -1041,12 +1162,18 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") {
+	if in.mountContextKnown || in.UserPublish || (in.CreatorUID != "" && prev.CreatorUID() == "") {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
 	if in.mountContextKnown {
 		extra[storage.MountTypeExtraKey] = in.MountType
+		extra[storage.GroupNoExtraKey] = in.GroupNo
+		extra[storage.ThreadIDExtraKey] = in.ThreadID
+	}
+	if in.UserPublish {
+		extra[storage.UserPublishExtraKey] = true
+		extra[storage.SpaceIDExtraKey] = in.SpaceID
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID

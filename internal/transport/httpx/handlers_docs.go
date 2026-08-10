@@ -157,10 +157,17 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
-	userPublish := botSessionFromCtx(r.Context()) == nil && body.SpaceIDPresent
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && (body.SpaceIDPresent || userToken(r) != "")
 	if userPublish {
+		spaceID := strings.TrimSpace(body.SpaceID)
+		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
+			return apperr.Validation("valid space_id required", "space_id_invalid")
+		}
 		provider, providerErr := octoidentity.Get()
-		if providerErr != nil || !provider.IsSpaceMember(r.Context(), creatorUID, strings.TrimSpace(body.SpaceID), userToken(r)) {
+		if providerErr != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", providerErr)
+		}
+		if !provider.IsSpaceMember(r.Context(), creatorUID, spaceID, userToken(r)) {
 			return apperr.Forbidden("space membership required", "space_membership_required")
 		}
 	}
@@ -201,7 +208,24 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	}
 	// Stamp creator on first draft (draft-first create) with the same owner rule
 	// as publish, so the draft's author survives into the promoted version.
-	res, err := s.docs.SaveDraft(r.Context(), slug, body.HTML, body.Title, creatorUIDFromCtx(r.Context()))
+	creatorUID := creatorUIDFromCtx(r.Context())
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && (body.SpaceIDPresent || userToken(r) != "")
+	if userPublish {
+		spaceID := strings.TrimSpace(body.SpaceID)
+		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
+			return apperr.Validation("valid space_id required", "space_id_invalid")
+		}
+		provider, providerErr := octoidentity.Get()
+		if providerErr != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", providerErr)
+		}
+		if !provider.IsSpaceMember(r.Context(), creatorUID, spaceID, userToken(r)) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+	}
+	res, err := s.docs.SaveDraftWithProvenance(r.Context(), slug, body.HTML, body.Title, service.PublishInput{
+		CreatorUID: creatorUID, UserPublish: userPublish, SpaceID: body.SpaceID,
+	})
 	if err != nil {
 		return err
 	}

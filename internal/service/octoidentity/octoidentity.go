@@ -78,7 +78,12 @@ func New(baseURL, serviceToken string, timeout time.Duration) *HTTPIdentity {
 	return &HTTPIdentity{
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		serviceToken: serviceToken,
-		client:       &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -106,10 +111,14 @@ func (h *HTTPIdentity) IsSpaceMember(ctx context.Context, uid, spaceID, token st
 	req.Header.Set("Content-Type", "application/json")
 	res, err := h.client.Do(req)
 	if err != nil {
+		slog.Default().Warn("octoidentity: upstream fault", "op", "isSpaceMember", "err", err.Error())
 		return false
 	}
 	defer func() { _, _ = io.Copy(io.Discard, res.Body); _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if res.StatusCode >= 500 {
+			slog.Default().Warn("octoidentity: upstream fault", "op", "isSpaceMember", "status", res.StatusCode)
+		}
 		return false
 	}
 	var body verifyBody
