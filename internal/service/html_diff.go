@@ -1819,8 +1819,7 @@ func (c *diffLineConsumer) consumeNonText(token diffHTMLToken) bool {
 	}
 	switch token.type_ {
 	case xhtml.TextToken: // RCDATA/RAWTEXT content.
-		literal := isDiffLiteralRawTextTag(token.rawTextTag)
-		if !appendNormalizedDiffText(&c.lines, token.raw, literal, false, c.preformatted()) {
+		if !appendRawDiffText(&c.lines, token.raw) {
 			return false
 		}
 		c.fingerprint.transparent()
@@ -1892,6 +1891,17 @@ func isPreformattedContextAttrs(tag string, attrs map[string]string) (preserve, 
 		return true, true
 	}
 	return false, false
+}
+
+func appendRawDiffText(lines *[]diffSourceLine, text string) bool {
+	if text == "" {
+		return true
+	}
+	if len(*lines) >= maxDiffInputLines {
+		return false
+	}
+	*lines = append(*lines, newDiffSourceLine("raw", text, text))
+	return true
 }
 
 func appendNormalizedDiffText(lines *[]diffSourceLine, text string, literal, visible, preformatted bool) bool {

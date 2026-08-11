@@ -1323,6 +1323,35 @@ func assertVisibleAndValid(t *testing.T, before, after string) {
 // Raw-text (RCDATA/literal) content changes must surface, including when the
 // content holds a stray '<' that is text, not markup: the parser must scan to
 // the close tag rather than splitting the run into a spurious tag.
+func TestBuildVersionDiffRawTextSourceWhitespaceIsBytePreserving(t *testing.T) {
+	for _, tag := range []string{"script", "style", "textarea", "title", "pre"} {
+		for _, change := range []struct {
+			name          string
+			before, after string
+		}{
+			{name: "space", before: "a b", after: "a  b"},
+			{name: "tab", before: "a b", after: "a	b"},
+			{name: "newline", before: "a b", after: "a\nb"},
+		} {
+			t.Run(tag+"_"+change.name, func(t *testing.T) {
+				before := "<" + tag + ">" + change.before + "</" + tag + ">"
+				after := "<" + tag + ">" + change.after + "</" + tag + ">"
+				result, err := buildVersionDiff(1, 2, before, after)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.CodeHunks) == 0 {
+					t.Fatalf("%s source whitespace change missing from code hunks: %+v", tag, result)
+				}
+				body := hunksBody(result.CodeHunks)
+				if !strings.Contains(body, "-"+change.before) || !strings.Contains(body, "+"+change.after) {
+					t.Fatalf("%s source bytes missing from code hunks:\n%s", tag, body)
+				}
+			})
+		}
+	}
+}
+
 func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
 	assertStructuralChange := func(before, after string) {
 		t.Helper()
@@ -1351,12 +1380,13 @@ func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
 	collapsedCases := []struct {
 		name          string
 		before, after string
+		rawText       bool
 	}{
-		{"last_declaration_wins", `<div style="white-space: pre; white-space: normal">a b</div>`, `<div style="white-space: pre; white-space: normal">a  b</div>`},
-		{"important_wins", `<div style="white-space: normal !important; white-space: pre">a b</div>`, `<div style="white-space: normal !important; white-space: pre">a  b</div>`},
-		{"descendant_override", `<pre><code style="white-space: normal">a b</code></pre>`, `<pre><code style="white-space: normal">a  b</code></pre>`},
-		{"self_override", `<pre style="white-space: normal">a b</pre>`, `<pre style="white-space: normal">a  b</pre>`},
-		{"textarea_self_override", `<textarea style="white-space: normal">a b</textarea>`, `<textarea style="white-space: normal">a  b</textarea>`},
+		{"last_declaration_wins", `<div style="white-space: pre; white-space: normal">a b</div>`, `<div style="white-space: pre; white-space: normal">a  b</div>`, false},
+		{"important_wins", `<div style="white-space: normal !important; white-space: pre">a b</div>`, `<div style="white-space: normal !important; white-space: pre">a  b</div>`, false},
+		{"descendant_override", `<pre><code style="white-space: normal">a b</code></pre>`, `<pre><code style="white-space: normal">a  b</code></pre>`, false},
+		{"self_override", `<pre style="white-space: normal">a b</pre>`, `<pre style="white-space: normal">a  b</pre>`, false},
+		{"textarea_self_override", `<textarea style="white-space: normal">a b</textarea>`, `<textarea style="white-space: normal">a  b</textarea>`, true},
 	}
 	for _, test := range collapsedCases {
 		t.Run(test.name, func(t *testing.T) {
@@ -1367,10 +1397,14 @@ func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
 			if len(result.Changes) != 0 || result.Summary.Modified != 0 {
 				t.Fatalf("CSS-collapsible whitespace became structural: %+v", result)
 			}
-			// Both output fields must agree; a silent structural diff beside a
-			// non-empty hunk is a self-contradicting response.
+			if test.rawText {
+				if len(result.CodeHunks) == 0 {
+					t.Fatalf("raw source whitespace missing from code hunks: %+v", result)
+				}
+				return
+			}
 			if len(result.CodeHunks) != 0 {
-				t.Fatalf("collapsible whitespace surfaced in code hunks only: %+v", result)
+				t.Fatalf("collapsible ordinary text surfaced in code hunks: %+v", result)
 			}
 		})
 	}
