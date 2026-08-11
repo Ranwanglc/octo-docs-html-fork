@@ -56,6 +56,76 @@ func TestVerifyTokenOK(t *testing.T) {
 	}
 }
 
+func TestHTTPIdentityRejectsEveryRedirectWithoutForwardingToken(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			targetCalls := 0
+			target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				targetCalls++
+				body, _ := io.ReadAll(r.Body)
+				if strings.Contains(r.Header.Get("token")+string(body), "secret") {
+					t.Error("redirect target received a user or service token")
+				}
+			}))
+			defer target.Close()
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", target.URL+"/stolen")
+				w.WriteHeader(status)
+			}))
+			defer source.Close()
+
+			id := octoidentity.New(source.URL, "service-secret", time.Second)
+			_, _ = id.VerifyToken(context.Background(), "user-secret")
+			_, _ = id.VerifyBot(context.Background(), "bot-secret")
+			_, _ = id.GetUser(context.Background(), "u1", "caller-secret")
+			_ = id.IsSpaceMember(context.Background(), "u1", "s1", "member-secret")
+			if targetCalls != 0 {
+				t.Fatalf("redirect target calls = %d, want 0", targetCalls)
+			}
+		})
+	}
+}
+
+func TestIsSpaceMemberUsesContextVerify(t *testing.T) {
+	srv := newStub(t, map[string]http.HandlerFunc{
+		"POST /v1/auth/verify": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.RawQuery != "include=context" {
+				t.Errorf("query = %q", r.URL.RawQuery)
+			}
+			body, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(body), `"token":"user-token"`) {
+				t.Errorf("body = %s", body)
+			}
+			_, _ = io.WriteString(w, `{"uid":"u1","context_included":true,"spaces":["s1"]}`)
+		},
+	})
+	defer srv.Close()
+	id := octoidentity.New(srv.URL, "", time.Second)
+	if !id.IsSpaceMember(context.Background(), "u1", "s1", "user-token") {
+		t.Fatal("expected confirmed membership")
+	}
+	if id.IsSpaceMember(context.Background(), "other", "s1", "user-token") {
+		t.Fatal("uid mismatch must fail closed")
+	}
+}
+
+func TestIsSpaceMemberFailsClosedWithoutTokenOrContext(t *testing.T) {
+	id := octoidentity.New("http://127.0.0.1:1", "", time.Second)
+	if id.IsSpaceMember(context.Background(), "u1", "s1", "") {
+		t.Fatal("missing token must fail closed")
+	}
+	srv := newStub(t, map[string]http.HandlerFunc{
+		"POST /v1/auth/verify": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"uid":"u1"}`)
+		},
+	})
+	defer srv.Close()
+	id = octoidentity.New(srv.URL, "", time.Second)
+	if id.IsSpaceMember(context.Background(), "u1", "s1", "user-token") {
+		t.Fatal("missing context must fail closed")
+	}
+}
+
 func TestVerifyTokenNon2xxReturnsNil(t *testing.T) {
 	srv := newStub(t, map[string]http.HandlerFunc{
 		"POST /v1/auth/verify": func(w http.ResponseWriter, _ *http.Request) {
@@ -280,6 +350,9 @@ func (s stubIdentity) VerifyBot(_ context.Context, _ string) (*octoidentity.BotI
 }
 func (s stubIdentity) GetUser(_ context.Context, uid, _ string) (*octoidentity.User, error) {
 	return &octoidentity.User{UID: uid}, nil
+}
+func (s stubIdentity) IsSpaceMember(_ context.Context, uid, _, token string) bool {
+	return uid == s.uid && token != ""
 }
 
 // captureWarns swaps slog.Default() for a JSON handler over a byte buffer so

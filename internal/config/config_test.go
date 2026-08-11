@@ -137,12 +137,13 @@ func TestLoadDocsBackendRegisterKnobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DocsBackendRegisterURL != "" || cfg.DocsBackendRegisterToken != "" {
-		t.Fatalf("unset docs-backend register config = url %q token %q", cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken)
+	if cfg.DocsBackendRegisterURL != "" || cfg.DocsBackendRegisterToken != "" || cfg.DocsBackendInternalRegisterToken != "" {
+		t.Fatalf("unset docs-backend register config = url %q bot token %q internal token %q", cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken)
 	}
 
 	t.Setenv("DOCS_BACKEND_REGISTER_URL", "https://docs-backend.example.com/v1/bot/docs/")
 	t.Setenv("DOCS_BACKEND_REGISTER_TOKEN", "bot-token")
+	t.Setenv("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN", "internal-token")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
@@ -152,6 +153,9 @@ func TestLoadDocsBackendRegisterKnobs(t *testing.T) {
 	}
 	if cfg.DocsBackendRegisterToken != "bot-token" {
 		t.Errorf("DOCS_BACKEND_REGISTER_TOKEN = %q", cfg.DocsBackendRegisterToken)
+	}
+	if cfg.DocsBackendInternalRegisterToken != "internal-token" {
+		t.Errorf("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN = %q", cfg.DocsBackendInternalRegisterToken)
 	}
 }
 

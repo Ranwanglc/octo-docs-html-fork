@@ -69,6 +69,7 @@ services:
       # Empty ⇒ disabled (no error, but published docs won't appear in the sidebar).
       DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
       DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
+      DOCS_BACKEND_INTERNAL_REGISTER_TOKEN: ${DOCS_BACKEND_INTERNAL_REGISTER_TOKEN:-}
 
       # ── Production-safe auth default ────────────────────────────────────────
       # Base compose defaults ALLOW_BOOTSTRAP=true (dev convenience); force false.

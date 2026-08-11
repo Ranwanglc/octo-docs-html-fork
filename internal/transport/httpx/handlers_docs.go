@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
@@ -31,6 +32,8 @@ type publishBody struct {
 	MountTypePresent bool
 	GroupNo          string
 	ThreadID         string
+	SpaceID          string
+	SpaceIDPresent   bool
 }
 
 func (s *Server) readPublishBody(w http.ResponseWriter, r *http.Request) (publishBody, error) {
@@ -55,6 +58,8 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	_, b.MountTypePresent = r.MultipartForm.Value["mount_type"]
 	b.GroupNo = r.FormValue("group_no")
 	b.ThreadID = r.FormValue("thread_id")
+	b.SpaceID = r.FormValue("space_id")
+	_, b.SpaceIDPresent = r.MultipartForm.Value["space_id"]
 	if file, _, err := r.FormFile("file"); err == nil {
 		defer func() { _ = file.Close() }()
 		data, rerr := io.ReadAll(file)
@@ -83,6 +88,7 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		MountType *string `json:"mount_type"`
 		GroupNo   string  `json:"group_no"`
 		ThreadID  string  `json:"thread_id"`
+		SpaceID   *string `json:"space_id"`
 	}
 	if r.Body != nil {
 		// Publish bodies carry the document HTML, so cap at the HTML limit plus JSON
@@ -108,6 +114,10 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 	body := publishBody{
 		Slug: raw.Slug, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
 		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
+	}
+	if raw.SpaceID != nil {
+		body.SpaceID = *raw.SpaceID
+		body.SpaceIDPresent = true
 	}
 	if raw.MountType != nil {
 		body.MountType = *raw.MountType
@@ -147,12 +157,30 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
+	spaceID := ""
+	if userPublish {
+		spaceID = strings.TrimSpace(body.SpaceID)
+		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
+			return apperr.Validation("valid space_id required", "space_id_invalid")
+		}
+		provider, providerErr := octoidentity.Get()
+		if providerErr != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", providerErr)
+		}
+		if !provider.IsSpaceMember(r.Context(), creatorUID, spaceID, userToken(r)) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+	}
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
-		CreatorUID:     creatorUID,
-		PublisherToken: botTokenFromCtx(r.Context()),
+		CreatorUID:          creatorUID,
+		PublisherToken:      botTokenFromCtx(r.Context()),
+		SpaceID:             spaceID,
+		UserPublish:         userPublish,
+		AuthorizeProvenance: s.provenanceAuthorizer(r),
 	}, func(exists bool) error {
 		if !exists {
 			return nil
@@ -182,7 +210,30 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	}
 	// Stamp creator on first draft (draft-first create) with the same owner rule
 	// as publish, so the draft's author survives into the promoted version.
-	res, err := s.docs.SaveDraft(r.Context(), slug, body.HTML, body.Title, creatorUIDFromCtx(r.Context()))
+	creatorUID := creatorUIDFromCtx(r.Context())
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
+	spaceID := ""
+	if userPublish {
+		spaceID = strings.TrimSpace(body.SpaceID)
+		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
+			return apperr.Validation("valid space_id required", "space_id_invalid")
+		}
+		provider, providerErr := octoidentity.Get()
+		if providerErr != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", providerErr)
+		}
+		if !provider.IsSpaceMember(r.Context(), creatorUID, spaceID, userToken(r)) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+	}
+	res, err := s.docs.SaveDraftWithProvenance(r.Context(), slug, body.HTML, body.Title, service.PublishInput{
+		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
+		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
+		CreatorUID:          creatorUID,
+		UserPublish:         userPublish,
+		SpaceID:             spaceID,
+		AuthorizeProvenance: s.provenanceAuthorizer(r),
+	})
 	if err != nil {
 		return err
 	}
@@ -204,12 +255,41 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&raw)
 	}
-	res, err := s.docs.Promote(r.Context(), slug, raw.Title)
+	res, err := s.docs.PromoteAuthorized(r.Context(), slug, raw.Title, s.provenanceAuthorizer(r))
 	if err != nil {
 		return err
 	}
 	writeData(w, 200, res)
 	return nil
+}
+
+func (s *Server) provenanceAuthorizer(r *http.Request) service.ProvenanceAuthorizer {
+	if bot := botSessionFromCtx(r.Context()); bot != nil {
+		spaceID := botSpaceFromCtx(r.Context())
+		return func(_ context.Context, provenance service.PublishProvenance) error {
+			if !provenance.UserPublish {
+				return nil
+			}
+			if bot.OwnerUID != provenance.CreatorUID || spaceID != provenance.SpaceID {
+				return apperr.Forbidden("space membership required", "space_membership_required")
+			}
+			return nil
+		}
+	}
+	uid, token := creatorUIDFromCtx(r.Context()), userToken(r)
+	return func(ctx context.Context, provenance service.PublishProvenance) error {
+		if !provenance.UserPublish {
+			return nil
+		}
+		provider, err := octoidentity.Get()
+		if err != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", err)
+		}
+		if !provider.IsSpaceMember(ctx, uid, provenance.SpaceID, token) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+		return nil
+	}
 }
 
 // handleRenderDraft renders the draft slot (GET/HEAD /d/{slug}/draft) with the
@@ -343,7 +423,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.docs.Remove(r.Context(), slug); err != nil {
+	if err := s.docs.RemoveAuthorized(r.Context(), slug, s.provenanceAuthorizer(r)); err != nil {
 		return err
 	}
 	writeData(w, 200, struct{}{})

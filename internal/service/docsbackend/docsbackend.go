@@ -26,6 +26,7 @@ type Registration struct {
 	Title       string `json:"title,omitempty"`
 	Owner       string `json:"owner,omitempty"`
 	SpaceID     string `json:"spaceId,omitempty"`
+	Internal    bool   `json:"-"`
 }
 
 // RegistrationResult is the canonical docs-backend response for HTML doc
@@ -46,19 +47,20 @@ type Rename struct {
 // Client posts registration mutations. Empty URL returns nil from New; all
 // methods are nil-safe and never return errors to callers.
 type Client struct {
-	registerURL string
-	token       string
-	http        *http.Client
-	logger      *slog.Logger
+	registerURL   string
+	botToken      string
+	internalToken string
+	http          *http.Client
+	logger        *slog.Logger
 }
 
 // New wires the registrar. registerURL is the full POST endpoint, usually
 // <docs-backend>/v1/bot/docs. token is sent as a bot Bearer token.
-func New(registerURL, token string, logger *slog.Logger) *Client {
-	return newWithTimeout(registerURL, token, defaultTimeout, logger)
+func New(registerURL, botToken, internalToken string, logger *slog.Logger) *Client {
+	return newWithTimeout(registerURL, botToken, internalToken, defaultTimeout, logger)
 }
 
-func newWithTimeout(registerURL, token string, timeout time.Duration, logger *slog.Logger) *Client {
+func newWithTimeout(registerURL, botToken, internalToken string, timeout time.Duration, logger *slog.Logger) *Client {
 	registerURL = strings.TrimRight(strings.TrimSpace(registerURL), "/")
 	if registerURL == "" {
 		return nil
@@ -70,10 +72,13 @@ func newWithTimeout(registerURL, token string, timeout time.Duration, logger *sl
 		logger = slog.Default()
 	}
 	return &Client{
-		registerURL: registerURL,
-		token:       strings.TrimSpace(token),
-		http:        &http.Client{Timeout: timeout},
-		logger:      logger,
+		registerURL:   registerURL,
+		botToken:      strings.TrimSpace(botToken),
+		internalToken: strings.TrimSpace(internalToken),
+		http: &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+		logger: logger,
 	}
 }
 
@@ -82,7 +87,14 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	if c == nil {
 		return nil, fmt.Errorf("docs-backend registrar is disabled")
 	}
-	body, err := c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register", token)
+	endpoint := c.registerURL
+	if reg.Internal {
+		endpoint = internalRegisterURL(endpoint)
+		if c.internalToken == "" {
+			return nil, fmt.Errorf("docs-backend internal register token is not configured")
+		}
+	}
+	body, err := c.doJSON(ctx, http.MethodPost, endpoint, reg, reg.OctoDocSlug, "register", token, reg.Internal)
 	if err != nil {
 		return nil, err
 	}
@@ -99,13 +111,20 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	return &result, nil
 }
 
+func internalRegisterURL(registerURL string) string {
+	if strings.HasSuffix(registerURL, "/v1/bot/docs") {
+		return strings.TrimSuffix(registerURL, "/v1/bot/docs") + "/internal/html/register"
+	}
+	return strings.TrimRight(registerURL, "/") + "/internal/html/register"
+}
+
 // Rename PATCHes the registered title by octo-doc slug. token is the publishing
 // bot's own bearer token; empty falls back to the process-configured token.
 func (c *Client) Rename(ctx context.Context, slug, title, token string) {
 	if c == nil {
 		return
 	}
-	_, _ = c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename", token)
+	_, _ = c.doJSON(ctx, http.MethodPatch, c.octoDocURL(slug), Rename{Title: title}, slug, "rename", token, false)
 }
 
 // Delete removes the registered docs-backend row by octo-doc slug. Delete is
@@ -115,14 +134,14 @@ func (c *Client) Delete(ctx context.Context, slug, token string) {
 	if c == nil {
 		return
 	}
-	_, _ = c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token)
+	_, _ = c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token, false)
 }
 
 func (c *Client) octoDocURL(slug string) string {
 	return c.registerURL + "/octo-doc/" + url.PathEscape(slug)
 }
 
-func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string) ([]byte, error) {
+func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string, internal bool) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -150,11 +169,15 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 	// Prefer the publishing bot's own token so docs-backend attributes the doc to
 	// whoever published it; fall back to the process-configured token when the
 	// caller had none (e.g. the by-slug delete path).
-	authToken := token
-	if authToken == "" {
-		authToken = c.token
+	if internal {
+		req.Header.Set("X-Internal-Token", c.internalToken)
+	} else {
+		authToken := token
+		if authToken == "" {
+			authToken = c.botToken
+		}
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
-	req.Header.Set("Authorization", "Bearer "+authToken)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

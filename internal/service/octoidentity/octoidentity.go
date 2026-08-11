@@ -57,6 +57,8 @@ type Identity interface {
 	// header when no service token is configured. Same nil-nil contract as
 	// VerifyToken on 404/unreachable/malformed.
 	GetUser(ctx context.Context, uid, callerToken string) (*User, error)
+	// IsSpaceMember verifies the token holder's uid and active space context.
+	IsSpaceMember(ctx context.Context, uid, spaceID, token string) bool
 }
 
 // HTTPIdentity talks to octo-server over HTTP. Zero-value is not usable — go
@@ -76,16 +78,59 @@ func New(baseURL, serviceToken string, timeout time.Duration) *HTTPIdentity {
 	return &HTTPIdentity{
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		serviceToken: serviceToken,
-		client:       &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
 // verifyBody mirrors octo-server modules/user/api.go authVerifyToken response.
 // role and owned_bots are surfaced by the server; doc only cares about role.
 type verifyBody struct {
-	UID  string `json:"uid"`
-	Name string `json:"name"`
-	Role string `json:"role"`
+	UID             string   `json:"uid"`
+	Name            string   `json:"name"`
+	Role            string   `json:"role"`
+	ContextIncluded bool     `json:"context_included"`
+	Spaces          []string `json:"spaces"`
+}
+
+// IsSpaceMember uses the caller's token against the authoritative context-aware
+// verify endpoint. Every incomplete or failed response is denied.
+func (h *HTTPIdentity) IsSpaceMember(ctx context.Context, uid, spaceID, token string) bool {
+	if uid == "" || spaceID == "" || token == "" {
+		return false
+	}
+	payload, _ := json.Marshal(map[string]string{"token": token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL+"/v1/auth/verify?include=context", strings.NewReader(string(payload)))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := h.client.Do(req)
+	if err != nil {
+		slog.Default().Warn("octoidentity: upstream fault", "op", "isSpaceMember", "err", err.Error())
+		return false
+	}
+	defer func() { _, _ = io.Copy(io.Discard, res.Body); _ = res.Body.Close() }()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if res.StatusCode >= 500 {
+			slog.Default().Warn("octoidentity: upstream fault", "op", "isSpaceMember", "status", res.StatusCode)
+		}
+		return false
+	}
+	var body verifyBody
+	if json.NewDecoder(res.Body).Decode(&body) != nil || body.UID != uid || !body.ContextIncluded || body.Spaces == nil {
+		return false
+	}
+	for _, candidate := range body.Spaces {
+		if candidate == spaceID {
+			return true
+		}
+	}
+	return false
 }
 
 // VerifyToken → POST /v1/auth/verify {token}. Unauthenticated / network

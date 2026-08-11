@@ -74,7 +74,7 @@ func (s *Server) handleAgentElementReplace(w http.ResponseWriter, r *http.Reques
 	if body.NewHTML == "" {
 		return apperr.Validation("new_html required", "new_html_required")
 	}
-	res, err := s.docs.ReplaceElement(r.Context(), slug, body.BaseVersion, body.AID, body.NewHTML)
+	res, err := s.docs.ReplaceElementAuthorized(r.Context(), slug, body.BaseVersion, body.AID, body.NewHTML, s.provenanceAuthorizer(r))
 	if err != nil {
 		return err
 	}

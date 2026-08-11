@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 )
@@ -29,6 +30,20 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// Publish provenance keys persist registration identity and mount details.
+const (
+	UserPublishExtraKey               = "user_publish"
+	SpaceIDExtraKey                   = "space_id"
+	GroupNoExtraKey                   = "group_no"
+	ThreadIDExtraKey                  = "thread_id"
+	DocsBackendDocIDExtraKey          = "docs_backend_doc_id"
+	DocsBackendRegistrationStateKey   = "docs_backend_registration_state"
+	DocsBackendRegistrationVersionKey = "docs_backend_registration_version"
+	DocsBackendRegistrationLocalOnly  = "local_only"
+	DocsBackendRegistrationPending    = "pending"
+	DocsBackendRegistrationRegistered = "registered"
+)
+
 // CreatorUID returns the creating uid stored under Extra, or "" when absent
 // (legacy docs / no creator recorded ⇒ nobody is author by ownership).
 func (m *DocMeta) CreatorUID() string {
@@ -48,6 +63,41 @@ func (m *DocMeta) MountType() (string, bool) {
 	}
 	mountType, ok := m.Extra[MountTypeExtraKey].(string)
 	return mountType, ok
+}
+
+// PublishProvenance returns the persisted docs-backend registration context.
+func (m *DocMeta) PublishProvenance() (userPublish bool, spaceID, groupNo, threadID string) {
+	if m == nil || m.Extra == nil {
+		return false, "", "", ""
+	}
+	userPublish, _ = m.Extra[UserPublishExtraKey].(bool)
+	spaceID, _ = m.Extra[SpaceIDExtraKey].(string)
+	groupNo, _ = m.Extra[GroupNoExtraKey].(string)
+	threadID, _ = m.Extra[ThreadIDExtraKey].(string)
+	return
+}
+
+// DocsBackendRegistration returns the durable registration state, doc id, and
+// version whose registration attempt owns that state.
+func (m *DocMeta) DocsBackendRegistration() (state, docID string, version int) {
+	if m == nil || m.Extra == nil {
+		return "", "", 0
+	}
+	state, _ = m.Extra[DocsBackendRegistrationStateKey].(string)
+	docID, _ = m.Extra[DocsBackendDocIDExtraKey].(string)
+	version = extraInt(m.Extra[DocsBackendRegistrationVersionKey])
+	return strings.TrimSpace(state), strings.TrimSpace(docID), version
+}
+
+func extraInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
 }
 
 // GrantsExtraKey is the DocMeta.Extra key holding per-uid access grants: a
