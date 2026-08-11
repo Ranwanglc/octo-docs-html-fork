@@ -423,7 +423,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.docs.Remove(r.Context(), slug); err != nil {
+	if err := s.docs.RemoveAuthorized(r.Context(), slug, s.provenanceAuthorizer(r)); err != nil {
 		return err
 	}
 	writeData(w, 200, struct{}{})

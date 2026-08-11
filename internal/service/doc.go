@@ -898,7 +898,8 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, 
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
 func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev *storage.DocMeta, provenance PublishInput) error {
-	if prev == nil {
+	newMeta := prev == nil
+	if newMeta {
 		prev = &storage.DocMeta{Slug: slug, Title: slug, Versions: []storage.VersionRef{}}
 	}
 	metaTitle := prev.Title
@@ -917,6 +918,9 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev 
 	if provenance.UserPublish {
 		extra[storage.UserPublishExtraKey] = true
 		extra[storage.SpaceIDExtraKey] = provenance.SpaceID
+		if state, _, _ := prev.DocsBackendRegistration(); newMeta && state == "" {
+			extra[storage.DocsBackendRegistrationStateKey] = storage.DocsBackendRegistrationLocalOnly
+		}
 	}
 	if provenance.MountTypePresent {
 		extra[storage.MountTypeExtraKey] = provenance.MountType
@@ -1006,19 +1010,35 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 	return &VersionList{Slug: slug, Title: title, Versions: versions}, nil
 }
 
-// Remove deletes all versions, metadata, and comments for a slug. It holds the
-// per-slug lock across all three deletes so it is serialized against a concurrent
-// Publish of the same slug (which holds the same lock); otherwise a delete could
-// interleave with a publish and leave orphaned blobs or meta pointing at a
-// missing blob.
+// Remove deletes legacy/Bot documents. User-owned callers should use
+// RemoveAuthorized so persisted provenance is checked before local cleanup.
 func (s *DocService) Remove(ctx context.Context, slug string) error {
+	return s.RemoveAuthorized(ctx, slug, nil)
+}
+
+// RemoveAuthorized deletes user-owned documents only when they were never
+// registered in docs-backend; registered documents must start deletion there.
+func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, authorize ProvenanceAuthorizer) error {
+	userDocument := false
 	err := s.lock.With(ctx, slug, func() error {
 		meta, metaErr := s.meta.GetMeta(ctx, slug)
 		if metaErr != nil {
 			return metaErr
 		}
-		if userPublish, _, _, _ := meta.PublishProvenance(); userPublish {
-			return apperr.Conflict("user-published documents must be deleted through docs-backend", "user_publish_delete_unsupported")
+		userPublish, spaceID, _, _ := meta.PublishProvenance()
+		userDocument = userPublish
+		if userPublish {
+			provenance := PublishProvenance{UserPublish: true, SpaceID: spaceID, CreatorUID: meta.CreatorUID()}
+			if authorize == nil {
+				return apperr.Forbidden("user publish provenance authorization required", "space_membership_required")
+			}
+			if authErr := authorize(ctx, provenance); authErr != nil {
+				return authErr
+			}
+			state, docID, _ := meta.DocsBackendRegistration()
+			if state != storage.DocsBackendRegistrationLocalOnly || docID != "" {
+				return apperr.Conflict("registered or unconfirmed user documents must be deleted through docs-backend", "user_publish_delete_via_backend")
+			}
 		}
 		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
 			return err
@@ -1044,8 +1064,42 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 	if err != nil {
 		return err
 	}
-	s.afterRemoved(slug)
+	if !userDocument {
+		s.afterRemoved(slug)
+	}
 	return nil
+}
+
+func (s *DocService) setDocsBackendRegistrationState(ctx context.Context, slug, state, docID string, version int) bool {
+	updated := false
+	err := s.lock.With(ctx, slug, func() error {
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("metadata missing")
+		}
+		currentState, currentDocID, currentVersion := meta.DocsBackendRegistration()
+		if currentState != storage.DocsBackendRegistrationPending || currentDocID != "" || currentVersion != version {
+			return fmt.Errorf("registration state changed to %q at version %d", currentState, currentVersion)
+		}
+		if meta.Extra == nil {
+			meta.Extra = map[string]any{}
+		}
+		meta.Extra[storage.DocsBackendRegistrationStateKey] = state
+		meta.Extra[storage.DocsBackendRegistrationVersionKey] = version
+		meta.Extra[storage.DocsBackendDocIDExtraKey] = docID
+		if err = s.meta.PutMeta(ctx, slug, *meta); err != nil {
+			return err
+		}
+		updated = true
+		return nil
+	})
+	if err != nil {
+		s.log().Warn("docs_backend_registration_state failed after publish", "slug", slug, "err", err.Error())
+	}
+	return updated
 }
 
 func (s *DocService) afterPublished(parent context.Context, result *PublishResult) {
@@ -1105,6 +1159,12 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 	result.URL = registration.ShareURL
 	result.ShareURL = registration.ShareURL
 	result.Registered = true
+	if result.userPublish {
+		if !s.setDocsBackendRegistrationState(parent, result.Slug, storage.DocsBackendRegistrationRegistered, registration.DocID, result.Version) {
+			result.Status = publishStatusRegisterFailed
+			return
+		}
+	}
 	if result.hadMeta && result.titleChanged && !result.userPublish {
 		s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
 	}
@@ -1324,6 +1384,9 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	if in.UserPublish {
 		extra[storage.UserPublishExtraKey] = true
 		extra[storage.SpaceIDExtraKey] = in.SpaceID
+		extra[storage.DocsBackendRegistrationStateKey] = storage.DocsBackendRegistrationPending
+		extra[storage.DocsBackendRegistrationVersionKey] = version
+		delete(extra, storage.DocsBackendDocIDExtraKey)
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
