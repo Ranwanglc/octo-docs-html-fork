@@ -94,6 +94,9 @@ type Config struct {
 	// DocsBackendRegisterToken is the bot Bearer token used for registration
 	// calls and the matching binding lookup. Never logged.
 	DocsBackendRegisterToken string
+	// DocsHTMLDelegationSecret signs human HTML deletes delegated to docs-backend.
+	// Empty disables delegated human delete; it never falls back to a bot token.
+	DocsHTMLDelegationSecret string
 	// TrustProxyHeaders enables honoring X-Forwarded-For / X-Real-IP for the client
 	// IP (rate limiting). Enable ONLY when the server sits behind a trusted reverse
 	// proxy that sets these; otherwise a client can spoof them to evade limits.
@@ -166,6 +169,7 @@ func Load() (*Config, error) {
 		OctoDocEventWebhookToken: env("OCTO_DOC_EVENT_WEBHOOK_TOKEN", ""),
 		DocsBackendRegisterURL:   strings.TrimRight(strings.TrimSpace(env("DOCS_BACKEND_REGISTER_URL", "")), "/"),
 		DocsBackendRegisterToken: env("DOCS_BACKEND_REGISTER_TOKEN", ""),
+		DocsHTMLDelegationSecret: env("DOCS_HTML_DELEGATION_SECRET", ""),
 
 		TrustProxyHeaders: envBool("TRUST_PROXY_HEADERS", false),
 		CORSOrigins:       splitList(env("CORS_ORIGINS", "")),
@@ -284,6 +288,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitMax < 0 {
 		problems = append(problems, fmt.Sprintf("RATE_LIMIT_MAX must be >= 0, got %d", c.RateLimitMax))
+	}
+	if c.DocsHTMLDelegationSecret != "" && len([]byte(c.DocsHTMLDelegationSecret)) < 32 {
+		problems = append(problems, "DOCS_HTML_DELEGATION_SECRET must be at least 32 bytes when configured")
 	}
 	if c.MaxHTMLBytes <= 0 {
 		problems = append(problems, fmt.Sprintf("MAX_HTML_BYTES must be positive, got %d", c.MaxHTMLBytes))

@@ -110,7 +110,7 @@ the server behaves as a standalone deploy.
 | **Login (http provider)** | `OCTO_SERVER_BASE_URL`, `LOGIN_ENABLED` | `/v1/auth/login` verifies a viewer against octo-server and populates the session |
 | **Bot-token auth** | `BOT_AUTH_ENABLED` (+ `OCTO_SERVER_BASE_URL`) | accepts an Octo bot token; the bot's owner uid becomes the doc creator/author |
 | **Doc-binding channel** | `OCTO_DOC_BINDING_URL`, `OCTO_DOC_BINDING_TTL_MS` | asks octo-server whether a uid may see a slug's binding (per-uid visibility), cached briefly |
-| **Web-docs registration** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN` | registers each published HTML doc into the docs-backend sidebar |
+| **Web-docs registration/delete** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN`, `DOCS_HTML_DELEGATION_SECRET` | registers HTML docs; bot deletes use the request bot token, while human owner/admin/superAdmin deletes use HMAC delegation (secret must match docs-backend, at least 32 bytes) |
 | **Comment-event webhook** | `OCTO_WEBHOOK_URL`, `OCTO_DOC_EVENT_WEBHOOK_TOKEN` | pushes new-comment events to Octo IM (token required, sent as `X-Octo-Doc-Webhook-Token`) |
 | **Superadmin/owner** | `OWNER` | designates which signed-in Login sees the `/me` catalog |
 
@@ -125,14 +125,19 @@ and promoting the draft mints an immutable version. The client
 ```bash
 export BASE=https://docs.example.com
 
-# Save HTML as a private draft, then promote it to an immutable version:
-curl -H "Content-Type: application/json" \
-  -d '{"slug":"explainer","html":"<html><body><h1>Hi</h1></body></html>"}' \
-  "$BASE/v1/docs"                                    # → /d/explainer/v/1
+# Create a private canonical draft, then promote it to an immutable version.
+# Save data.doc_id from the 201 response and use it for all later operations:
+CREATE=$(curl -sS -H "Authorization: Bearer ${OCTO_BOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"idempotency_key":"agent-run-123","html":"<html><body><h1>Hi</h1></body></html>"}' \
+  "$BASE/v1/docs/draft")
+DOC_ID=$(printf '%s' "$CREATE" | jq -r '.data.doc_id')
+curl -H "Authorization: Bearer ${OCTO_BOT_TOKEN}" -H "Content-Type: application/json" \
+  -d '{}' "$BASE/v1/docs/$DOC_ID/draft/promote"       # → /d/$DOC_ID/v/1
 
 # Mint a per-doc read-only share code:
-curl -X POST "$BASE/v1/docs/explainer/share"
-#   → { "data": { "code": "…", "url": ".../d/explainer/v/1?code=***" } }
+curl -X POST -H "Authorization: Bearer ${OCTO_BOT_TOKEN}" "$BASE/v1/docs/$DOC_ID/share"
+#   → { "data": { "code": "…", "url": ".../d/<doc-id>/v/1?code=***" } }
 ```
 
 Authenticate as the creator via an Octo session/bot token (see
@@ -159,6 +164,12 @@ agent element get/replace).
 | `MAX_ASSET_BYTES` | `26214400` | per-asset size cap (25 MiB) |
 
 Octo-integration variables are listed under [Octo integration](#octo-integration).
+
+After canonical content is persisted, the server synchronously notifies
+`docs-backend` using the publishing bot's token. Delivery is best-effort:
+transient failures receive a bounded number of retries, each with its own timeout,
+but there is no eventual-delivery guarantee after the request returns. A failed
+notification never rolls back durable HTML or creates another document version.
 
 The server binary `cmd/octo-doc` exposes these subcommands:
 

@@ -226,9 +226,14 @@ advisory-lock implementation, documented in [DESIGN.md](./DESIGN.md).
 ## Request lifecycle (publish)
 
 ```
-POST /v1/docs  (Authorization: Bearer <token>, multipart or JSON)
+POST /v1/docs  (Authorization: Bearer *** multipart or JSON)
+	Canonical create: `{idempotency_key, html, ...}` with no `slug`. The server
+	synchronously obtains a doc ID before writing and stores everything under it.
+	A request carrying `slug` addresses that exact existing local ref instead;
+	legacy first-create-by-slug remains deprecated compatibility behavior only.
   ├─ requireWriteAuth         constant-time token check
   ├─ size cap check           (MAX_HTML_BYTES, default 5 MiB)
+  ├─ canonical create registration (before local writes; mounted or unmounted)
   ├─ next version = max(blobStore.listVersions)+1   (if not explicit)
   ├─ stampAids(html)          identity-stamp artifacts (verbatim port)
   ├─ blobStore.putDoc         immutable write + head-verify

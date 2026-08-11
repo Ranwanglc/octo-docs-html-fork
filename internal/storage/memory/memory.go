@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
@@ -25,6 +26,7 @@ type Store struct {
 	blobs     map[string]string            // "slug\x00version" -> html
 	assets    map[string][]byte            // "slug\x00sha256" -> bytes
 	assetMeta map[string]storage.AssetMeta // "slug\x00sha256" -> meta
+	locker    sluglock.Locker
 }
 
 type sessionEntry struct {
@@ -42,8 +44,13 @@ func New() *Store {
 		blobs:     map[string]string{},
 		assets:    map[string][]byte{},
 		assetMeta: map[string]storage.AssetMeta{},
+		locker:    sluglock.NewMemory(),
 	}
 }
+
+// Locker returns the store-scoped lock primitive. Production stores expose the
+// same method using database advisory locks shared across replicas.
+func (s *Store) Locker() sluglock.Locker { return s.locker }
 
 // --- MetadataStore ---
 

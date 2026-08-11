@@ -34,7 +34,7 @@ func (r *noopRegistrar) Register(_ context.Context, reg docsbackend.Registration
 func (r *noopRegistrar) Rename(context.Context, string, string, string) {
 	r.renamed.Add(1)
 }
-func (*noopRegistrar) Delete(context.Context, string, string) {}
+func (*noopRegistrar) Delete(context.Context, string, string) error { return nil }
 
 // afterPublished invokes the injected reconciler after confirmed registration
 // so grants written during the post-commit registration gap survive A4.
@@ -67,8 +67,8 @@ func TestAfterPublishedTriggersGrantReconciler(t *testing.T) {
 	if got := called.Load(); got != 1 {
 		t.Fatalf("reconciler called %d times; want 1", got)
 	}
-	if got := registrar.registered.Load(); got != 1 {
-		t.Fatalf("registrar called %d times; want 1 (reconcile must run only after Register)", got)
+	if got := registrar.registered.Load(); got != 0 {
+		t.Fatalf("registrar called %d times; want 0 for an existing ref", got)
 	}
 	if got, _ := seenSlug.Load().(string); got != "docGap" {
 		t.Fatalf("reconciler saw slug %q; want docGap", got)
@@ -115,8 +115,8 @@ func TestAfterPublishedThreadMountTriggersReconciler(t *testing.T) {
 	if called.Load() != 1 {
 		t.Fatalf("reconciler calls = %d; want 1", called.Load())
 	}
-	if registrar.registered.Load() != 1 {
-		t.Fatalf("register calls = %d; want 1", registrar.registered.Load())
+	if registrar.registered.Load() != 0 {
+		t.Fatalf("register calls = %d; want 0", registrar.registered.Load())
 	}
 }
 
@@ -160,11 +160,11 @@ func TestReplaceElementRestoresPersistedMountContext(t *testing.T) {
 			if err != nil {
 				t.Fatalf("replace: %v", err)
 			}
-			if !result.Registered || result.Status != "published" {
+			if result.Registered || result.Status != "published" {
 				t.Fatalf("replace registration = registered:%v status:%q", result.Registered, result.Status)
 			}
-			if got := registrar.registered.Load(); got != 2 {
-				t.Fatalf("register calls = %d; want 2", got)
+			if got := registrar.registered.Load(); got != 0 {
+				t.Fatalf("register calls = %d; want 0", got)
 			}
 			if got := reconciled.Load(); got != 2 {
 				t.Fatalf("reconcile calls = %d; want 2", got)
@@ -200,11 +200,11 @@ func TestPublishOmittedMountRestoresPersistedMountContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("republish: %v", err)
 	}
-	if !result.Registered || result.Status != "published" {
+	if result.Registered || result.Status != "published" {
 		t.Fatalf("republish registration = registered:%v status:%q", result.Registered, result.Status)
 	}
-	if got := registrar.registered.Load(); got != 2 {
-		t.Fatalf("register calls = %d; want 2", got)
+	if got := registrar.registered.Load(); got != 0 {
+		t.Fatalf("register calls = %d; want 0", got)
 	}
 	meta, err := store.GetMeta(ctx, "republish-mounted")
 	if err != nil {
@@ -235,7 +235,7 @@ func TestPublishExplicitEmptyMountPreservesExistingMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("republish: %v", err)
 	}
-	if !result.Registered || result.Status != "published" {
+	if result.Registered || result.Status != "published" {
 		t.Fatalf("republish registration = registered:%v status:%q", result.Registered, result.Status)
 	}
 	meta, err := store.GetMeta(ctx, "empty-mounted")
@@ -276,11 +276,11 @@ func TestPromoteRestoresMountAndRenames(t *testing.T) {
 			if err != nil {
 				t.Fatalf("promote: %v", err)
 			}
-			if !result.Registered || result.Status != "published" {
+			if result.Registered || result.Status != "published" {
 				t.Fatalf("promote registration = registered:%v status:%q", result.Registered, result.Status)
 			}
-			if got := registrar.registered.Load(); got != 2 {
-				t.Fatalf("register calls = %d; want 2", got)
+			if got := registrar.registered.Load(); got != 0 {
+				t.Fatalf("register calls = %d; want 0", got)
 			}
 			if got := registrar.renamed.Load(); got != 1 {
 				t.Fatalf("rename calls = %d; want 1", got)

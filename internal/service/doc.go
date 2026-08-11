@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -44,13 +45,33 @@ type GrantReconciler func(ctx context.Context, slug string) error
 type DocRegistrar interface {
 	Register(ctx context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error)
 	Rename(ctx context.Context, slug, title, token string)
-	Delete(ctx context.Context, slug, token string)
+	Delete(ctx context.Context, slug, token string) error
+}
+
+type delegatedDocDeleter interface {
+	DeleteDelegated(ctx context.Context, in docsbackend.DelegatedDelete, secret string) error
+}
+
+// DeleteAuth contains the disjoint bot and delegated-human authorization paths.
+// A non-empty bot token always selects the existing bot delete endpoint.
+type DeleteAuth struct {
+	PublisherToken   string
+	ActorUID         string
+	SuperAdmin       bool
+	DelegationSecret string
+}
+
+type publishNotifier interface {
+	Published(ctx context.Context, docID, title, token string) error
+}
+
+type lockerProvider interface {
+	Locker() sluglock.Locker
 }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
-// CommentService uses, so that a publish (which holds the slug lock across the
-// whole resolve→put→meta→merge sequence) is serialized against comment mutations
-// for the same slug.
+// CommentService uses. Canonical initialization additionally uses the metadata
+// store's deployment-wide locker; production stores provide database locks.
 func NewDocService(blobs storage.BlobStore, meta storage.MetadataStore, comments *CommentService, lock sluglock.Locker, baseURL string, maxBytes int64) *DocService {
 	return &DocService{blobs: blobs, meta: meta, comments: comments, lock: lock, baseURL: baseURL, maxBytes: maxBytes}
 }
@@ -122,18 +143,29 @@ type PublishInput struct {
 
 	// PublisherToken is the publishing bot's own bearer token, forwarded to the
 	// docs-backend registration so the doc is attributed to whoever published it.
-	// Empty ⇒ the registrar falls back to its process-configured token.
+	// Empty is valid for edits, but cannot allocate a new canonical mounted
+	// identity or authenticate backend mutations.
 	PublisherToken string
+	// IdempotencyKey explicitly selects canonical create. Canonical create has no
+	// Slug; docs-backend allocates the doc ID before any local write.
+	IdempotencyKey string
 
 	mountContextKnown bool
 	pinnedAID         string
 	pinnedTag         string
 	anchorMigrations  map[string]string
+	identity          *canonicalIdentity
+}
+
+type canonicalIdentity struct {
+	docID    string
+	shareURL string
 }
 
 // PublishResult is the result of a successful publish.
 type PublishResult struct {
-	Slug           string `json:"slug"`
+	Slug string `json:"slug"`
+
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
 	DocID          string `json:"doc_id"`
@@ -182,7 +214,7 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 
 // PublishAuthorized publishes after authorize checks the slug's current
 // existence while the per-slug lock is held.
-func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(exists bool) error) (*PublishResult, error) {
+func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(slug string, exists bool) error) (*PublishResult, error) {
 	if in.HTML == "" {
 		return nil, apperr.Validation("html (file) required", "html_required")
 	}
@@ -198,6 +230,55 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	}
 	in.MountType = mountType
 	in.mountContextKnown = in.MountTypePresent
+	explicitCreate := strings.TrimSpace(in.IdempotencyKey) != ""
+	if explicitCreate && in.Slug != "" {
+		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if in.Slug == "" && !explicitCreate {
+		return nil, apperr.Validation("idempotency_key required for canonical create", "idempotency_key_required")
+	}
+	if explicitCreate && strings.TrimSpace(in.PublisherToken) == "" {
+		return nil, apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
+	}
+	exists := false
+	if !explicitCreate {
+		var err error
+		exists, err = s.slugExists(ctx, in.Slug)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+			if metaErr != nil {
+				return nil, metaErr
+			}
+			if persistedMount, ok := meta.MountType(); ok && in.MountType == "" {
+				in.MountType, err = normalizeMountType(persistedMount)
+				if err != nil {
+					return nil, err
+				}
+				in.mountContextKnown = true
+			}
+			if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
+				in.identity = &canonicalIdentity{docID: docID, shareURL: shareURL}
+			}
+		} else if authorize != nil && s.register != nil {
+			return nil, apperr.NotFound("document not found")
+		}
+	}
+	var registration *docsbackend.RegistrationResult
+	if explicitCreate {
+		var err error
+		registration, err = s.preRegister(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
+			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+		}
+		in.Slug = registration.DocID
+		in.identity = &canonicalIdentity{docID: registration.DocID, shareURL: registration.ShareURL}
+	}
 
 	stamped := core.StampAids(in.HTML)
 
@@ -206,25 +287,147 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	// atomic, or two concurrent publishes of the same slug can resolve to the same
 	// version and clobber each other (and drift meta vs blobs).
 	var result *PublishResult
-	err = s.lock.With(ctx, in.Slug, func() error {
-		if authorize != nil {
-			exists, xerr := s.slugExists(ctx, in.Slug)
-			if xerr != nil {
-				return xerr
+	err = s.withCanonicalGuard(ctx, in.Slug, explicitCreate, func() error {
+		return s.lock.With(ctx, in.Slug, func() error {
+			// Registration allocates the lock key, so it necessarily precedes this
+			// critical section. Retry inspection and initialization must both happen
+			// here: a Created=false caller waits for the creator and then observes v1.
+			if registration != nil && !registration.Created {
+				existing, xerr := s.existingPublishResult(ctx, in, registration.ShareURL)
+				if xerr != nil {
+					return xerr
+				}
+				if existing != nil {
+					if authorize != nil {
+						if aerr := authorize(in.Slug, true); aerr != nil {
+							return aerr
+						}
+					}
+					result = existing
+					return nil
+				}
 			}
-			if aerr := authorize(exists); aerr != nil {
-				return aerr
+			if authorize != nil {
+				exists, xerr := s.slugExists(ctx, in.Slug)
+				if xerr != nil {
+					return xerr
+				}
+				if aerr := authorize(in.Slug, exists); aerr != nil {
+					return aerr
+				}
 			}
-		}
-		r, perr := s.publishLocked(ctx, in, stamped)
-		result = r
-		return perr
+			return s.publishIntoLockedResult(ctx, in, stamped, &result)
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(ctx, result)
+	s.applyIdentity(result, in.identity)
+	s.afterPublished(ctx, result, registration != nil)
 	return result, nil
+}
+
+// publishIntoLockedResult calls the non-locking helper for callers that already
+// own the document lock, avoiding lock re-entry.
+func (s *DocService) publishIntoLockedResult(ctx context.Context, in PublishInput, stamped core.StampResult, result **PublishResult) error {
+	r, err := s.publishLocked(ctx, in, stamped)
+	*result = r
+	return err
+}
+
+func (s *DocService) withCanonicalGuard(ctx context.Context, slug string, canonical bool, fn func() error) error {
+	if !canonical {
+		return fn()
+	}
+	provider, ok := s.meta.(lockerProvider)
+	if !ok || provider.Locker() == nil {
+		return apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
+	}
+	return provider.Locker().With(ctx, "canonical-init:"+slug, fn)
+}
+
+func (s *DocService) applyIdentity(result *PublishResult, identity *canonicalIdentity) {
+	if result == nil || identity == nil {
+		return
+	}
+	result.Slug = identity.docID
+
+	result.DocID = identity.docID
+	result.URL = identity.shareURL
+	result.ShareURL = identity.shareURL
+	result.Registered = true
+}
+
+func (s *DocService) existingPublishResult(ctx context.Context, in PublishInput, shareURL string) (*PublishResult, error) {
+	versions, err := s.blobs.ListVersions(ctx, in.Slug)
+	if err != nil {
+		return nil, err
+	}
+	if len(versions) == 0 {
+		return nil, nil
+	}
+	latest := versions[0]
+	for _, version := range versions[1:] {
+		if version > latest {
+			latest = version
+		}
+	}
+	meta, err := s.meta.GetMeta(ctx, in.Slug)
+	if err != nil {
+		return nil, err
+	}
+	// Registration and PutDoc(v1) may be durable before PutMeta fails. Repair
+	// that exact half-state under the shared canonical guard without rewriting the
+	// immutable blob or minting a replay version.
+	_, _, canonical := meta.CanonicalIdentity()
+	hasVersion := false
+	if meta != nil {
+		for _, ref := range meta.Versions {
+			if ref.N == latest {
+				hasVersion = true
+				break
+			}
+		}
+	}
+	if meta == nil || !canonical || !hasVersion {
+		if _, err = s.upsertMeta(ctx, in, latest); err != nil {
+			return nil, err
+		}
+		meta, err = s.meta.GetMeta(ctx, in.Slug)
+		if err != nil {
+			return nil, err
+		}
+		if meta == nil {
+			return nil, apperr.Upstream("canonical metadata recovery failed", "metadata_recovery_failed", nil)
+		}
+	}
+	if !publishCommentsMerged(meta, latest) {
+		html, ok, getErr := s.blobs.GetDoc(ctx, in.Slug, latest)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if !ok {
+			return nil, apperr.Upstream("canonical publish blob recovery failed", "blob_recovery_failed", nil)
+		}
+		persisted := core.StampAids(html)
+		if _, mergeErr := s.comments.PublishMergeWithMigrationsLocked(ctx, in.Slug, in.LocalComments, persisted.AIDs, latest, "", "", nil); mergeErr != nil {
+			return nil, mergeErr
+		}
+		if err = s.markPublishCommentsMerged(ctx, in.Slug, latest); err != nil {
+			return nil, err
+		}
+		meta, err = s.meta.GetMeta(ctx, in.Slug)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, persistedURL, ok := meta.CanonicalIdentity(); ok && persistedURL != "" {
+		shareURL = persistedURL
+	}
+	return &PublishResult{
+		Slug: in.Slug, Version: latest, DocID: in.Slug, URL: shareURL, ShareURL: shareURL,
+		Registered: true, Status: publishStatusPublished, title: meta.Title, publisherToken: in.PublisherToken,
+	}, nil
 }
 
 func (s *DocService) slugExists(ctx context.Context, slug string) (bool, error) {
@@ -277,6 +480,11 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 	if err != nil {
 		return nil, err
 	}
+	if in.identity != nil {
+		if err := s.markPublishCommentsMerged(ctx, in.Slug, version); err != nil {
+			return nil, err
+		}
+	}
 	merged := 0
 	if body, ok := merge.Body.(map[string]any); ok {
 		if m, ok := body["mergedComments"].(int); ok {
@@ -284,7 +492,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		}
 	}
 
-	return &PublishResult{
+	result := &PublishResult{
 		Slug:              in.Slug,
 		Version:           version,
 		Status:            publishStatusPublished,
@@ -297,7 +505,9 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		mountType:         in.MountType,
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
-	}, nil
+	}
+	s.applyIdentity(result, in.identity)
+	return result, nil
 }
 
 func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) error {
@@ -372,6 +582,12 @@ func (s *DocService) GetElement(ctx context.Context, slug string, version int, a
 // is unique and refreshes the anchor fingerprint atomically when the tag changes;
 // later plain publishes compute normal content-derived identity again.
 func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersion int, aid, newHTML string) (*PublishResult, error) {
+	return s.ReplaceElementAuthorized(ctx, slug, baseVersion, aid, newHTML, "")
+}
+
+// ReplaceElementAuthorized replaces an element and carries the request bot token
+// through persistence to the bounded best-effort published notification.
+func (s *DocService) ReplaceElementAuthorized(ctx context.Context, slug string, baseVersion int, aid, newHTML, publisherToken string) (*PublishResult, error) {
 	if aid == "" {
 		return nil, apperr.Validation("aid required", "aid_required")
 	}
@@ -448,6 +664,7 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		if ierr != nil {
 			return ierr
 		}
+		in.PublisherToken = publisherToken
 		in.pinnedAID = aid
 		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
 		in.anchorMigrations = map[string]string{aid: canonicalAID}
@@ -461,7 +678,7 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(ctx, result)
+	s.afterPublished(ctx, result, false)
 	return result, nil
 }
 
@@ -518,10 +735,11 @@ type VersionList struct {
 
 // DraftResult is the result of saving a draft.
 type DraftResult struct {
-	Slug string `json:"slug"`
-	URL  string `json:"url"`
-	Size int64  `json:"size"`
-	AIDs int    `json:"aids"`
+	Slug  string `json:"slug"`
+	DocID string `json:"doc_id,omitempty"`
+	URL   string `json:"url"`
+	Size  int64  `json:"size"`
+	AIDs  int    `json:"aids"`
 }
 
 // SaveDraft stamps and writes the mutable draft slot for a slug, creating the
@@ -532,34 +750,163 @@ type DraftResult struct {
 // exactly like Publish; a later save by a different caller never reassigns it,
 // and the stamped creator carries through to the promoted version.
 func (s *DocService) SaveDraft(ctx context.Context, slug, html, title, creatorUID string) (*DraftResult, error) {
+	return s.SaveDraftMounted(ctx, PublishInput{Slug: slug, HTML: html, Title: title, CreatorUID: creatorUID})
+}
+
+// SaveDraftMounted saves a draft and pre-registers mounted draft-first docs.
+func (s *DocService) SaveDraftMounted(ctx context.Context, in PublishInput) (*DraftResult, error) {
+	return s.SaveDraftMountedAuthorized(ctx, in, nil)
+}
+
+// SaveDraftMountedAuthorized checks existing identities under their lock.
+func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishInput, authorize func(string, bool) error) (*DraftResult, error) {
+	slug, html, title, creatorUID := in.Slug, in.HTML, in.Title, in.CreatorUID
 	if html == "" {
 		return nil, apperr.Validation("html required", "html_required")
 	}
 	if int64(len(html)) > s.maxBytes {
 		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 	}
+	if in.MountType != "" {
+		in.MountTypePresent = true
+	}
+	mountType, err := normalizeMountType(in.MountType)
+	if err != nil {
+		return nil, err
+	}
+	in.MountType = mountType
+	explicitCreate := strings.TrimSpace(in.IdempotencyKey) != ""
+	if explicitCreate && slug != "" {
+		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if slug == "" && !explicitCreate {
+		return nil, apperr.Validation("idempotency_key required for canonical create", "idempotency_key_required")
+	}
+	if explicitCreate && strings.TrimSpace(in.PublisherToken) == "" {
+		return nil, apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
+	}
+	exists := false
+	if !explicitCreate {
+		exists, err = s.slugExists(ctx, slug)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			meta, metaErr := s.meta.GetMeta(ctx, slug)
+			if metaErr != nil {
+				return nil, metaErr
+			}
+			if persistedMount, ok := meta.MountType(); ok && in.MountType == "" {
+				in.MountType, err = normalizeMountType(persistedMount)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else if authorize != nil && s.register != nil {
+			return nil, apperr.NotFound("document not found")
+		}
+	}
+	var registration *docsbackend.RegistrationResult
+	if explicitCreate {
+		registration, err = s.preRegister(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
+			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+		}
+		slug = registration.DocID
+		in.Slug = slug
+		in.identity = &canonicalIdentity{docID: registration.DocID, shareURL: registration.ShareURL}
+	}
 	stamped := core.StampAids(html)
 	var result *DraftResult
-	err := s.lock.With(ctx, slug, func() error {
-		size, perr := s.blobs.PutDraft(ctx, slug, stamped.HTML)
-		if perr != nil {
-			return apperr.Upstream("draft write failed", "draft_write_failed", perr)
-		}
-		if merr := s.setDraftMeta(ctx, slug, title, creatorUID); merr != nil {
-			return merr
-		}
-		result = &DraftResult{
-			Slug: slug,
-			URL:  fmt.Sprintf("%s/d/%s/draft", s.baseURL, slug),
-			Size: size,
-			AIDs: len(stamped.AIDs),
-		}
-		return nil
+	err = s.withCanonicalGuard(ctx, slug, explicitCreate, func() error {
+		return s.lock.With(ctx, slug, func() error {
+			if registration != nil && !registration.Created {
+				existing, xerr := s.existingDraftResult(ctx, in)
+				if xerr != nil {
+					return xerr
+				}
+				if existing != nil {
+					if authorize != nil {
+						if aerr := authorize(slug, true); aerr != nil {
+							return aerr
+						}
+					}
+					result = existing
+					return nil
+				}
+			}
+			if authorize != nil {
+				current, xerr := s.slugExists(ctx, slug)
+				if xerr != nil {
+					return xerr
+				}
+				if aerr := authorize(slug, current); aerr != nil {
+					return aerr
+				}
+			}
+			return s.saveDraftLocked(ctx, slug, title, creatorUID, stamped, in.identity, &result)
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
+	if in.identity != nil {
+		result.DocID = in.identity.docID
+	}
 	return result, nil
+}
+
+func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput) (*DraftResult, error) {
+	html, ok, err := s.blobs.GetDraft(ctx, in.Slug)
+	if err != nil || !ok {
+		return nil, err
+	}
+	meta, err := s.meta.GetMeta(ctx, in.Slug)
+	if err != nil {
+		return nil, err
+	}
+	hasDraftMeta := false
+	if meta != nil {
+		_, hasDraftMeta = meta.Extra[storage.DraftExtraKey]
+	}
+	docID, shareURL, canonical := meta.CanonicalIdentity()
+	creatorComplete := in.CreatorUID == "" || (meta != nil && meta.CreatorUID() != "")
+	identityComplete := canonical && docID == in.Slug && in.identity != nil && shareURL == in.identity.shareURL
+	if !hasDraftMeta || !identityComplete || !creatorComplete {
+		if err := s.setDraftMeta(ctx, in.Slug, in.Title, in.CreatorUID, in.identity); err != nil {
+			return nil, err
+		}
+		meta, err = s.meta.GetMeta(ctx, in.Slug)
+		if err != nil {
+			return nil, err
+		}
+		if meta == nil {
+			return nil, apperr.Upstream("canonical draft metadata recovery failed", "metadata_recovery_failed", nil)
+		}
+		docID, shareURL, canonical = meta.CanonicalIdentity()
+		_, hasDraftMeta = meta.Extra[storage.DraftExtraKey]
+		creatorComplete = in.CreatorUID == "" || meta.CreatorUID() != ""
+		if !hasDraftMeta || !canonical || docID != in.Slug || in.identity == nil || shareURL != in.identity.shareURL || !creatorComplete {
+			return nil, apperr.Upstream("canonical draft metadata recovery failed", "metadata_recovery_failed", nil)
+		}
+	}
+	return &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(html)), AIDs: len(core.StampAids(html).AIDs)}, nil
+}
+
+// saveDraftLocked initializes the draft without acquiring the document lock.
+func (s *DocService) saveDraftLocked(ctx context.Context, slug, title, creatorUID string, stamped core.StampResult, identity *canonicalIdentity, result **DraftResult) error {
+	size, err := s.blobs.PutDraft(ctx, slug, stamped.HTML)
+	if err != nil {
+		return apperr.Upstream("draft write failed", "draft_write_failed", err)
+	}
+	if err := s.setDraftMeta(ctx, slug, title, creatorUID, identity); err != nil {
+		return err
+	}
+	*result = &DraftResult{Slug: slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, slug), Size: size, AIDs: len(stamped.AIDs)}
+	return nil
 }
 
 // GetDraft fetches the draft HTML + version list for rendering, or nil if absent.
@@ -595,6 +942,12 @@ func (s *DocService) GetDraft(ctx context.Context, slug string) (*RenderData, er
 // leftover draft blob is harmless: it's invisible to ListVersions and is overwritten
 // by the next SaveDraft.
 func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishResult, error) {
+	return s.PromoteAuthorized(ctx, slug, title, "")
+}
+
+// PromoteAuthorized promotes a draft and forwards the request bot credential to
+// the post-commit backend notification.
+func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title, publisherToken string) (*PublishResult, error) {
 	var result *PublishResult
 	err := s.lock.With(ctx, slug, func() error {
 		html, ok, gerr := s.blobs.GetDraft(ctx, slug)
@@ -609,6 +962,7 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 		if ierr != nil {
 			return ierr
 		}
+		in.PublisherToken = publisherToken
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr
@@ -628,7 +982,7 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 	if err != nil {
 		return nil, err
 	}
-	s.afterPublished(ctx, result)
+	s.afterPublished(ctx, result, false)
 	return result, nil
 }
 
@@ -636,7 +990,7 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string) error {
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string, identity *canonicalIdentity) error {
 	prev, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
 		return err
@@ -654,8 +1008,13 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID s
 	extra := map[string]any{}
 	maps.Copy(extra, prev.Extra)
 	extra[storage.DraftExtraKey] = map[string]any{"updated_at": time.Now().UTC().Format(time.RFC3339)}
+
 	if creatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = creatorUID
+	}
+	if identity != nil {
+		extra[storage.CanonicalDocIDExtraKey] = identity.docID
+		extra[storage.CanonicalShareURLExtraKey] = identity.shareURL
 	}
 	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 		Slug:     slug,
@@ -705,6 +1064,10 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 		in.MountType = normalized
 		in.mountContextKnown = true
 	}
+	if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
+		in.identity = &canonicalIdentity{docID: docID, shareURL: shareURL}
+	}
+
 	return in, nil
 }
 
@@ -742,13 +1105,54 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 // interleave with a publish and leave orphaned blobs or meta pointing at a
 // missing blob.
 func (s *DocService) Remove(ctx context.Context, slug string) error {
-	err := s.lock.With(ctx, slug, func() error {
+	return s.RemoveAuthorized(ctx, slug, DeleteAuth{})
+}
+
+// RemoveAuthorized deletes an existing ref via explicit bot or human auth.
+func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth DeleteAuth) error {
+	return s.lock.With(ctx, slug, func() error {
+		exists, err := s.slugExists(ctx, slug)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return apperr.NotFound("document not found")
+		}
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		docID, _, canonical := meta.CanonicalIdentity()
+		if canonical && docID != slug {
+			return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+		}
+		if canonical && s.register == nil {
+			return apperr.Upstream("docs-backend deletion unavailable", "delete_failed", nil)
+		}
+		if s.register != nil {
+			deleteCtx, cancel := context.WithTimeout(ctx, docsBackendSideEffectTimeout)
+			defer cancel()
+			var derr error
+			if strings.TrimSpace(auth.PublisherToken) != "" {
+				derr = s.register.Delete(deleteCtx, slug, auth.PublisherToken)
+			} else {
+				deleter, ok := s.register.(delegatedDocDeleter)
+				if !ok || strings.TrimSpace(auth.ActorUID) == "" || strings.TrimSpace(auth.DelegationSecret) == "" {
+					return apperr.Unauthorized("remote delete requires authenticated delegation", "delete_delegation_required")
+				}
+				delegated := docsbackend.DelegatedDelete{Slug: slug, ActorUID: auth.ActorUID, SuperAdmin: auth.SuperAdmin}
+				if canonical {
+					delegated.DocID = slug
+				}
+				derr = deleter.DeleteDelegated(deleteCtx, delegated, auth.DelegationSecret)
+			}
+			if derr != nil {
+				return apperr.Upstream("docs-backend deletion failed", "delete_failed", derr)
+			}
+		}
 		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
 			return err
 		}
-		// blobs.DeleteDoc purges asset bytes (they share the doc's key prefix), but
-		// the asset metadata rows are a separate store — purge them too, or they'd
-		// orphan and resurface if the slug is later reused.
 		assets, err := s.meta.ListAssetMeta(ctx, slug)
 		if err != nil {
 			return err
@@ -758,82 +1162,66 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 				return derr
 			}
 		}
-		if err := s.meta.DeleteMeta(ctx, slug); err != nil {
+		// Comments are removed before metadata so a failed wipe remains reachable
+		// through the document and a retry can finish cleanup.
+		if _, err = s.comments.WipeLocked(ctx, slug); err != nil {
 			return err
 		}
-		_, err = s.comments.WipeLocked(ctx, slug)
-		return err
+		return s.meta.DeleteMeta(ctx, slug)
 	})
-	if err != nil {
-		return err
-	}
-	s.afterRemoved(slug)
-	return nil
 }
 
-func (s *DocService) afterPublished(parent context.Context, result *PublishResult) {
+func (s *DocService) afterPublished(parent context.Context, result *PublishResult, registered bool) {
 	if result == nil {
 		return
 	}
-	reg, ok := s.registrationForMount(result.Slug, result.title, result.mountType)
-	if !ok {
-		if result.mountContextKnown {
-			result.Status = publishStatusUnregistered
-			return
+	if result.Registered {
+		s.notifyPublished(parent, result)
+	}
+	if registered || result.Registered {
+		// Canonical edits never register again. A title reconcile is optional and
+		// must use this request's bot identity, not the process token.
+		if result.hadMeta && result.titleChanged && s.register != nil && result.publisherToken != "" {
+			ctx, cancel := context.WithTimeout(parent, docsBackendSideEffectTimeout)
+			s.register.Rename(ctx, result.Slug, result.title, result.publisherToken)
+			cancel()
 		}
-		s.afterLegacyPublished(parent, result)
+		if s.reconcileFn != nil {
+			if err := s.reconcileFn(parent, result.Slug); err != nil {
+				s.log().Error("grant_reconcile_failed", "slug", result.Slug, "err", err.Error())
+			}
+		}
 		return
 	}
-	if s.register == nil {
-		result.Status = publishStatusRegisterFailed
-		s.log().Warn("docs_backend_register unavailable after publish", "slug", result.Slug, "version", result.Version)
+	// Existing references are never registration creates. Legacy registered rows
+	// may only be reconciled through non-create endpoints.
+	if result.mountContextKnown && result.mountType == "" {
+		result.Status = publishStatusUnregistered
+	}
+	s.afterLegacyPublished(parent, result)
+}
+
+func (s *DocService) notifyPublished(parent context.Context, result *PublishResult) {
+	notifier, ok := s.register.(publishNotifier)
+	if !ok || strings.TrimSpace(result.publisherToken) == "" {
 		return
 	}
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, docsBackendSideEffectTimeout)
-	defer cancel()
-	var registration *docsbackend.RegistrationResult
 	var err error
 	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, docsBackendAttemptTimeout)
-		registration, err = s.register.Register(attemptCtx, reg, result.publisherToken)
-		attemptCancel()
+		attemptCtx, cancel := context.WithTimeout(parent, docsBackendAttemptTimeout)
+		err = notifier.Published(attemptCtx, result.DocID, result.title, result.publisherToken)
+		cancel()
 		if err == nil {
+			return
+		}
+		if attempt < docsBackendRegisterAttempts && !waitForRetry(parent, docsBackendRegisterDelay) {
 			break
 		}
-		if attempt == docsBackendRegisterAttempts || !waitForRetry(ctx, docsBackendRegisterDelay) {
-			break
-		}
 	}
-	if err == nil && registration == nil {
-		err = fmt.Errorf("docs-backend registration returned no result")
-	}
-	if err != nil {
-		result.Status = publishStatusRegisterFailed
-		s.log().Warn("docs_backend_register failed after publish", "slug", result.Slug, "version", result.Version, "err", err.Error())
-		return
-	}
-	if ctx.Err() != nil {
-		result.Status = publishStatusRegisterFailed
-		return
-	}
-	result.DocID = registration.DocID
-	result.URL = registration.ShareURL
-	result.ShareURL = registration.ShareURL
-	result.Registered = true
-	if result.hadMeta && result.titleChanged {
-		s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	if s.reconcileFn != nil {
-		if reconcileErr := s.reconcileFn(ctx, result.Slug); reconcileErr != nil {
-			s.log().Error("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
-		}
-	}
+	s.log().Error("publish_notification_failed", "doc_id", result.DocID, "attempts", docsBackendRegisterAttempts, "err", err.Error())
 }
 
 func (s *DocService) afterLegacyPublished(parent context.Context, result *PublishResult) {
@@ -863,48 +1251,31 @@ func waitForRetry(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (s *DocService) afterRemoved(slug string) {
+func (s *DocService) preRegister(ctx context.Context, in PublishInput) (*docsbackend.RegistrationResult, error) {
+	reg := docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: strings.TrimSpace(in.Title)}
 	if s.register == nil {
-		return
+		return nil, apperr.Upstream("docs-backend registration unavailable", "registration_failed", nil)
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), docsBackendSideEffectTimeout)
-		defer cancel()
-		// Delete is by slug and idempotent: docs-backend 404s harmlessly if the
-		// slug was never registered. No mount info is needed to unregister, so we
-		// call it unconditionally rather than re-deriving a registration. No
-		// publisher token is available on the remove path, so "" falls back to the
-		// process-configured token.
-		s.register.Delete(ctx, slug, "")
-	}()
-}
-
-// registrationForMount builds a docs-backend registration from mount info the
-// publishing bot supplied on the publish request. This replaces the former GET
-// /v1/docs/bindings/<slug> lookup (which required a login-user token and 401'd
-// on a bot token). SpaceID and Owner are intentionally omitted: docs-backend
-// reverse-resolves both from the bot's own token via verify-bot, so the caller
-// must not (and need not) supply them.
-func (s *DocService) registrationForMount(slug, title, mountType string) (docsbackend.Registration, bool) {
-	switch mountType {
-	case "":
-		s.log().Debug("docs_backend_register skipped: no mount_type", "slug", slug)
-		return docsbackend.Registration{}, false
-	case "group", "space", "thread":
-	default:
-		s.log().Debug("docs_backend_register skipped: unsupported mount_type", "slug", slug, "mount_type", mountType)
-		return docsbackend.Registration{}, false
+	var result *docsbackend.RegistrationResult
+	var err error
+	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, docsBackendAttemptTimeout)
+		result, err = s.register.Register(attemptCtx, reg, in.PublisherToken)
+		cancel()
+		if err == nil && result != nil {
+			return result, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("docs-backend registration returned no result")
+		}
+		if docsbackend.IsCanonicalDocumentDeleted(err) {
+			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
+		}
+		if attempt < docsBackendRegisterAttempts && !waitForRetry(ctx, docsBackendRegisterDelay) {
+			break
+		}
 	}
-	title = strings.TrimSpace(title)
-	if title == "" {
-		title = slug
-	}
-	return docsbackend.Registration{
-		DocType:     "html",
-		OctoDocSlug: slug,
-		MountType:   mountType,
-		Title:       title,
-	}, true
+	return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 }
 
 func normalizeMountType(mountType string) (string, error) {
@@ -1017,7 +1388,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") {
+	if in.mountContextKnown || in.identity != nil || (in.CreatorUID != "" && prev.CreatorUID() == "") {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
@@ -1027,6 +1398,11 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
 	}
+	if in.identity != nil {
+		extra[storage.CanonicalDocIDExtraKey] = in.identity.docID
+		extra[storage.CanonicalShareURLExtraKey] = in.identity.shareURL
+	}
+
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,
 		Title:    title,
@@ -1040,6 +1416,29 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 		hadMeta:      hadMeta,
 		titleChanged: hadMeta && strings.TrimSpace(prev.Title) != "" && prev.Title != title,
 	}, nil
+}
+
+func publishCommentsMerged(meta *storage.DocMeta, version int) bool {
+	if meta == nil || meta.Extra == nil {
+		return false
+	}
+	value, ok := meta.Extra[storage.PublishCommentsMergedVersionExtraKey].(float64)
+	return ok && int(value) == version
+}
+
+func (s *DocService) markPublishCommentsMerged(ctx context.Context, slug string, version int) error {
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if meta == nil || publishCommentsMerged(meta, version) {
+		return nil
+	}
+	extra := map[string]any{}
+	maps.Copy(extra, meta.Extra)
+	extra[storage.PublishCommentsMergedVersionExtraKey] = version
+	meta.Extra = extra
+	return s.meta.PutMeta(ctx, slug, *meta)
 }
 
 func sortVersions(v []storage.VersionRef) {

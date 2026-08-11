@@ -19,11 +19,12 @@ import (
 
 // publishBody is the parsed publish input from JSON or multipart.
 type publishBody struct {
-	Slug          string
-	HTML          string
-	Version       int
-	Title         string
-	LocalComments []core.Comment
+	Slug           string
+	IdempotencyKey string
+	HTML           string
+	Version        int
+	Title          string
+	LocalComments  []core.Comment
 
 	// Mount info the publishing bot supplies so the doc can be registered into
 	// docs-backend (and thus appear in the sidebar) without a doc_binding lookup.
@@ -47,6 +48,7 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	}
 	var b publishBody
 	b.Slug = r.FormValue("slug")
+	b.IdempotencyKey = r.FormValue("idempotency_key")
 	b.Title = r.FormValue("title")
 	if v := r.FormValue("version"); v != "" {
 		b.Version, _ = strconv.Atoi(v)
@@ -70,11 +72,12 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 
 func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publishBody, error) {
 	var raw struct {
-		Slug    string `json:"slug"`
-		HTML    string `json:"html"`
-		Version int    `json:"version"`
-		Title   string `json:"title"`
-		Meta    *struct {
+		Slug           string `json:"slug"`
+		IdempotencyKey string `json:"idempotency_key"`
+		HTML           string `json:"html"`
+		Version        int    `json:"version"`
+		Title          string `json:"title"`
+		Meta           *struct {
 			Title string `json:"title"`
 		} `json:"meta"`
 		Comments []core.Comment `json:"comments"`
@@ -106,7 +109,7 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		title = raw.Meta.Title
 	}
 	body := publishBody{
-		Slug: raw.Slug, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
+		Slug: raw.Slug, IdempotencyKey: raw.IdempotencyKey, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
 		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
 	}
 	if raw.MountType != nil {
@@ -135,9 +138,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	slug, err := requireSlug(body.Slug)
-	if err != nil {
-		return err
+	slug := body.Slug
+	if slug != "" {
+		var err error
+		slug, err = requireSlug(slug)
+		if err != nil {
+			return err
+		}
 	}
 	if body.HTML == "" {
 		return apperr.Validation("html (file) required", "html_required")
@@ -147,17 +154,18 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
+	publisherToken := botTokenFromCtx(r.Context())
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
-		PublisherToken: botTokenFromCtx(r.Context()),
-	}, func(exists bool) error {
+		PublisherToken: publisherToken, IdempotencyKey: body.IdempotencyKey,
+	}, func(canonicalSlug string, exists bool) error {
 		if !exists {
 			return nil
 		}
-		return s.requireDocEditSlug(r, slug)
+		return s.requireDocEditSlug(r, canonicalSlug)
 	})
 	if err != nil {
 		return err
@@ -166,8 +174,38 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// handleSaveDraft writes the mutable draft slot (PUT /v1/docs/{slug}/draft).
-// Write-auth gated. The body is the same shape as publish, minus version.
+func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) error {
+	body, err := s.readPublishBody(w, r)
+	if err != nil {
+		return err
+	}
+	if body.Slug != "" {
+		return apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	// Validate before canonical registration. Registration allocates the durable
+	// docs-backend identity, so an invalid request must not leave an orphan row.
+	if body.HTML == "" {
+		return apperr.Validation("html (file) required", "html_required")
+	}
+	res, err := s.docs.SaveDraftMountedAuthorized(r.Context(), service.PublishInput{
+		HTML: body.HTML, Title: body.Title, IdempotencyKey: body.IdempotencyKey,
+		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
+		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
+		CreatorUID: creatorUIDFromCtx(r.Context()), PublisherToken: botTokenFromCtx(r.Context()),
+	}, func(canonicalSlug string, exists bool) error {
+		if !exists {
+			return nil
+		}
+		return s.requireDocEditSlug(r, canonicalSlug)
+	})
+	if err != nil {
+		return err
+	}
+	writeData(w, http.StatusCreated, res)
+	return nil
+}
+
+// handleSaveDraft updates the mutable draft slot for an existing ref.
 func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -180,9 +218,20 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	if body.HTML == "" {
 		return apperr.Validation("html (file) required", "html_required")
 	}
+	publisherToken := botTokenFromCtx(r.Context())
 	// Stamp creator on first draft (draft-first create) with the same owner rule
 	// as publish, so the draft's author survives into the promoted version.
-	res, err := s.docs.SaveDraft(r.Context(), slug, body.HTML, body.Title, creatorUIDFromCtx(r.Context()))
+	res, err := s.docs.SaveDraftMountedAuthorized(r.Context(), service.PublishInput{
+		Slug: slug, HTML: body.HTML, Title: body.Title,
+		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
+		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
+		CreatorUID: creatorUIDFromCtx(r.Context()), PublisherToken: publisherToken,
+	}, func(canonicalSlug string, exists bool) error {
+		if !exists {
+			return nil
+		}
+		return s.requireDocEditSlug(r, canonicalSlug)
+	})
 	if err != nil {
 		return err
 	}
@@ -190,8 +239,8 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// handlePromote promotes the draft to a new immutable version
-// (POST /v1/docs/{slug}/draft/promote). Write-auth gated.
+// handlePromote promotes the draft to a new immutable version and forwards a
+// bot credential for the post-commit backend notification when one is present.
 func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -204,7 +253,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&raw)
 	}
-	res, err := s.docs.Promote(r.Context(), slug, raw.Title)
+	res, err := s.docs.PromoteAuthorized(r.Context(), slug, raw.Title, botTokenFromCtx(r.Context()))
 	if err != nil {
 		return err
 	}
@@ -343,7 +392,19 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.docs.Remove(r.Context(), slug); err != nil {
+	auth := service.DeleteAuth{PublisherToken: botTokenFromCtx(r.Context())}
+	if auth.PublisherToken == "" {
+		session, serr := s.resolveViewerSession(r)
+		if serr != nil {
+			return serr
+		}
+		if session != nil {
+			auth.ActorUID = session.Login
+			auth.SuperAdmin = session.Role == "superAdmin"
+		}
+		auth.DelegationSecret = s.cfg.DocsHTMLDelegationSecret
+	}
+	if err := s.docs.RemoveAuthorized(r.Context(), slug, auth); err != nil {
 		return err
 	}
 	writeData(w, 200, struct{}{})

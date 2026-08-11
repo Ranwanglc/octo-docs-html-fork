@@ -69,6 +69,13 @@ not apply to them.
 and deployed before HTML PR #24 is deployed, because thread registration
 depends on that backend contract.
 
+### `POST /v1/docs/draft` — create a canonical draft (bot author)
+Creates a new mutable draft without a caller-chosen reference. Body:
+`{html, idempotency_key, meta?: {title}, mount_type?, group_no?, thread_id?}`.
+Returns **201** with `data.doc_id` and `data.slug` (equal); persist `data.slug`
+for later save, promote, publish, and delete calls. Missing or empty `html` returns
+`400 html_required` before backend registration or local writes.
+
 ### `PUT /v1/docs/{slug}/draft` — save the mutable draft (author)
 Overwrites the single draft slot without minting a version. Body: `{html, title?}`.
 The draft renders at `/d/{slug}/draft` (author-only).
@@ -81,7 +88,10 @@ Returns the same shape as publish.
 `data: { slug, title, versions: [{ n, created }] }`.
 
 ### `DELETE /v1/docs/{slug}` — unpublish (author)
-Deletes all versions, the draft, comments, and assets for the slug.
+Deletes all versions, the draft, comments, and assets for the slug. For canonical
+doc IDs, the docs-backend delete occurs first; an authenticated owner retry after
+that remote soft delete succeeds idempotently so interrupted local cleanup can
+finish. Unauthorized deletion remains an error.
 
 ## Sharing
 

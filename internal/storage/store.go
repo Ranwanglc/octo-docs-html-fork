@@ -29,6 +29,16 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// CanonicalDocIDExtraKey marks identities allocated by docs-backend.
+const CanonicalDocIDExtraKey = "canonical_doc_id"
+
+// CanonicalShareURLExtraKey stores the canonical read URL for idempotent retries.
+const CanonicalShareURLExtraKey = "canonical_share_url"
+
+// PublishCommentsMergedVersionExtraKey stores the latest version whose
+// publish-time comment merge/reconciliation completed durably.
+const PublishCommentsMergedVersionExtraKey = "publish_comments_merged_version"
+
 // CreatorUID returns the creating uid stored under Extra, or "" when absent
 // (legacy docs / no creator recorded ⇒ nobody is author by ownership).
 func (m *DocMeta) CreatorUID() string {
@@ -48,6 +58,16 @@ func (m *DocMeta) MountType() (string, bool) {
 	}
 	mountType, ok := m.Extra[MountTypeExtraKey].(string)
 	return mountType, ok
+}
+
+// CanonicalIdentity returns the docs-backend identity and URL, if recorded.
+func (m *DocMeta) CanonicalIdentity() (string, string, bool) {
+	if m == nil || m.Extra == nil {
+		return "", "", false
+	}
+	docID, _ := m.Extra[CanonicalDocIDExtraKey].(string)
+	shareURL, _ := m.Extra[CanonicalShareURLExtraKey].(string)
+	return docID, shareURL, docID != ""
 }
 
 // GrantsExtraKey is the DocMeta.Extra key holding per-uid access grants: a

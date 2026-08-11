@@ -95,6 +95,13 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		}
 	}
 	sess := octoSessionFromCtx(r.Context())
+	if sess == nil {
+		var err error
+		sess, err = s.auth.GetSession(r.Context(), sessionCookie(r))
+		if err != nil {
+			return service.CapNone, err
+		}
+	}
 	if sess != nil && s.auth.IsOwner(sess) {
 		if service.CapManage > best {
 			best = service.CapManage
@@ -110,7 +117,13 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	// octoSessionCtxKey and botSessionCtxKey, so octoSessionFromCtx and
 	// botSessionFromCtx here observe one identity — do not split them into
 	// separate instances or the bot→OwnerUID mapping below silently breaks.
-	selfUID, ownerUID := sessionUIDs(r)
+	selfUID, ownerUID := "", ""
+	if sess != nil {
+		selfUID, ownerUID = sess.Login, sess.Login
+		if bs := botSessionFromCtx(r.Context()); bs != nil && bs.OwnerUID != "" {
+			ownerUID = bs.OwnerUID
+		}
+	}
 	// matchUID keeps the pre-plan③ owner-preferring value for doc_grants (A4)
 	// and doc_binding, which still resolve against the owner uid. The author
 	// tiers below use selfUID/ownerUID explicitly.

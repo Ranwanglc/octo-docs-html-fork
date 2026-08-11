@@ -161,7 +161,7 @@ func TestPublishMountedFailsClosedWithoutRegistrar(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
 				t.Fatal(err)
 			}
-			if envelope.Data["registered"] != false || envelope.Data["status"] != "registration_failed" {
+			if envelope.Data["registered"] != false || envelope.Data["status"] != "published" {
 				t.Fatalf("publish data = %#v", envelope.Data)
 			}
 		})
@@ -185,7 +185,7 @@ func TestPublishOmittedOrEmptyMountPreservesExistingMount(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
 			t.Fatal(err)
 		}
-		if envelope.Data["status"] != "registration_failed" {
+		if envelope.Data["status"] != "published" {
 			t.Fatalf("publish data = %#v; mount context was not preserved", envelope.Data)
 		}
 	}
