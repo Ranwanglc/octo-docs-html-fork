@@ -149,6 +149,38 @@ func TestFailedUserRegistrationRemainsUnconfirmedForDelete(t *testing.T) {
 	requireAppCode(t, err, "user_publish_delete_via_backend")
 }
 
+func TestFailedRepublishPreservesConfirmedBackendDocID(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	registrar := &deleteRegistrar{deleted: make(chan string, 1), registerID: "doc-confirmed"}
+	docs := NewDocService(store, store, NewCommentService(store, locker), locker, "", 1<<20).
+		WithDocsBackendRegistration(registrar, nil)
+	ctx := context.Background()
+	first, err := docs.Publish(ctx, PublishInput{
+		Slug: "registered-republish", HTML: "<html>v1</html>", UserPublish: true, SpaceID: "space-1", CreatorUID: "u1",
+	})
+	if err != nil || !first.Registered {
+		t.Fatalf("first publish result=%+v err=%v", first, err)
+	}
+	registrar.registerID = ""
+	second, err := docs.Publish(ctx, PublishInput{
+		Slug: "registered-republish", HTML: "<html>v2</html>", UserPublish: true, SpaceID: "space-1", CreatorUID: "u1",
+	})
+	if err != nil || second.Status != publishStatusRegisterFailed {
+		t.Fatalf("second publish result=%+v err=%v", second, err)
+	}
+	meta, err := store.GetMeta(ctx, "registered-republish")
+	if err != nil || meta == nil {
+		t.Fatalf("meta=%+v err=%v", meta, err)
+	}
+	state, docID, version := meta.DocsBackendRegistration()
+	if state != storage.DocsBackendRegistrationPending || docID != "doc-confirmed" || version != second.Version {
+		t.Fatalf("registration state=%q docID=%q version=%d", state, docID, version)
+	}
+	err = docs.RemoveAuthorized(ctx, "registered-republish", func(context.Context, PublishProvenance) error { return nil })
+	requireAppCode(t, err, "user_publish_delete_via_backend")
+}
+
 func TestLegacyPublishedUserDraftDoesNotBecomeLocalOnly(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()

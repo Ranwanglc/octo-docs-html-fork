@@ -1080,8 +1080,8 @@ func (s *DocService) setDocsBackendRegistrationState(ctx context.Context, slug, 
 		if meta == nil {
 			return fmt.Errorf("metadata missing")
 		}
-		currentState, currentDocID, currentVersion := meta.DocsBackendRegistration()
-		if currentState != storage.DocsBackendRegistrationPending || currentDocID != "" || currentVersion != version {
+		currentState, _, currentVersion := meta.DocsBackendRegistration()
+		if currentState != storage.DocsBackendRegistrationPending || currentVersion != version {
 			return fmt.Errorf("registration state changed to %q at version %d", currentState, currentVersion)
 		}
 		if meta.Extra == nil {
@@ -1155,16 +1155,17 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 		result.Status = publishStatusRegisterFailed
 		return
 	}
-	result.DocID = registration.DocID
-	result.URL = registration.ShareURL
-	result.ShareURL = registration.ShareURL
-	result.Registered = true
+	result.Status = publishStatusPublished
 	if result.userPublish {
 		if !s.setDocsBackendRegistrationState(parent, result.Slug, storage.DocsBackendRegistrationRegistered, registration.DocID, result.Version) {
 			result.Status = publishStatusRegisterFailed
 			return
 		}
 	}
+	result.DocID = registration.DocID
+	result.URL = registration.ShareURL
+	result.ShareURL = registration.ShareURL
+	result.Registered = true
 	if result.hadMeta && result.titleChanged && !result.userPublish {
 		s.register.Rename(ctx, result.Slug, reg.Title, result.publisherToken)
 	}
@@ -1386,7 +1387,6 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 		extra[storage.SpaceIDExtraKey] = in.SpaceID
 		extra[storage.DocsBackendRegistrationStateKey] = storage.DocsBackendRegistrationPending
 		extra[storage.DocsBackendRegistrationVersionKey] = version
-		delete(extra, storage.DocsBackendDocIDExtraKey)
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
