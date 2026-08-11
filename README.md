@@ -116,7 +116,7 @@ the server behaves as a standalone deploy.
 
 ### User-owned Space publishing
 
-A user-owned Space document is created only when the request explicitly supplies a valid `space_id`. A raw user token without `space_id` keeps the legacy direct-publish behavior. Once user provenance is persisted, every later publishing mutation (direct republish, draft save/promote, and element replacement) revalidates the current user's membership in that persisted Space; omitting `space_id` does not bypass this check. Bot/legacy provenance cannot be converted to user provenance, and non-empty mount/Space provenance is immutable.
+A user-owned Space document is created only when the request explicitly supplies a valid `space_id`. A raw user token without `space_id` keeps the legacy direct-publish behavior. Once user provenance is persisted, every later publishing mutation (direct republish, draft save/promote, and element replacement) revalidates the persisted Space: user sessions must still be members, while Bot sessions must have the same trusted owner and Space. Omitting `space_id` does not bypass this check. Bot/legacy provenance cannot be converted to user provenance. Mount/Space provenance is immutable for user-owned documents; existing Bot/legacy remount behavior remains unchanged.
 
 ## Agent workflow
 

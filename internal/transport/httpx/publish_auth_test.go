@@ -118,6 +118,31 @@ func TestUserPublishSpaceMembership(t *testing.T) {
 	}
 }
 
+func TestBotRepublishUserDocumentRequiresPersistedSpace(t *testing.T) {
+	withStubIdentity(t, stubIdentity{uid: "owner-1", spaces: map[string]bool{"space-1": true}})
+	h := newTestServer(t, ownerAuthCfg())
+	userHeaders := map[string]string{octoUIDHeaderName: "owner-1", "Content-Type": "application/json", "token": "user-token"}
+	body := `{"slug":"user-bot-edit","html":"<html><body>user</body></html>","space_id":"space-1"}`
+	if rec := do(t, h, http.MethodPost, "/v1/docs", userHeaders, body); rec.Code != http.StatusOK {
+		t.Fatalf("user publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botSpaceID: "space-2", botOwnerUID: "owner-1"})
+	botHeaders := map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"}
+	rec := do(t, h, http.MethodPost, "/v1/docs", botHeaders,
+		`{"slug":"user-bot-edit","html":"<html><body>bot</body></html>"}`)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "space_membership_required") {
+		t.Fatalf("cross-space bot republish = %d; want 403 space_membership_required: %s", rec.Code, rec.Body.String())
+	}
+
+	withStubIdentity(t, stubIdentity{botUID: "bot-1", botSpaceID: "space-1", botOwnerUID: "owner-1"})
+	rec = do(t, h, http.MethodPost, "/v1/docs", botHeaders,
+		`{"slug":"user-bot-edit","html":"<html><body>bot</body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same-owner same-space bot republish = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPublishExistingSlugAllowsAdmin(t *testing.T) {
 	mirror := &stubMirror{
 		slugToDoc: map[string]string{"publish-admin": "doc-admin"},

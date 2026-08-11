@@ -17,6 +17,8 @@ type botSessionCtxKey struct{}
 // registration authenticates as that bot, not a fixed process identity.
 type botTokenCtxKey struct{}
 
+type botSpaceCtxKey struct{}
+
 // botAuthMiddleware enriches Bearer bot tokens into the same context session
 // used by proxy trust headers. It is intentionally non-gating so legacy bearer
 // credentials continue through the existing capability chain.
@@ -64,6 +66,7 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), octoSessionCtxKey{}, sess)
 		ctx = context.WithValue(ctx, botSessionCtxKey{}, sess)
 		ctx = context.WithValue(ctx, botTokenCtxKey{}, token)
+		ctx = context.WithValue(ctx, botSpaceCtxKey{}, bi.SpaceID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -73,6 +76,13 @@ func botSessionFromCtx(ctx context.Context) *storage.Session {
 		return v
 	}
 	return nil
+}
+
+func botSpaceFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(botSpaceCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
 }
 
 // botTokenFromCtx returns the publishing bot's own bearer token stashed by

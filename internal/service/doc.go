@@ -192,7 +192,7 @@ const (
 	publishStatusRegisterFailed  = "registration_failed"
 )
 
-var spaceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+var spaceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // ValidSpaceID reports whether a space id is valid for user publishing.
 func ValidSpaceID(spaceID string) bool { return spaceIDRe.MatchString(strings.TrimSpace(spaceID)) }
@@ -383,6 +383,13 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 	if !hasMount || strings.TrimSpace(existingMount) == "" {
 		existingMount = inferredLegacyMount(existingUser, spaceID, groupNo, threadID)
 	}
+	if !existingUser {
+		restoreLegacyMount(in, existingMount, groupNo, threadID)
+		if creator := meta.CreatorUID(); creator != "" {
+			in.CreatorUID = creator
+		}
+		return nil
+	}
 	if in.SpaceID != "" && spaceID != "" && in.SpaceID != spaceID {
 		return apperr.Conflict("document space is immutable", "space_conflict")
 	}
@@ -416,6 +423,27 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 		in.CreatorUID = creator
 	}
 	return nil
+}
+
+func restoreLegacyMount(in *PublishInput, existingMount, groupNo, threadID string) {
+	if in.MountType == "" {
+		in.MountType = existingMount
+	}
+	switch in.MountType {
+	case "group":
+		if in.GroupNo == "" {
+			in.GroupNo = groupNo
+		}
+		in.ThreadID = ""
+	case "thread":
+		if in.ThreadID == "" {
+			in.ThreadID = threadID
+		}
+		in.GroupNo = ""
+	default:
+		in.GroupNo, in.ThreadID = "", ""
+	}
+	in.mountContextKnown = in.MountType != ""
 }
 
 // ElementView is the outer HTML of a single artifact located by aid.
@@ -721,6 +749,14 @@ func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in
 	}
 	if in.UserPublish && !existingUser {
 		return nil, PublishInput{}, apperr.Conflict("document publishing identity is immutable", "publish_provenance_conflict")
+	}
+	if !existingUser {
+		restoreLegacyMount(&in, existingMount, existingGroup, existingThread)
+		in.MountTypePresent = in.mountContextKnown
+		if creator := prev.CreatorUID(); creator != "" {
+			in.CreatorUID = creator
+		}
+		return prev, in, nil
 	}
 	if in.SpaceID != "" && existingSpace != "" && in.SpaceID != existingSpace {
 		return nil, PublishInput{}, apperr.Conflict("document space is immutable", "space_conflict")

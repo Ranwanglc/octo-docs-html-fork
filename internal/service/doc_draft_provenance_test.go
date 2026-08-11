@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -136,7 +137,7 @@ func TestSaveDraftRejectsUserClaimOfDraftWithoutMetaBeforeWriting(t *testing.T) 
 	}
 }
 
-func TestLegacyGroupMetadataRejectsConflictingGroupBeforeBackfill(t *testing.T) {
+func TestLegacyGroupMetadataAllowsBotRemount(t *testing.T) {
 	docs, store := draftProvenanceFixture()
 	ctx := context.Background()
 	if err := store.PutMeta(ctx, "legacy-group", storage.DocMeta{Slug: "legacy-group", Extra: map[string]any{
@@ -148,17 +149,53 @@ func TestLegacyGroupMetadataRejectsConflictingGroupBeforeBackfill(t *testing.T) 
 	_, err := docs.Publish(ctx, PublishInput{
 		Slug: "legacy-group", HTML: "<p>new</p>", MountType: "group", GroupNo: "group-new",
 	})
-	requireAppCode(t, err, "mount_conflict")
+	if err != nil {
+		t.Fatalf("legacy bot remount: %v", err)
+	}
 	meta, getErr := store.GetMeta(ctx, "legacy-group")
 	if getErr != nil || meta == nil {
 		t.Fatalf("meta = %+v, err=%v", meta, getErr)
 	}
 	_, _, groupNo, _ := meta.PublishProvenance()
-	if groupNo != "group-old" {
-		t.Fatalf("persisted group overwritten: %q", groupNo)
+	if groupNo != "group-new" {
+		t.Fatalf("persisted group = %q, want group-new", groupNo)
 	}
-	if versions, listErr := store.ListVersions(ctx, "legacy-group"); listErr != nil || len(versions) != 0 {
-		t.Fatalf("versions after rejection = %v, err=%v", versions, listErr)
+	if versions, listErr := store.ListVersions(ctx, "legacy-group"); listErr != nil || len(versions) != 1 {
+		t.Fatalf("versions after remount = %v, err=%v", versions, listErr)
+	}
+}
+
+func TestValidSpaceIDMatchesDocsBackendLimit(t *testing.T) {
+	if !ValidSpaceID(strings.Repeat("a", 64)) {
+		t.Fatal("64-character space id rejected")
+	}
+	if ValidSpaceID(strings.Repeat("a", 65)) {
+		t.Fatal("65-character space id accepted")
+	}
+}
+
+func TestLegacyBotCrossMountClearsStaleLocation(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	if err := store.PutMeta(ctx, "legacy-thread-move", storage.DocMeta{Slug: "legacy-thread-move", Extra: map[string]any{
+		storage.MountTypeExtraKey: "thread",
+		storage.ThreadIDExtraKey:  "thread-old",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := docs.Publish(ctx, PublishInput{
+		Slug: "legacy-thread-move", HTML: "<p>new</p>", MountType: "group", GroupNo: "group-new",
+	}); err != nil {
+		t.Fatalf("legacy bot cross-mount: %v", err)
+	}
+	meta, err := store.GetMeta(ctx, "legacy-thread-move")
+	if err != nil || meta == nil {
+		t.Fatalf("meta = %+v, err=%v", meta, err)
+	}
+	_, _, groupNo, threadID := meta.PublishProvenance()
+	if groupNo != "group-new" || threadID != "" {
+		t.Fatalf("persisted location: group=%q thread=%q", groupNo, threadID)
 	}
 }
 

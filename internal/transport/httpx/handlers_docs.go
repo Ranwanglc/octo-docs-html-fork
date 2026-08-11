@@ -158,8 +158,9 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
 	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
+	spaceID := ""
 	if userPublish {
-		spaceID := strings.TrimSpace(body.SpaceID)
+		spaceID = strings.TrimSpace(body.SpaceID)
 		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
 			return apperr.Validation("valid space_id required", "space_id_invalid")
 		}
@@ -177,7 +178,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:          creatorUID,
 		PublisherToken:      botTokenFromCtx(r.Context()),
-		SpaceID:             body.SpaceID,
+		SpaceID:             spaceID,
 		UserPublish:         userPublish,
 		AuthorizeProvenance: s.provenanceAuthorizer(r),
 	}, func(exists bool) error {
@@ -211,8 +212,9 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	// as publish, so the draft's author survives into the promoted version.
 	creatorUID := creatorUIDFromCtx(r.Context())
 	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
+	spaceID := ""
 	if userPublish {
-		spaceID := strings.TrimSpace(body.SpaceID)
+		spaceID = strings.TrimSpace(body.SpaceID)
 		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
 			return apperr.Validation("valid space_id required", "space_id_invalid")
 		}
@@ -229,7 +231,7 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:          creatorUID,
 		UserPublish:         userPublish,
-		SpaceID:             body.SpaceID,
+		SpaceID:             spaceID,
 		AuthorizeProvenance: s.provenanceAuthorizer(r),
 	})
 	if err != nil {
@@ -262,8 +264,17 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) provenanceAuthorizer(r *http.Request) service.ProvenanceAuthorizer {
-	if botSessionFromCtx(r.Context()) != nil {
-		return nil
+	if bot := botSessionFromCtx(r.Context()); bot != nil {
+		spaceID := botSpaceFromCtx(r.Context())
+		return func(_ context.Context, provenance service.PublishProvenance) error {
+			if !provenance.UserPublish {
+				return nil
+			}
+			if bot.OwnerUID != provenance.CreatorUID || spaceID != provenance.SpaceID {
+				return apperr.Forbidden("space membership required", "space_membership_required")
+			}
+			return nil
+		}
 	}
 	uid, token := creatorUIDFromCtx(r.Context()), userToken(r)
 	return func(ctx context.Context, provenance service.PublishProvenance) error {
