@@ -215,6 +215,43 @@ func TestPublishOmittedMountRestoresPersistedMountContext(t *testing.T) {
 	}
 }
 
+func TestPublishUnregisteredRepublishKeepsStatusAndSkipsLegacySideEffects(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &noopRegistrar{}
+	var reconciled atomic.Int32
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20).
+		WithDocsBackendRegistration(registrar, nil).
+		WithGrantReconciler(func(context.Context, string) error {
+			reconciled.Add(1)
+			return nil
+		})
+
+	ctx := context.Background()
+	first, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "unregistered-republish", HTML: "<html><body><p>v1</p></body></html>", Title: "Old",
+	})
+	if err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+	second, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "unregistered-republish", HTML: "<html><body><p>v2</p></body></html>", Title: "New",
+	})
+	if err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+	if first.Status != "published_unregistered" || second.Status != "published_unregistered" {
+		t.Fatalf("statuses = %q, %q; want published_unregistered", first.Status, second.Status)
+	}
+	if got := registrar.renamed.Load(); got != 0 {
+		t.Fatalf("rename calls = %d; want 0", got)
+	}
+	if got := reconciled.Load(); got != 0 {
+		t.Fatalf("reconcile calls = %d; want 0", got)
+	}
+}
+
 func TestPublishExplicitEmptyMountPreservesExistingMount(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()

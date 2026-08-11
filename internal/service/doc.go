@@ -213,6 +213,10 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	}
 	if in.UserPublish {
 		in.SpaceID = strings.TrimSpace(in.SpaceID)
+		in.CreatorUID = strings.TrimSpace(in.CreatorUID)
+		if in.CreatorUID == "" {
+			return nil, apperr.Conflict("user publish provenance requires a creator", "publish_provenance_conflict")
+		}
 		if !spaceIDRe.MatchString(in.SpaceID) {
 			return nil, apperr.Validation("valid space_id required", "space_id_invalid")
 		}
@@ -380,15 +384,24 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 		spaceID = in.SpaceID
 	}
 	existingMount, hasMount := meta.MountType()
-	if !hasMount || strings.TrimSpace(existingMount) == "" {
-		existingMount = inferredLegacyMount(existingUser, spaceID, groupNo, threadID)
-	}
 	if !existingUser {
-		restoreLegacyMount(in, existingMount, groupNo, threadID)
+		if restoreErr := restoreLegacyMount(in, existingMount, hasMount, groupNo, threadID); restoreErr != nil {
+			return restoreErr
+		}
 		if creator := meta.CreatorUID(); creator != "" {
 			in.CreatorUID = creator
 		}
 		return nil
+	}
+	creator := strings.TrimSpace(meta.CreatorUID())
+	if creator == "" {
+		return apperr.Conflict("user publish provenance is incomplete", "publish_provenance_conflict")
+	}
+	if !ValidSpaceID(spaceID) {
+		return apperr.Conflict("user publish provenance is incomplete", "publish_provenance_conflict")
+	}
+	if !hasMount {
+		existingMount = inferredLegacyMount(existingUser, spaceID, groupNo, threadID)
 	}
 	if in.SpaceID != "" && spaceID != "" && in.SpaceID != spaceID {
 		return apperr.Conflict("document space is immutable", "space_conflict")
@@ -419,15 +432,25 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 	if threadID != "" {
 		in.ThreadID = threadID
 	}
-	if creator := meta.CreatorUID(); creator != "" {
-		in.CreatorUID = creator
-	}
+	in.CreatorUID = creator
 	return nil
 }
 
-func restoreLegacyMount(in *PublishInput, existingMount, groupNo, threadID string) {
+func restoreLegacyMount(in *PublishInput, existingMount string, hasMount bool, groupNo, threadID string) error {
+	requestKnown := in.mountContextKnown || in.MountTypePresent
+	normalized := ""
 	if in.MountType == "" {
-		in.MountType = existingMount
+		var err error
+		normalized, err = normalizeMountType(existingMount)
+		if err != nil {
+			return err
+		}
+	}
+	if !hasMount && normalized == "" {
+		normalized = inferredLegacyMount(false, "", groupNo, threadID)
+	}
+	if in.MountType == "" && (!requestKnown || hasMount && normalized != "") {
+		in.MountType = normalized
 	}
 	switch in.MountType {
 	case "group":
@@ -443,7 +466,8 @@ func restoreLegacyMount(in *PublishInput, existingMount, groupNo, threadID strin
 	default:
 		in.GroupNo, in.ThreadID = "", ""
 	}
-	in.mountContextKnown = in.MountType != ""
+	in.mountContextKnown = requestKnown || hasMount || normalized != ""
+	return nil
 }
 
 // ElementView is the outer HTML of a single artifact located by aid.
@@ -709,6 +733,10 @@ func (s *DocService) SaveDraftWithProvenance(ctx context.Context, slug, html, ti
 func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in PublishInput) (*storage.DocMeta, PublishInput, error) {
 	if in.UserPublish {
 		in.SpaceID = strings.TrimSpace(in.SpaceID)
+		in.CreatorUID = strings.TrimSpace(in.CreatorUID)
+		if in.CreatorUID == "" {
+			return nil, PublishInput{}, apperr.Conflict("user publish provenance requires a creator", "publish_provenance_conflict")
+		}
 		if !ValidSpaceID(in.SpaceID) {
 			return nil, PublishInput{}, apperr.Validation("valid space_id required", "space_id_invalid")
 		}
@@ -738,25 +766,30 @@ func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in
 	}
 	existingUser, existingSpace, existingGroup, existingThread := prev.PublishProvenance()
 	existingMount, hasMount := prev.MountType()
-	if hasMount {
-		existingMount, err = normalizeMountType(existingMount)
-		if err != nil {
-			return nil, PublishInput{}, err
-		}
-	}
-	if !hasMount || existingMount == "" {
-		existingMount = inferredLegacyMount(existingUser, existingSpace, existingGroup, existingThread)
-	}
 	if in.UserPublish && !existingUser {
 		return nil, PublishInput{}, apperr.Conflict("document publishing identity is immutable", "publish_provenance_conflict")
 	}
 	if !existingUser {
-		restoreLegacyMount(&in, existingMount, existingGroup, existingThread)
+		if restoreErr := restoreLegacyMount(&in, existingMount, hasMount, existingGroup, existingThread); restoreErr != nil {
+			return nil, PublishInput{}, restoreErr
+		}
 		in.MountTypePresent = in.mountContextKnown
 		if creator := prev.CreatorUID(); creator != "" {
 			in.CreatorUID = creator
 		}
 		return prev, in, nil
+	}
+	creator := strings.TrimSpace(prev.CreatorUID())
+	if creator == "" || !ValidSpaceID(existingSpace) {
+		return nil, PublishInput{}, apperr.Conflict("user publish provenance is incomplete", "publish_provenance_conflict")
+	}
+	if hasMount {
+		existingMount, err = normalizeMountType(existingMount)
+		if err != nil {
+			return nil, PublishInput{}, err
+		}
+	} else {
+		existingMount = inferredLegacyMount(existingUser, existingSpace, existingGroup, existingThread)
 	}
 	if in.SpaceID != "" && existingSpace != "" && in.SpaceID != existingSpace {
 		return nil, PublishInput{}, apperr.Conflict("document space is immutable", "space_conflict")
@@ -780,9 +813,7 @@ func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in
 	if existingMount != "" {
 		in.MountType, in.MountTypePresent = existingMount, true
 	}
-	if creator := prev.CreatorUID(); creator != "" {
-		in.CreatorUID = creator
-	}
+	in.CreatorUID = creator
 	return prev, in, nil
 }
 
@@ -982,6 +1013,13 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 // missing blob.
 func (s *DocService) Remove(ctx context.Context, slug string) error {
 	err := s.lock.With(ctx, slug, func() error {
+		meta, metaErr := s.meta.GetMeta(ctx, slug)
+		if metaErr != nil {
+			return metaErr
+		}
+		if userPublish, _, _, _ := meta.PublishProvenance(); userPublish {
+			return apperr.Conflict("user-published documents must be deleted through docs-backend", "user_publish_delete_unsupported")
+		}
 		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
 			return err
 		}
