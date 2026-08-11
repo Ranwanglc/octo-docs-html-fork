@@ -37,6 +37,7 @@ func multipartFile(t *testing.T, filename string, data []byte) (string, string) 
 func TestAssetLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	authJSON := authorHdr()
+	seedLegacyRef(t, h, "pics", testUID)
 
 	// Publish a doc so it exists (and to mint a share code from).
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
@@ -145,6 +146,7 @@ func TestAssetLifecycle(t *testing.T) {
 func TestAssetUploadRejectsDisallowedType(t *testing.T) {
 	h := newTestServer(t, nil)
 	authJSON := authorHdr()
+	seedLegacyRef(t, h, "d", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", authJSON,
 		`{"slug":"d","html":"<html><body><p>x</p></body></html>"}`)
 
@@ -163,6 +165,7 @@ func TestAssetUploadRejectsDisallowedType(t *testing.T) {
 func TestAssetUploadRequiresAuthor(t *testing.T) {
 	h := newTestServer(t, nil)
 	authJSON := authorHdr()
+	seedLegacyRef(t, h, "d", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", authJSON,
 		`{"slug":"d","html":"<html><body><p>x</p></body></html>"}`)
 
@@ -179,6 +182,7 @@ func TestAssetUploadRequiresAuthor(t *testing.T) {
 func uploadAssetForRange(t *testing.T, h http.Handler, slug string, data []byte) (sha, code string) {
 	t.Helper()
 	authJSON := authorHdr()
+	seedLegacyRef(t, h, slug, testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
 		`{"slug":"`+slug+`","html":"<html><body><p>x</p></body></html>"}`); rec.Code != 200 {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
@@ -282,6 +286,7 @@ func TestAssetPDFEmbedPath(t *testing.T) {
 	}
 	h := newTestServer(t, cfg)
 	authJSON := authorHdr()
+	seedLegacyRef(t, h, "paper", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authJSON,
 		`{"slug":"paper","html":"<html><body><p>doc</p></body></html>"}`); rec.Code != 200 {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())

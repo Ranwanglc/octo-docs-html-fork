@@ -26,6 +26,7 @@ func TestPublishExistingSlugRequiresEditCapability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newTestServer(t, nil)
 			slug := "publish-" + tc.role
+			seedLegacyRef(t, h, slug, testUID)
 
 			if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody(slug, "owner-v1")); rec.Code != http.StatusOK {
 				t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
@@ -55,6 +56,7 @@ func TestPublishExistingSlugRequiresEditCapability(t *testing.T) {
 
 func TestPublishExistingSlugRejectsUnrelatedIdentity(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "publish-owned", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-owned", "owner-v1")); rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -72,9 +74,9 @@ func TestPublishExistingSlugRejectsUnrelatedIdentity(t *testing.T) {
 }
 
 func TestPublishNewSlugAllowsAuthenticatedIdentity(t *testing.T) {
-	h := newTestServer(t, nil)
-	headers := map[string]string{octoUIDHeaderName: "new-author", "Content-Type": "application/json"}
-	rec := do(t, h, http.MethodPost, "/v1/docs", headers, publishBody("publish-new", "new-v1"))
+	h := canonicalCreateServer(t, "publish-new", nil)
+	headers := map[string]string{"Authorization": "Bearer publisher-token", "Content-Type": "application/json"}
+	rec := do(t, h, http.MethodPost, "/v1/docs", headers, `{"idempotency_key":"publish-new-1","html":"<html><body><p>new-v1</p></body></html>"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first publish = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -86,6 +88,7 @@ func TestPublishExistingSlugAllowsAdmin(t *testing.T) {
 		roles:     map[string]int{"doc-admin|admin": service.DocMemberRoleAdmin},
 	}
 	h := newServerWithMirror(t, mirror)
+	seedLegacyRef(t, h, "publish-admin", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-admin", "owner-v1")); rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -99,6 +102,7 @@ func TestPublishExistingSlugAllowsAdmin(t *testing.T) {
 
 func TestPublishExistingSlugAllowsCreator(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "publish-creator", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), publishBody("publish-creator", "owner-v1")); rec.Code != http.StatusOK {
 		t.Fatalf("seed publish = %d: %s", rec.Code, rec.Body.String())
 	}

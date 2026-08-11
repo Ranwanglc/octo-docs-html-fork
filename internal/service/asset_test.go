@@ -182,7 +182,7 @@ func TestDocRemovePurgesAssets(t *testing.T) {
 	if _, err := assets.Put(ctx, "d", bytes.NewReader(pngBytes), "a.png"); err != nil {
 		t.Fatal(err)
 	}
-	if err := docs.Remove(ctx, "d"); err != nil {
+	if err := docs.RemoveAuthorized(ctx, "d", service.DeleteAuth{PublisherToken: "test-internal"}); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	list, err := assets.List(ctx, "d")

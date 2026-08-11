@@ -16,20 +16,32 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
 )
 
-func TestExplicitCanonicalCreateHasNoDocRefAndReturnsDocIDAsSlug(t *testing.T) {
+func canonicalCreateServer(t *testing.T, docID string, inspect func(map[string]any)) http.Handler {
+	t.Helper()
 	withStubIdentity(t, stubIdentity{botUID: "publisher-bot", botName: "Publisher", botSpaceID: "space-1", botOwnerUID: "owner-1"})
-	var got map[string]any
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&got)
-		_ = json.NewEncoder(w).Encode(map[string]any{"docId": "doc-42", "octoDocSlug": "doc-42", "shareUrl": "https://docs.test/d/doc-42", "created": true})
+		if inspect != nil && got["idempotencyKey"] != nil {
+			inspect(got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"docId": docID, "octoDocSlug": docID, "shareUrl": "https://docs.test/d/" + docID,
+			"publisherUid": "publisher-bot", "spaceId": "space-1", "created": true,
+		})
 	}))
-	defer backend.Close()
+	t.Cleanup(backend.Close)
 	cfg := &config.Config{BaseURL: "https://html.test", MaxHTMLBytes: 5 << 20, MaxAssetBytes: 25 << 20, AssetMIMEAllow: []string{"image/png"}, BotAuthEnabled: true, OctoServerBaseURL: "http://octo.test"}
 	store := memory.New()
 	lock := sluglock.NewMemory()
 	comments := service.NewCommentService(store, lock)
 	docs := service.NewDocService(store, store, comments, lock, cfg.BaseURL, cfg.MaxHTMLBytes).WithDocsBackendRegistration(docsbackend.New(backend.URL, "process-token", nil), nil)
-	h := httpx.New(httpx.Deps{Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments, Auth: service.NewAuthService(store, cfg, lock), OverlayJS: "x"}).Handler()
+	return httpx.New(httpx.Deps{Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments, Auth: service.NewAuthService(store, cfg, lock), OverlayJS: "x"}).Handler()
+}
+
+func TestExplicitCanonicalCreateHasNoDocRefAndReturnsDocIDAsSlug(t *testing.T) {
+	var got map[string]any
+	h := canonicalCreateServer(t, "doc-42", func(body map[string]any) { got = body })
 	rec := do(t, h, http.MethodPost, "/v1/docs", map[string]string{"Authorization": "Bearer publisher-token", "Content-Type": "application/json"}, `{"idempotency_key":"create-1","html":"<html>x</html>"}`)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -47,17 +59,7 @@ func TestExplicitCanonicalCreateHasNoDocRefAndReturnsDocIDAsSlug(t *testing.T) {
 }
 
 func TestExplicitCanonicalDraftCreateReturnsCreated(t *testing.T) {
-	withStubIdentity(t, stubIdentity{botUID: "publisher-bot", botName: "Publisher", botSpaceID: "space-1", botOwnerUID: "owner-1"})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"docId": "doc-draft", "octoDocSlug": "doc-draft", "shareUrl": "https://docs.test/d/doc-draft", "created": true})
-	}))
-	defer backend.Close()
-	cfg := &config.Config{BaseURL: "https://html.test", MaxHTMLBytes: 5 << 20, MaxAssetBytes: 25 << 20, AssetMIMEAllow: []string{"image/png"}, BotAuthEnabled: true, OctoServerBaseURL: "http://octo.test"}
-	store := memory.New()
-	lock := sluglock.NewMemory()
-	comments := service.NewCommentService(store, lock)
-	docs := service.NewDocService(store, store, comments, lock, cfg.BaseURL, cfg.MaxHTMLBytes).WithDocsBackendRegistration(docsbackend.New(backend.URL, "process-token", nil), nil)
-	h := httpx.New(httpx.Deps{Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments, Auth: service.NewAuthService(store, cfg, lock), OverlayJS: "x"}).Handler()
+	h := canonicalCreateServer(t, "doc-draft", nil)
 
 	rec := do(t, h, http.MethodPost, "/v1/docs/draft", map[string]string{"Authorization": "Bearer publisher-token", "Content-Type": "application/json"}, `{"idempotency_key":"draft-1","html":"<html>x</html>"}`)
 	if rec.Code != http.StatusCreated {

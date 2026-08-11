@@ -155,12 +155,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
 	publisherToken := botTokenFromCtx(r.Context())
+	publisherUID, publisherSpaceID := trustedPublisherFromCtx(r.Context())
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
-		PublisherToken: publisherToken, IdempotencyKey: body.IdempotencyKey,
+		PublisherToken: publisherToken, PublisherUID: publisherUID, PublisherSpaceID: publisherSpaceID, IdempotencyKey: body.IdempotencyKey,
 	}, func(canonicalSlug string, exists bool) error {
 		if !exists {
 			return nil
@@ -187,11 +188,13 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) error
 	if body.HTML == "" {
 		return apperr.Validation("html (file) required", "html_required")
 	}
+	publisherUID, publisherSpaceID := trustedPublisherFromCtx(r.Context())
 	res, err := s.docs.SaveDraftMountedAuthorized(r.Context(), service.PublishInput{
 		HTML: body.HTML, Title: body.Title, IdempotencyKey: body.IdempotencyKey,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID: creatorUIDFromCtx(r.Context()), PublisherToken: botTokenFromCtx(r.Context()),
+		PublisherUID: publisherUID, PublisherSpaceID: publisherSpaceID,
 	}, func(canonicalSlug string, exists bool) error {
 		if !exists {
 			return nil
@@ -402,7 +405,6 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 			auth.ActorUID = session.Login
 			auth.SuperAdmin = session.Role == "superAdmin"
 		}
-		auth.DelegationSecret = s.cfg.DocsHTMLDelegationSecret
 	}
 	if err := s.docs.RemoveAuthorized(r.Context(), slug, auth); err != nil {
 		return err

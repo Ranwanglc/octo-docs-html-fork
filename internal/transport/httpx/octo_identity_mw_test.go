@@ -47,7 +47,7 @@ func newTestServerWithProxyIdentity(t *testing.T) http.Handler {
 		Assets: assets, Auth: auth,
 		OverlayJS: "/* overlay */",
 	})
-	return srv.Handler()
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}
 }
 
 // publish is a helper: create a doc as the test creator (trust-header uid) so
@@ -57,12 +57,7 @@ func newTestServerWithProxyIdentity(t *testing.T) http.Handler {
 // by accidentally matching the creator.
 func publish(t *testing.T, h http.Handler, slug string) {
 	t.Helper()
-	rec := do(t, h, http.MethodPost, "/v1/docs",
-		authorHdr(),
-		`{"slug":"`+slug+`","version":1,"html":"<html><body><p>hello</p></body></html>","meta":{"title":"T"}}`)
-	if rec.Code != 200 {
-		t.Fatalf("publish %s = %d: %s", slug, rec.Code, rec.Body.String())
-	}
+	seedLegacyDoc(t, h, slug, testUID, "T", "<html><body><p>hello</p></body></html>")
 }
 
 // generateShareCode calls the author-only share endpoint (as the creator) and
@@ -397,8 +392,8 @@ func TestPublishAcceptsBotOwnerOrTrustHeaderSession(t *testing.T) {
 		rec := do(t, h, http.MethodPost, "/v1/docs",
 			map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"},
 			body("publishBotOwner"))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("publish with bot owner session = %d: %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("unknown-ref publish with bot owner session = %d; want 404: %s", rec.Code, rec.Body.String())
 		}
 	})
 
@@ -408,6 +403,7 @@ func TestPublishAcceptsBotOwnerOrTrustHeaderSession(t *testing.T) {
 		// doc listens only on the internal network, so the headers are trusted.
 		withStubIdentity(t, stubIdentity{botUID: "botuid", botName: "Deploy Bot", botSpaceID: "space1"})
 		h := newTestServer(t, botCfg(true))
+		seedLegacyRef(t, h, "publishTrustHeaderSession", "trusted-user")
 		rec := do(t, h, http.MethodPost, "/v1/docs",
 			map[string]string{
 				"Content-Type": "application/json",
@@ -464,10 +460,13 @@ func TestBotAuthEnabledProviderDisabledWriteTokenNoLongerAuthorizes(t *testing.T
 		t.Fatalf("delete with write token (retired) = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
-	// The creator (trust-header uid == stamped creator_uid) still authorizes it.
+	// Human deletion fails closed when safe remote delegation is unavailable.
 	rec = do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", authorHdrNoCT(), "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("delete as creator = %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("delete as creator = %d; want 401 fail-closed: %s", rec.Code, rec.Body.String())
+	}
+	if got := do(t, h, http.MethodGet, "/d/botFallbackWrite/v/1", authorHdrNoCT(), ""); got.Code != http.StatusOK {
+		t.Fatalf("failed human delete must retain local document: %d %s", got.Code, got.Body.String())
 	}
 }
 

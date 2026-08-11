@@ -98,7 +98,7 @@ func newServerWithMirror(t *testing.T, mirror *stubMirror) http.Handler {
 		Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments,
 		Assets: assets, Auth: auth, OverlayJS: "/* overlay */",
 	})
-	return srv.Handler()
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}
 }
 
 // A3① (real user visiting own doc): creator_uid == selfUID → CapAuthor.

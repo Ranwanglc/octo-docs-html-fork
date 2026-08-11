@@ -15,11 +15,18 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
 )
 
 // newTestServer builds a full server backed by the in-memory store.
+type fixtureHandler struct {
+	http.Handler
+	docs  *service.DocService
+	store *memory.Store
+}
+
 func newTestServer(t *testing.T, cfg *config.Config) http.Handler {
 	t.Helper()
 	if cfg == nil {
@@ -40,7 +47,39 @@ func newTestServer(t *testing.T, cfg *config.Config) http.Handler {
 		Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments, Assets: assets, Auth: auth,
 		OverlayJS: "/* overlay */",
 	})
-	return srv.Handler()
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}
+}
+
+func seedLegacyDoc(t *testing.T, h http.Handler, slug, creatorUID, title, html string) {
+	t.Helper()
+	f, ok := h.(*fixtureHandler)
+	if !ok {
+		t.Fatalf("handler does not expose the storage fixture")
+	}
+	if title == "" {
+		title = slug
+	}
+	if html == "" {
+		html = "<html><body><p>fixture</p></body></html>"
+	}
+	if _, err := f.docs.Publish(t.Context(), service.PublishInput{
+		Slug: slug, CreatorUID: creatorUID, Title: title, HTML: html,
+	}); err != nil {
+		t.Fatalf("seed legacy doc %s: %v", slug, err)
+	}
+}
+
+func seedLegacyRef(t *testing.T, h http.Handler, slug, creatorUID string) {
+	t.Helper()
+	f, ok := h.(*fixtureHandler)
+	if !ok {
+		t.Fatalf("handler does not expose the storage fixture")
+	}
+	if err := f.store.PutMeta(t.Context(), slug, storage.DocMeta{
+		Slug: slug, Extra: map[string]any{storage.CreatorUIDExtraKey: creatorUID},
+	}); err != nil {
+		t.Fatalf("seed legacy ref %s: %v", slug, err)
+	}
 }
 
 // testUID is the octo uid used by tests to seed publishes and drive author-only
@@ -119,30 +158,12 @@ func TestPublishRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestPublishResponseIncludesRegistrationState(t *testing.T) {
+func TestPublishUnknownRefReturnsNotFound(t *testing.T) {
 	h := newTestServer(t, nil)
-	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+	rec := do(t, h.(*fixtureHandler).Handler, http.MethodPost, "/v1/docs", authorHdr(),
 		`{"slug":"contract","html":"<html><body>x</body></html>"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
-	}
-	var envelope struct {
-		Data map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
-		t.Fatal(err)
-	}
-	if envelope.Data["registered"] != false || envelope.Data["status"] != "published_unregistered" {
-		t.Fatalf("publish data = %#v", envelope.Data)
-	}
-	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
-		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
-	}
-	if envelope.Data["url"] != "" {
-		t.Fatalf("unregistered response must not expose a url: %#v", envelope.Data)
-	}
-	if _, ok := envelope.Data["render_url"]; ok {
-		t.Fatalf("render_url must not be present in the publish response: %#v", envelope.Data)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("publish = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -150,6 +171,7 @@ func TestPublishMountedFailsClosedWithoutRegistrar(t *testing.T) {
 	for _, mountType := range []string{"group", "thread"} {
 		t.Run(mountType, func(t *testing.T) {
 			h := newTestServer(t, nil)
+			seedLegacyRef(t, h, "contract-"+mountType, testUID)
 			body := fmt.Sprintf(`{"slug":"contract-%s","html":"<html><body>x</body></html>","mount_type":%q}`, mountType, mountType)
 			rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), body)
 			if rec.Code != http.StatusOK {
@@ -170,6 +192,7 @@ func TestPublishMountedFailsClosedWithoutRegistrar(t *testing.T) {
 
 func TestPublishOmittedOrEmptyMountPreservesExistingMount(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "mounted-presence", testUID)
 	for _, body := range []string{
 		`{"slug":"mounted-presence","html":"<html><body>v1</body></html>","mount_type":"group"}`,
 		`{"slug":"mounted-presence","html":"<html><body>v2</body></html>"}`,
@@ -221,6 +244,7 @@ func TestPublishTitleFromMeta(t *testing.T) {
 	// comments}); the server must read meta.title when no top-level title is given.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "titled", testUID)
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"titled","version":1,"html":"<html><body><h1>x</h1></body></html>","meta":{"title":"From Meta","slug":"titled"}}`)
 	if rec.Code != 200 {
@@ -240,6 +264,7 @@ func TestRenderAlwaysPublishedMode(t *testing.T) {
 	// stays anonymous.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "m", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"m","version":1,"html":"<html><body><h1>x</h1></body></html>","meta":{"title":"M"}}`)
 	body := do(t, h, http.MethodGet, "/d/m/v/1", authorHdrNoCT(), "").Body.String()
@@ -268,6 +293,7 @@ func TestCommentRequiresCapability(t *testing.T) {
 	// hidden). Comment capability (author or commenter member) is required.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "anon", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"anon","version":1,"html":"<html><body><p>hello world</p></body></html>"}`)
 
@@ -289,6 +315,7 @@ func TestCommentRequiresCapability(t *testing.T) {
 func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "private-mutations", testUID)
 	for _, html := range []string{
 		`{"slug":"private-mutations","html":"<html><body><p>v1</p></body></html>"}`,
 		`{"slug":"private-mutations","html":"<html><body><p>v2</p></body></html>"}`,
@@ -332,6 +359,7 @@ func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
 func TestPublishRenderLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "hello", testUID)
 
 	// Publish v1.
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
@@ -390,6 +418,7 @@ func TestRenderLatestVersion(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
 	readAuth := authorHdrNoCT()
+	seedLegacyRef(t, h, "latest", testUID)
 
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"latest","html":"<html><body><h1>Version One</h1></body></html>"}`)
@@ -434,6 +463,7 @@ func TestRenderLatestVersion(t *testing.T) {
 
 func TestRenderLatestVersionNoVersions(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "nover", "admin-uid")
 	// Draft-first (no prior publish) can only be created by a superAdmin: draft
 	// save does not stamp a creator_uid, so author-by-creator never applies here
 	// and only the IsOwner short-circuit grants CapAuthor on a not-yet-existing doc.
@@ -452,6 +482,7 @@ func TestRenderLatestVersionNoVersions(t *testing.T) {
 
 func TestDraftLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "dr", "admin-uid")
 	// Draft-first flow: use a superAdmin identity (see TestRenderLatestVersionNoVersions
 	// for why draft-first requires IsOwner rather than a creator match).
 	auth := adminHdr()
@@ -527,6 +558,7 @@ func TestDraftLifecycle(t *testing.T) {
 func TestCommentLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "doc", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"doc","html":"<html><body><p>hello world</p></body></html>"}`)
 
@@ -577,6 +609,7 @@ func TestCommentLifecycle(t *testing.T) {
 func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "anchors", testUID)
 	for _, html := range []string{
 		`{"slug":"anchors","html":"<html><body><p>v1</p></body></html>"}`,
 		`{"slug":"anchors","html":"<html><body><p>v2</p></body></html>"}`,
@@ -663,6 +696,7 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "strict-versions", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"strict-versions","html":"<html><body><section>v1</section></body></html>"}`); rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
@@ -691,6 +725,7 @@ func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 func TestForkExport(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "f", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"f","html":"<html><body><p>content here</p></body></html>"}`)
 	_ = do(t, h, http.MethodPost, "/v1/comments", auth,
@@ -718,6 +753,7 @@ func TestForkExportLatestVersion(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
 	rd := authorHdrNoCT()
+	seedLegacyRef(t, h, "fl", testUID)
 
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"fl","html":"<html><body><p>old export</p></body></html>"}`)
@@ -763,6 +799,7 @@ func TestInvalidSlugRejected(t *testing.T) {
 // must fold back at version 1.
 func TestDraftOnlyLatestResolvesToConcreteVersion(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "draftonly", "admin-uid")
 	// Draft-first requires the IsOwner (superAdmin) identity; no publish happens,
 	// so ListVersions returns zero versions for this slug.
 	auth := adminHdr()
@@ -847,6 +884,7 @@ func TestDraftOnlyLatestResolvesToConcreteVersion(t *testing.T) {
 func TestSentinelNumericVersionRejected(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "sentinel", testUID)
 	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"sentinel","html":"<html><body><p>v1</p></body></html>"}`); rec.Code != http.StatusOK {
 		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())

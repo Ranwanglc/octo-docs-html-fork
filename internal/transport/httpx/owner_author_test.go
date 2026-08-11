@@ -33,12 +33,7 @@ func ownerAuthCfg() *config.Config {
 
 func publishAsBot(t *testing.T, h http.Handler, slug string) {
 	t.Helper()
-	rec := do(t, h, http.MethodPost, "/v1/docs",
-		map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"},
-		`{"slug":"`+slug+`","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish as bot %s = %d: %s", slug, rec.Code, rec.Body.String())
-	}
+	seedLegacyDoc(t, h, slug, "owner-1", "T", "<html><body><p>hi</p></body></html>")
 }
 
 // 验收1: bot 发布 → creator = bot 的 OwnerUID（用户 uid），不是 bot uid。
@@ -47,11 +42,14 @@ func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 	h := newTestServer(t, ownerAuthCfg())
 	publishAsBot(t, h, "docO")
 
-	// The owner user (its own trust-header login == creator_uid) can author.
+	// Human deletion fails closed without safe remote delegation.
 	rec := do(t, h, http.MethodDelete, "/v1/docs/docO",
 		map[string]string{octoUIDHeaderName: "owner-1"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("owner delete = %d; creator_uid should be owner uid: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("owner delete = %d; want 401 fail-closed: %s", rec.Code, rec.Body.String())
+	}
+	if got := do(t, h, http.MethodGet, "/d/docO/v/1", map[string]string{octoUIDHeaderName: "owner-1"}, ""); got.Code != http.StatusOK {
+		t.Fatalf("failed human delete must retain local document: %d %s", got.Code, got.Body.String())
 	}
 
 	// The bot's own uid must NOT be the creator: a user logging in as the bot uid
@@ -114,6 +112,7 @@ func TestSameOwnerBotAuthorsOthersRejected(t *testing.T) {
 func TestUnrelatedBotNotSuperAdminOnOthersDoc(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-X", botName: "Bot X", botSpaceID: "s1", botOwnerUID: "owner-X"})
 	h := newTestServer(t, ownerAuthCfg())
+	seedLegacyRef(t, h, "docHuman", "human-owner")
 	// Doc created by a real user (creator_uid = "human-owner"), no bot involved.
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{octoUIDHeaderName: "human-owner", "Content-Type": "application/json"},
@@ -133,62 +132,23 @@ func TestUnrelatedBotNotSuperAdminOnOthersDoc(t *testing.T) {
 
 // 验收4: 普通用户/bot draft-first 建新 slug → 成功（不再 404），且 creator 落对。
 func TestDraftFirstCreateByUser(t *testing.T) {
-	h := newTestServer(t, ownerAuthCfg())
-	// A brand-new slug with no prior publish. Under the old gate this 404'd
-	// (requireDocAuthor found no creator to match). Now a first draft succeeds.
-	draft := `{"html":"<html><body><p>draft</p></body></html>","meta":{"title":"D"}}`
-	rec := do(t, h, http.MethodPut, "/v1/docs/newSlugU/draft",
-		map[string]string{octoUIDHeaderName: "user-42", "Content-Type": "application/json"}, draft)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("draft-first save = %d; want 200 (no longer 404): %s", rec.Code, rec.Body.String())
-	}
-
-	// creator was stamped to the creating user → same user can promote (author).
-	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugU/draft/promote",
-		map[string]string{octoUIDHeaderName: "user-42"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("promote as creator = %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// A different user must not author it after creation.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugU",
-		map[string]string{octoUIDHeaderName: "someone-else"}, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("other user delete = %d; want 404: %s", rec.Code, rec.Body.String())
-	}
-	// The creator can delete it.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugU",
-		map[string]string{octoUIDHeaderName: "user-42"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("creator delete = %d: %s", rec.Code, rec.Body.String())
+	h := canonicalCreateServer(t, "newSlugU", nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs/draft",
+		map[string]string{"Authorization": "Bearer publisher-token", "Content-Type": "application/json"},
+		`{"idempotency_key":"new-slug-u","html":"<html><body><p>draft</p></body></html>"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("canonical draft create = %d; want 201: %s", rec.Code, rec.Body.String())
 	}
 }
 
-// draft-first by a bot stamps the OwnerUID as creator (same owner rule), and the
-// owner user can then author the promoted doc.
-func TestDraftFirstCreateByBotStampsOwner(t *testing.T) {
+func TestBotDraftUnknownRefReturnsNotFound(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-D", botName: "Bot D", botSpaceID: "s1", botOwnerUID: "owner-D"})
 	h := newTestServer(t, ownerAuthCfg())
 	draft := `{"html":"<html><body><p>draft</p></body></html>","meta":{"title":"D"}}`
 	rec := do(t, h, http.MethodPut, "/v1/docs/newSlugBot/draft",
 		map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"}, draft)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bot draft-first save = %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// The owner user (owner-D) can author it — creator was stamped to OwnerUID.
-	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugBot/draft/promote",
-		map[string]string{octoUIDHeaderName: "owner-D"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("owner promote of bot draft = %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// The stamped creator survives promote: confirm a published version exists and
-	// the owner can delete.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/newSlugBot",
-		map[string]string{octoUIDHeaderName: "owner-D"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("owner delete after promote = %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("bot draft to unknown ref = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -207,7 +167,7 @@ func newTestServerWithStore(t *testing.T, cfg *config.Config) (http.Handler, *me
 		Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments,
 		Assets: assets, Auth: auth, OverlayJS: "/* overlay */",
 	})
-	return srv.Handler(), store
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}, store
 }
 
 // BLOCKER-1: a pre-migration/write-token-era doc can have real versions (or a
@@ -301,18 +261,12 @@ func TestCreatorlessExistingDocNotHijackableViaDraft(t *testing.T) {
 
 // A genuinely brand-new slug (meta==nil) still succeeds via draft-first.
 func TestBrandNewSlugDraftFirstStillWorks(t *testing.T) {
-	h := newTestServer(t, ownerAuthCfg())
-	draft := `{"html":"<html><body><p>new</p></body></html>","meta":{"title":"N"}}`
-	rec := do(t, h, http.MethodPut, "/v1/docs/freshSlug/draft",
-		map[string]string{octoUIDHeaderName: "user-77", "Content-Type": "application/json"}, draft)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("brand-new draft-first = %d; want 200: %s", rec.Code, rec.Body.String())
-	}
-	// The creator was stamped; a different user cannot author it.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/freshSlug",
-		map[string]string{octoUIDHeaderName: "other"}, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("other user delete of freshSlug = %d; want 404: %s", rec.Code, rec.Body.String())
+	h := canonicalCreateServer(t, "freshSlug", nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs/draft",
+		map[string]string{"Authorization": "Bearer publisher-token", "Content-Type": "application/json"},
+		`{"idempotency_key":"fresh-slug","html":"<html><body><p>new</p></body></html>"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("canonical brand-new draft = %d; want 201: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -321,6 +275,7 @@ func TestBrandNewSlugDraftFirstStillWorks(t *testing.T) {
 // authorizes (it is not an author credential).
 func TestWipeCommentsAuthorOnly(t *testing.T) {
 	h := newTestServer(t, ownerAuthCfg())
+	seedLegacyRef(t, h, "wdoc", "creator-w")
 	// Creator publishes and seeds a comment.
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{octoUIDHeaderName: "creator-w", "Content-Type": "application/json"},
@@ -382,6 +337,7 @@ func TestWipeCommentsAuthorOnly(t *testing.T) {
 func TestBotAuthAcceptsTokenHeader(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	h := newTestServer(t, ownerAuthCfg())
+	seedLegacyRef(t, h, "docTokHdr", "owner-1")
 
 	// Publish carrying the bot token in the `token` header (NOT Bearer).
 	rec := do(t, h, http.MethodPost, "/v1/docs",
@@ -391,11 +347,10 @@ func TestBotAuthAcceptsTokenHeader(t *testing.T) {
 		t.Fatalf("publish via token header = %d; want 200 (bot must resolve from token header): %s", rec.Code, rec.Body.String())
 	}
 
-	// The bot's owner can author it → proves the bot session (creator_uid=owner-1)
-	// was filled from the token-header publish.
+	// Bot deletion remains allowed through delegated remote authorization.
 	rec = do(t, h, http.MethodDelete, "/v1/docs/docTokHdr",
-		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+		map[string]string{"token": "bot-token"}, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("owner delete = %d; want 200 (token-header publish must stamp creator): %s", rec.Code, rec.Body.String())
+		t.Fatalf("bot delete = %d; want 200: %s", rec.Code, rec.Body.String())
 	}
 }

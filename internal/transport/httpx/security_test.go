@@ -48,6 +48,7 @@ func newTestServerWithHealth(t *testing.T, check func() error) http.Handler {
 func TestDocsPrivateByDefault(t *testing.T) {
 	h := newTestServer(t, nil) // default cfg
 	auth := authorHdr()
+	seedLegacyRef(t, h, "doc", testUID)
 
 	// Publish a doc (author = creator uid stamped from the trust-header session).
 	pub := do(t, h, http.MethodPost, "/v1/docs", auth,
@@ -123,6 +124,7 @@ func TestDocsPrivateByDefault(t *testing.T) {
 func TestCodeCookieExchange(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "doc", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"doc","html":"<html><body><p>hi</p></body></html>"}`)
 	sh := do(t, h, http.MethodPost, "/v1/docs/doc/share", authorHdrNoCT(), "")
@@ -152,6 +154,7 @@ func TestCodeCookieExchange(t *testing.T) {
 func TestAuthorMutationsGatedByCreator(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "br", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"br","html":"<html><body><p>hi</p></body></html>"}`)
 
@@ -199,6 +202,7 @@ func TestAuthorMutationsGatedByCreator(t *testing.T) {
 func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "rot", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"rot","html":"<html><body><p>hi</p></body></html>"}`)
 
@@ -245,6 +249,7 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
+	seedLegacyRef(t, h, "cap", testUID)
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"cap","html":"<html><body><p>hi</p></body></html>"}`)
 	sh := do(t, h, http.MethodPost, "/v1/docs/cap/share", authorHdrNoCT(), "")
@@ -280,6 +285,7 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 
 func TestDraftRenderInjectsEditorCapabilityMarker(t *testing.T) {
 	h := newTestServer(t, nil)
+	seedLegacyRef(t, h, "draft-cap", testUID)
 	rec := do(t, h, http.MethodPut, "/v1/docs/draft-cap/draft", authorHdr(),
 		`{"html":"<html><body><p>draft</p></body></html>"}`)
 	if rec.Code != http.StatusOK {
@@ -342,6 +348,7 @@ func indexOf(s, sub string) int {
 func TestFrameAncestorsCSPHeader(t *testing.T) {
 	publish := func(h http.Handler) {
 		auth := authorHdr()
+		seedLegacyRef(t, h, "embed", testUID)
 		pub := do(t, h, http.MethodPost, "/v1/docs", auth,
 			`{"slug":"embed","html":"<html><body><p>hi</p></body></html>"}`)
 		if pub.Code != http.StatusOK {
@@ -397,6 +404,7 @@ func TestRateLimitIgnoresSpoofedXFF(t *testing.T) {
 		TrustProxyHeaders: false,
 	}
 	h := newTestServer(t, cfg)
+	seedLegacyRef(t, h, "d", testUID)
 
 	// Publish slug "d" so the creator has author cap; reactions are
 	// capability-gated, so without a real doc + credential they would 404 at the

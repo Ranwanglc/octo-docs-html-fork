@@ -43,7 +43,7 @@ func newServerWithMirrorAndBotAuth(t *testing.T, mirror *stubMirror) (http.Handl
 		Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments,
 		Assets: assets, Auth: auth, OverlayJS: "/* overlay */",
 	})
-	return srv.Handler(), store
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}, store
 }
 
 // A3② unregistered doc: DocIDBySlug returns ok=false (doc not in doc_member
@@ -66,12 +66,7 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	}
 }
 
-// A3② P1-a lockout close: doc IS registered but no
-// doc_member owner-admin row (M1 has not backfilled yet, or docs-backend
-// registered the doc atomically without owner-admin). A3②'s fallback keys on
-// creator_uid, which is stamped at publish and never revocable, so falling back
-// is safe: it cannot resurrect a revoked grant. An earlier revision gated this
-// path on docRegistered and locked the owner out of their own doc; the gate was removed
+// Registered docs do not fall back to legacy creator metadata.
 // on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
 func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
@@ -84,15 +79,12 @@ func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	// creator_uid==ownerUID lands owner-2 as CapAuthor.
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 200 (P1-a fallback restored): %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
-// A3② P1-a lockout close, with unrelated doc_member rows present. Mirror
-// has entries for other uids (a reader grant and a stranger) but no
-// owner-admin row. Confirms the fallback keys strictly on
-// creator_uid==ownerUID via meta and is not confused by adjacent rows.
+// Unrelated member rows do not restore legacy creator fallback.
 func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-3", botName: "Bot Three", botSpaceID: "s3", botOwnerUID: "owner-3"})
 	mirror := &stubMirror{
@@ -107,8 +99,8 @@ func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg3/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 200 (creator_uid fallback wins): %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -137,6 +129,7 @@ func TestA3OwnerAdminInDocMemberStillWinsAfterFallback(t *testing.T) {
 // meta.grants[uid]=reader keeps the caller readable.
 func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
 	h, store := newServerWithMirrorAndBotAuth(t, &stubMirror{}) // no slugToDoc
+	seedLegacyRef(t, h, "docR", "owner-42")
 
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
@@ -163,6 +156,7 @@ func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
 func TestA4RegisteredDocDeletedRowNoFallback(t *testing.T) {
 	mirror := &stubMirror{slugToDoc: map[string]string{"docR": "dR"}} // registered, no reader row
 	h, store := newServerWithMirrorAndBotAuth(t, mirror)
+	seedLegacyRef(t, h, "docR", "owner-42")
 
 	rec := do(t, h, http.MethodPost, "/v1/docs",
 		map[string]string{octoUIDHeaderName: "owner-42", "Content-Type": "application/json"},
@@ -220,6 +214,7 @@ func seedLegacyReaderGrant(t *testing.T, store *memory.Store, slug, uid string) 
 func TestRevokeClosesReadWithStaleMetaGrant(t *testing.T) {
 	mirror := &stubMirror{slugToDoc: map[string]string{"docM": "dM"}}
 	h, store := newServerWithMirrorAndBotAuth(t, mirror)
+	seedLegacyRef(t, h, "docM", "owner-42")
 
 	// Owner publishes; creator_uid = owner-42.
 	rec := do(t, h, http.MethodPost, "/v1/docs",

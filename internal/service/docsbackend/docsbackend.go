@@ -5,8 +5,6 @@ package docsbackend
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +16,6 @@ import (
 )
 
 const defaultTimeout = 5 * time.Second
-const delegatedDeletePath = "/v1/internal/html-docs"
 
 // CanonicalDocumentDeletedError marks a terminal idempotency-key replay whose
 // canonical document was deleted. Callers must not retry or recreate locally.
@@ -46,8 +43,10 @@ type Registration struct {
 // registration. Created is false when the idempotent slug registration already
 // existed.
 type RegistrationResult struct {
-	DocID       string `json:"docId"`
-	OctoDocSlug string `json:"octoDocSlug"`
+	DocID        string `json:"docId"`
+	OctoDocSlug  string `json:"octoDocSlug"`
+	PublisherUID string `json:"publisherUid"`
+	SpaceID      string `json:"spaceId"`
 
 	ShareURL string `json:"shareUrl"`
 	Created  bool   `json:"created"`
@@ -61,14 +60,6 @@ type Rename struct {
 // Published is the post-commit notification payload.
 type Published struct {
 	Title string `json:"title,omitempty"`
-}
-
-// DelegatedDelete is the exact human-delete payload accepted by docs-backend.
-type DelegatedDelete struct {
-	Slug       string `json:"slug"`
-	DocID      string `json:"docId,omitempty"`
-	ActorUID   string `json:"actorUid"`
-	SuperAdmin bool   `json:"superAdmin"`
 }
 
 // Client posts registration mutations. Empty URL returns nil from New; all
@@ -151,57 +142,6 @@ func (c *Client) Delete(ctx context.Context, slug, token string) error {
 	}
 	_, err := c.doJSONAllowNotFound(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token)
 	return err
-}
-
-// DeleteDelegated signs exact JSON bytes and sends no authorization credential.
-func (c *Client) DeleteDelegated(ctx context.Context, in DelegatedDelete, secret string) error {
-	if c == nil {
-		return fmt.Errorf("docs-backend registrar is disabled")
-	}
-	if strings.TrimSpace(secret) == "" {
-		return fmt.Errorf("docs-backend delegated delete requires delegation secret")
-	}
-	body, err := json.Marshal(in)
-	if err != nil {
-		return fmt.Errorf("marshal docs-backend delegated delete request: %w", err)
-	}
-	base, err := url.Parse(c.registerURL)
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return fmt.Errorf("build docs-backend delegated delete request: invalid register URL")
-	}
-	endpoint := base.Scheme + "://" + base.Host + delegatedDeletePath
-	timestamp := fmt.Sprintf("%d", time.Now().Unix())
-	digest := sha256.Sum256(body)
-	input := fmt.Sprintf("v1\nDELETE\n%s\n%s\n%x", delegatedDeletePath, timestamp, digest)
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(input))
-	signature := fmt.Sprintf("v1=%x", mac.Sum(nil))
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, c.http.Timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build docs-backend delegated delete request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Octo-Timestamp", timestamp)
-	req.Header.Set("X-Octo-Signature", signature)
-	client := *c.http
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("docs-backend delegated delete request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if _, err = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); err != nil {
-		return fmt.Errorf("read docs-backend delegated delete response: %w", err)
-	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
-	}
-	return fmt.Errorf("docs-backend delegated delete returned HTTP %d", resp.StatusCode)
 }
 
 // Published notifies docs-backend after HTML content and metadata are durable.

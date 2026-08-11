@@ -307,9 +307,9 @@ func TestDelegatedDelete404RetainsLocalData(t *testing.T) {
 	ctx := context.Background()
 	_, _ = store.PutDoc(ctx, "canonical", 1, "x")
 	_ = store.PutMeta(ctx, "canonical", storage.DocMeta{Slug: "canonical", Versions: []storage.VersionRef{{N: 1}}, Extra: map[string]any{storage.CanonicalDocIDExtraKey: "canonical"}})
-	err := docs.RemoveAuthorized(ctx, "canonical", service.DeleteAuth{ActorUID: "human", DelegationSecret: strings.Repeat("s", 32)})
+	err := docs.RemoveAuthorized(ctx, "canonical", service.DeleteAuth{ActorUID: "human"})
 	if err == nil {
-		t.Fatal("delegated 404 reported success")
+		t.Fatal("human delete unexpectedly succeeded")
 	}
 	if versions, _ := store.ListVersions(ctx, "canonical"); len(versions) != 1 {
 		t.Fatalf("local data deleted after backend 404: %v", versions)

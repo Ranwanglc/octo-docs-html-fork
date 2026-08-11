@@ -16,8 +16,9 @@ import (
 
 var signedAssetRe = regexp.MustCompile(`/d/pics/assets/([0-9a-f]{64})\?sig=([^"&]+)&exp=([0-9]+)`)
 
-func seedDocWithAsset(t *testing.T, h http.Handler) string {
+func uploadSignedAsset(t *testing.T, h http.Handler) string {
 	t.Helper()
+	seedLegacyRef(t, h, "pics", testUID)
 	// Upload an asset first (author).
 	body, ct := multipartFile(t, "cat.gif", gifBytes)
 	rec := do(t, h, http.MethodPost, "/v1/docs/pics/assets",
@@ -54,7 +55,7 @@ func seedDocWithAsset(t *testing.T, h http.Handler) string {
 
 func TestRenderSignsAssetURLsAndServes(t *testing.T) {
 	h := newTestServer(t, nil)
-	sha := seedDocWithAsset(t, h)
+	sha := uploadSignedAsset(t, h)
 
 	// Render as the author (creator trust header). Rendered HTML must carry the
 	// asset URL stamped with a signature.

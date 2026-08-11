@@ -17,6 +17,7 @@ import (
 // stamped artifact, by rendering v1 and scraping the stamped attribute.
 func publishAndFirstAID(t *testing.T, h http.Handler, auth map[string]string, slug, html string) string {
 	t.Helper()
+	seedLegacyRef(t, h, slug, testUID)
 	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
 		`{"slug":"`+slug+`","html":`+jsonString(html)+`}`)
 	if rec.Code != 200 {

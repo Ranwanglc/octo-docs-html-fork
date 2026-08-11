@@ -59,6 +59,7 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 			// bot's OwnerUID matching the doc's creator_uid (see bestCred), not from
 			// a blanket role — otherwise every bot could write every doc.
 			OwnerUID: bi.OwnerUID,
+			SpaceID:  bi.SpaceID,
 			Created:  time.Now().UTC().Format(time.RFC3339),
 		}
 		ctx := context.WithValue(r.Context(), octoSessionCtxKey{}, sess)
@@ -82,4 +83,11 @@ func botTokenFromCtx(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+func trustedPublisherFromCtx(ctx context.Context) (string, string) {
+	if sess := botSessionFromCtx(ctx); sess != nil {
+		return sess.Login, sess.SpaceID
+	}
+	return "", ""
 }

@@ -26,8 +26,6 @@ type canonicalRegistrar struct {
 	tokens    []string
 	deletes   []struct{ ref, token string }
 	deleteErr error
-	delegated []docsbackend.DelegatedDelete
-	secrets   []string
 }
 
 func (r *canonicalRegistrar) Register(_ context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error) {
@@ -38,11 +36,6 @@ func (r *canonicalRegistrar) Register(_ context.Context, reg docsbackend.Registr
 func (*canonicalRegistrar) Rename(context.Context, string, string, string) {}
 func (r *canonicalRegistrar) Delete(_ context.Context, ref, token string) error {
 	r.deletes = append(r.deletes, struct{ ref, token string }{ref, token})
-	return r.deleteErr
-}
-func (r *canonicalRegistrar) DeleteDelegated(_ context.Context, in docsbackend.DelegatedDelete, secret string) error {
-	r.delegated = append(r.delegated, in)
-	r.secrets = append(r.secrets, secret)
 	return r.deleteErr
 }
 
@@ -85,7 +78,7 @@ func (r *retryRegistrar) Register(context.Context, docsbackend.Registration, str
 	if r.calls == 2 {
 		close(r.second)
 	}
-	return &docsbackend.RegistrationResult{DocID: "doc-concurrent", OctoDocSlug: "doc-concurrent", ShareURL: "u", Created: r.calls == 1}, nil
+	return &docsbackend.RegistrationResult{DocID: "doc-concurrent", OctoDocSlug: "doc-concurrent", ShareURL: "u", PublisherUID: "bot", SpaceID: "space", Created: r.calls != 1}, nil
 }
 func (*retryRegistrar) Rename(context.Context, string, string, string) {}
 func (*retryRegistrar) Delete(context.Context, string, string) error   { return nil }
@@ -262,7 +255,7 @@ func TestConcurrentCanonicalPublishRetryWaitsAndReturnsV1(t *testing.T) {
 	docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
 		WithDocsBackendRegistration(registrar, nil)
 	input := func(html string) service.PublishInput {
-		return service.PublishInput{HTML: html, IdempotencyKey: "same", PublisherToken: "bot"}
+		return service.PublishInput{HTML: html, IdempotencyKey: "same", PublisherToken: "bot", PublisherUID: "bot", PublisherSpaceID: "space"}
 	}
 	results := make(chan *service.PublishResult, 2)
 	errs := make(chan error, 2)
@@ -301,7 +294,7 @@ func TestConcurrentCanonicalDraftRetryWaitsAndDoesNotOverwrite(t *testing.T) {
 	docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
 		WithDocsBackendRegistration(registrar, nil)
 	input := func(html string) service.PublishInput {
-		return service.PublishInput{HTML: html, IdempotencyKey: "same", PublisherToken: "bot"}
+		return service.PublishInput{HTML: html, IdempotencyKey: "same", PublisherToken: "bot", PublisherUID: "bot", PublisherSpaceID: "space"}
 	}
 	results := make(chan *service.DraftResult, 2)
 	errs := make(chan error, 2)
@@ -503,29 +496,20 @@ func TestCanonicalDeleteUsesRequestCredentialAndMissingIsNotFound(t *testing.T) 
 	}
 }
 
-func TestHumanDeleteDelegatesCanonicalAndLegacyWithoutBotFallback(t *testing.T) {
+func TestHumanDeleteFailsClosedWithoutBotFallback(t *testing.T) {
 	registrar := &canonicalRegistrar{}
 	docs, store := canonicalDocs(t, registrar)
 	ctx := context.Background()
-	for _, tc := range []struct {
-		slug      string
-		canonical bool
-	}{{"doc-human", true}, {"legacy-human", false}} {
-		_, _ = store.PutDoc(ctx, tc.slug, 1, "x")
-		var extra map[string]any
-		if tc.canonical {
-			extra = map[string]any{storage.CanonicalDocIDExtraKey: tc.slug}
-		}
-		_ = store.PutMeta(ctx, tc.slug, storage.DocMeta{Slug: tc.slug, Versions: []storage.VersionRef{{N: 1}}, Extra: extra})
-		if err := docs.RemoveAuthorized(ctx, tc.slug, service.DeleteAuth{ActorUID: "human-admin", DelegationSecret: "shared-secret", SuperAdmin: true}); err != nil {
-			t.Fatal(err)
-		}
+	_, _ = store.PutDoc(ctx, "doc-human", 1, "x")
+	_ = store.PutMeta(ctx, "doc-human", storage.DocMeta{Slug: "doc-human", Versions: []storage.VersionRef{{N: 1}}, Extra: map[string]any{storage.CanonicalDocIDExtraKey: "doc-human"}})
+	if err := docs.RemoveAuthorized(ctx, "doc-human", service.DeleteAuth{ActorUID: "human-admin", SuperAdmin: true}); err == nil {
+		t.Fatal("human delete succeeded without safe backend capability")
 	}
-	if len(registrar.deletes) != 0 || len(registrar.delegated) != 2 {
-		t.Fatalf("bot=%+v delegated=%+v", registrar.deletes, registrar.delegated)
+	if len(registrar.deletes) != 0 {
+		t.Fatal("bot delete attempted")
 	}
-	if registrar.delegated[0].DocID != "doc-human" || registrar.delegated[1].DocID != "" || registrar.delegated[1].ActorUID != "human-admin" {
-		t.Fatalf("delegated=%+v", registrar.delegated)
+	if versions, _ := store.ListVersions(ctx, "doc-human"); len(versions) != 1 {
+		t.Fatalf("local deleted: %v", versions)
 	}
 }
 
@@ -541,7 +525,26 @@ func TestHumanDeleteEmptySecretFailsClosedAndRetainsLocalData(t *testing.T) {
 	if versions, _ := store.ListVersions(ctx, "closed"); len(versions) != 1 {
 		t.Fatalf("local data deleted: %v", versions)
 	}
-	if len(registrar.deletes) != 0 || len(registrar.delegated) != 0 {
+	if len(registrar.deletes) != 0 {
 		t.Fatal("remote delete attempted")
+	}
+}
+
+func TestLegacyHumanDeleteWithoutRegistrarFailsClosed(t *testing.T) {
+	docs, store := canonicalDocs(t, nil)
+	ctx := context.Background()
+	_, _ = store.PutDoc(ctx, "legacy-human", 1, "blob")
+	_ = store.PutMeta(ctx, "legacy-human", storage.DocMeta{Slug: "legacy-human", Title: "keep", Versions: []storage.VersionRef{{N: 1}}})
+	if err := docs.RemoveAuthorized(ctx, "legacy-human", service.DeleteAuth{ActorUID: "human", SuperAdmin: true}); err == nil {
+		t.Fatal("human delete succeeded without delegated backend capability")
+	}
+	if versions, _ := store.ListVersions(ctx, "legacy-human"); len(versions) != 1 {
+		t.Fatalf("blob deleted: %v", versions)
+	}
+	if got, _ := store.GetMeta(ctx, "legacy-human"); got == nil || got.Title != "keep" {
+		t.Fatalf("meta changed: %+v", got)
+	}
+	if err := docs.Remove(ctx, "legacy-human"); err == nil {
+		t.Fatal("public Remove bypassed authentication")
 	}
 }

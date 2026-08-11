@@ -33,12 +33,7 @@ func memberHeaders() map[string]string {
 
 func seedDoc(t *testing.T, h http.Handler, slug, title string) {
 	t.Helper()
-	auth := authorHdr()
-	body := `{"slug":"` + slug + `","version":1,"html":"<html><body><h1>` + title + `</h1></body></html>","meta":{"title":"` + title + `"}}`
-	rec := do(t, h, http.MethodPost, "/v1/docs", auth, body)
-	if rec.Code != 200 {
-		t.Fatalf("seed publish %s = %d: %s", slug, rec.Code, rec.Body.String())
-	}
+	seedLegacyDoc(t, h, slug, testUID, title, "<html><body><h1>"+title+"</h1></body></html>")
 }
 
 // parseListEnvelope decodes {"data":[...], "pagination":{...}} for assertions.

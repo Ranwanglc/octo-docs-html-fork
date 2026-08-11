@@ -44,7 +44,6 @@ services:
       ASSET_SIGNING_SECRET: ${ASSET_SIGNING_SECRET:-}
       DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
       DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
-      DOCS_HTML_DELEGATION_SECRET: ${DOCS_HTML_DELEGATION_SECRET:-}
       # NOTE: this database must be the SAME one docs-backend uses — doc_meta /
       # doc_member are shared tables. On a reader grant doc-app writes doc_member
       # in this DB directly (the mirror, not HTTP); docs-backend's preflight reads

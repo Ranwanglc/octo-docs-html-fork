@@ -139,6 +139,8 @@ type Session struct {
 	// author-capability. Empty for real-user (trust-header) sessions, whose own
 	// Login already is the author uid.
 	OwnerUID string `json:"-"`
+	// SpaceID exists only on sessions produced by verified bot auth.
+	SpaceID string `json:"-"`
 }
 
 // TokenRecord is a provisioned write token.

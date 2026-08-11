@@ -68,7 +68,7 @@ func newTestServerWithBinding(t *testing.T, binding service.BindingFetcher) http
 		Assets: assets, Auth: auth, DocBinding: docBinding,
 		OverlayJS: "/* overlay */",
 	})
-	return srv.Handler()
+	return &fixtureHandler{Handler: srv.Handler(), docs: docs, store: store}
 }
 
 // proxiedMember shorthand: trust-header identity for a role=member caller

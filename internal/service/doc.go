@@ -48,17 +48,12 @@ type DocRegistrar interface {
 	Delete(ctx context.Context, slug, token string) error
 }
 
-type delegatedDocDeleter interface {
-	DeleteDelegated(ctx context.Context, in docsbackend.DelegatedDelete, secret string) error
-}
-
-// DeleteAuth contains the disjoint bot and delegated-human authorization paths.
-// A non-empty bot token always selects the existing bot delete endpoint.
+// DeleteAuth carries the verified request bot token. Human deletes fail closed
+// until docs-backend provides a separately reviewed safe capability.
 type DeleteAuth struct {
-	PublisherToken   string
-	ActorUID         string
-	SuperAdmin       bool
-	DelegationSecret string
+	PublisherToken string
+	ActorUID       string
+	SuperAdmin     bool
 }
 
 type publishNotifier interface {
@@ -145,7 +140,9 @@ type PublishInput struct {
 	// docs-backend registration so the doc is attributed to whoever published it.
 	// Empty is valid for edits, but cannot allocate a new canonical mounted
 	// identity or authenticate backend mutations.
-	PublisherToken string
+	PublisherToken   string
+	PublisherUID     string
+	PublisherSpaceID string
 	// IdempotencyKey explicitly selects canonical create. Canonical create has no
 	// Slug; docs-backend allocates the doc ID before any local write.
 	IdempotencyKey string
@@ -262,7 +259,7 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 			if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
 				in.identity = &canonicalIdentity{docID: docID, shareURL: shareURL}
 			}
-		} else if authorize != nil && s.register != nil {
+		} else if authorize != nil {
 			return nil, apperr.NotFound("document not found")
 		}
 	}
@@ -275,6 +272,9 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 		}
 		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
 			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+		}
+		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || registration.PublisherUID != in.PublisherUID || registration.SpaceID != in.PublisherSpaceID) {
+			return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
 		}
 		in.Slug = registration.DocID
 		in.identity = &canonicalIdentity{docID: registration.DocID, shareURL: registration.ShareURL}
@@ -292,17 +292,12 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 			// Registration allocates the lock key, so it necessarily precedes this
 			// critical section. Retry inspection and initialization must both happen
 			// here: a Created=false caller waits for the creator and then observes v1.
-			if registration != nil && !registration.Created {
-				existing, xerr := s.existingPublishResult(ctx, in, registration.ShareURL)
+			if registration != nil {
+				existing, xerr := s.existingPublishResult(ctx, in, registration.ShareURL, authorize)
 				if xerr != nil {
 					return xerr
 				}
 				if existing != nil {
-					if authorize != nil {
-						if aerr := authorize(in.Slug, true); aerr != nil {
-							return aerr
-						}
-					}
 					result = existing
 					return nil
 				}
@@ -358,7 +353,7 @@ func (s *DocService) applyIdentity(result *PublishResult, identity *canonicalIde
 	result.Registered = true
 }
 
-func (s *DocService) existingPublishResult(ctx context.Context, in PublishInput, shareURL string) (*PublishResult, error) {
+func (s *DocService) existingPublishResult(ctx context.Context, in PublishInput, shareURL string, authorize func(string, bool) error) (*PublishResult, error) {
 	versions, err := s.blobs.ListVersions(ctx, in.Slug)
 	if err != nil {
 		return nil, err
@@ -375,6 +370,14 @@ func (s *DocService) existingPublishResult(ctx context.Context, in PublishInput,
 	meta, err := s.meta.GetMeta(ctx, in.Slug)
 	if err != nil {
 		return nil, err
+	}
+	if authorize != nil {
+		trustedRecovery := meta == nil && in.PublisherUID != "" && in.PublisherSpaceID != "" && in.identity != nil
+		if !trustedRecovery {
+			if err := authorize(in.Slug, true); err != nil {
+				return nil, err
+			}
+		}
 	}
 	// Registration and PutDoc(v1) may be durable before PutMeta fails. Repair
 	// that exact half-state under the shared canonical guard without rewriting the
@@ -802,7 +805,7 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 					return nil, err
 				}
 			}
-		} else if authorize != nil && s.register != nil {
+		} else if authorize != nil {
 			return nil, apperr.NotFound("document not found")
 		}
 	}
@@ -815,6 +818,9 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
 			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
 		}
+		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || registration.PublisherUID != in.PublisherUID || registration.SpaceID != in.PublisherSpaceID) {
+			return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
+		}
 		slug = registration.DocID
 		in.Slug = slug
 		in.identity = &canonicalIdentity{docID: registration.DocID, shareURL: registration.ShareURL}
@@ -823,17 +829,12 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 	var result *DraftResult
 	err = s.withCanonicalGuard(ctx, slug, explicitCreate, func() error {
 		return s.lock.With(ctx, slug, func() error {
-			if registration != nil && !registration.Created {
-				existing, xerr := s.existingDraftResult(ctx, in)
+			if registration != nil {
+				existing, xerr := s.existingDraftResult(ctx, in, authorize)
 				if xerr != nil {
 					return xerr
 				}
 				if existing != nil {
-					if authorize != nil {
-						if aerr := authorize(slug, true); aerr != nil {
-							return aerr
-						}
-					}
 					result = existing
 					return nil
 				}
@@ -859,7 +860,7 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 	return result, nil
 }
 
-func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput) (*DraftResult, error) {
+func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput, authorize func(string, bool) error) (*DraftResult, error) {
 	html, ok, err := s.blobs.GetDraft(ctx, in.Slug)
 	if err != nil || !ok {
 		return nil, err
@@ -867,6 +868,14 @@ func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput) (
 	meta, err := s.meta.GetMeta(ctx, in.Slug)
 	if err != nil {
 		return nil, err
+	}
+	if authorize != nil {
+		trustedRecovery := meta == nil && in.PublisherUID != "" && in.PublisherSpaceID != "" && in.identity != nil
+		if !trustedRecovery {
+			if err := authorize(in.Slug, true); err != nil {
+				return nil, err
+			}
+		}
 	}
 	hasDraftMeta := false
 	if meta != nil {
@@ -1122,6 +1131,9 @@ func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth Del
 		if err != nil {
 			return err
 		}
+		if strings.TrimSpace(auth.PublisherToken) == "" {
+			return apperr.Unauthorized("safe remote human delete unavailable", "delete_delegation_required")
+		}
 		docID, _, canonical := meta.CanonicalIdentity()
 		if canonical && docID != slug {
 			return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
@@ -1133,19 +1145,7 @@ func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth Del
 			deleteCtx, cancel := context.WithTimeout(ctx, docsBackendSideEffectTimeout)
 			defer cancel()
 			var derr error
-			if strings.TrimSpace(auth.PublisherToken) != "" {
-				derr = s.register.Delete(deleteCtx, slug, auth.PublisherToken)
-			} else {
-				deleter, ok := s.register.(delegatedDocDeleter)
-				if !ok || strings.TrimSpace(auth.ActorUID) == "" || strings.TrimSpace(auth.DelegationSecret) == "" {
-					return apperr.Unauthorized("remote delete requires authenticated delegation", "delete_delegation_required")
-				}
-				delegated := docsbackend.DelegatedDelete{Slug: slug, ActorUID: auth.ActorUID, SuperAdmin: auth.SuperAdmin}
-				if canonical {
-					delegated.DocID = slug
-				}
-				derr = deleter.DeleteDelegated(deleteCtx, delegated, auth.DelegationSecret)
-			}
+			derr = s.register.Delete(deleteCtx, slug, auth.PublisherToken)
 			if derr != nil {
 				return apperr.Upstream("docs-backend deletion failed", "delete_failed", derr)
 			}
@@ -1254,7 +1254,7 @@ func waitForRetry(ctx context.Context, delay time.Duration) bool {
 func (s *DocService) preRegister(ctx context.Context, in PublishInput) (*docsbackend.RegistrationResult, error) {
 	reg := docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: strings.TrimSpace(in.Title)}
 	if s.register == nil {
-		return nil, apperr.Upstream("docs-backend registration unavailable", "registration_failed", nil)
+		return nil, apperr.Upstream("docs-backend registration unavailable", "registration_unavailable", nil)
 	}
 	var result *docsbackend.RegistrationResult
 	var err error
