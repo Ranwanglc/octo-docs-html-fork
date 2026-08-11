@@ -48,8 +48,7 @@ type DocRegistrar interface {
 	Delete(ctx context.Context, slug, token string) error
 }
 
-// DeleteAuth carries the verified request bot token. Human deletes fail closed
-// until docs-backend provides a separately reviewed safe capability.
+// DeleteAuth carries verified bot or HTTP-layer human authorization.
 type DeleteAuth struct {
 	PublisherToken string
 	ActorUID       string
@@ -65,8 +64,7 @@ type lockerProvider interface {
 }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
-// CommentService uses. Canonical initialization additionally uses the metadata
-// store's deployment-wide locker; production stores provide database locks.
+// CommentService uses. Canonical creates use the metadata store's shared locker.
 func NewDocService(blobs storage.BlobStore, meta storage.MetadataStore, comments *CommentService, lock sluglock.Locker, baseURL string, maxBytes int64) *DocService {
 	return &DocService{blobs: blobs, meta: meta, comments: comments, lock: lock, baseURL: baseURL, maxBytes: maxBytes}
 }
@@ -288,31 +286,29 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	// version and clobber each other (and drift meta vs blobs).
 	var result *PublishResult
 	err = s.withCanonicalGuard(ctx, in.Slug, explicitCreate, func() error {
-		return s.lock.With(ctx, in.Slug, func() error {
-			// Registration allocates the lock key, so it necessarily precedes this
-			// critical section. Retry inspection and initialization must both happen
-			// here: a Created=false caller waits for the creator and then observes v1.
-			if registration != nil {
-				existing, xerr := s.existingPublishResult(ctx, in, registration.ShareURL, authorize)
-				if xerr != nil {
-					return xerr
-				}
-				if existing != nil {
-					result = existing
-					return nil
-				}
+		// Registration allocates the lock key, so it necessarily precedes this
+		// critical section. Retry inspection and initialization must both happen
+		// here: a Created=false caller waits for the creator and then observes v1.
+		if registration != nil {
+			existing, xerr := s.existingPublishResult(ctx, in, registration.ShareURL, authorize)
+			if xerr != nil {
+				return xerr
 			}
-			if authorize != nil {
-				exists, xerr := s.slugExists(ctx, in.Slug)
-				if xerr != nil {
-					return xerr
-				}
-				if aerr := authorize(in.Slug, exists); aerr != nil {
-					return aerr
-				}
+			if existing != nil {
+				result = existing
+				return nil
 			}
-			return s.publishIntoLockedResult(ctx, in, stamped, &result)
-		})
+		}
+		if authorize != nil {
+			exists, xerr := s.slugExists(ctx, in.Slug)
+			if xerr != nil {
+				return xerr
+			}
+			if aerr := authorize(in.Slug, exists); aerr != nil {
+				return aerr
+			}
+		}
+		return s.publishIntoLockedResult(ctx, in, stamped, &result)
 	})
 	if err != nil {
 		return nil, err
@@ -332,13 +328,13 @@ func (s *DocService) publishIntoLockedResult(ctx context.Context, in PublishInpu
 
 func (s *DocService) withCanonicalGuard(ctx context.Context, slug string, canonical bool, fn func() error) error {
 	if !canonical {
-		return fn()
+		return s.lock.With(ctx, slug, fn)
 	}
 	provider, ok := s.meta.(lockerProvider)
 	if !ok || provider.Locker() == nil {
 		return apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
-	return provider.Locker().With(ctx, "canonical-init:"+slug, fn)
+	return provider.Locker().With(ctx, slug, fn)
 }
 
 func (s *DocService) applyIdentity(result *PublishResult, identity *canonicalIdentity) {
@@ -828,28 +824,26 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 	stamped := core.StampAids(html)
 	var result *DraftResult
 	err = s.withCanonicalGuard(ctx, slug, explicitCreate, func() error {
-		return s.lock.With(ctx, slug, func() error {
-			if registration != nil {
-				existing, xerr := s.existingDraftResult(ctx, in, authorize)
-				if xerr != nil {
-					return xerr
-				}
-				if existing != nil {
-					result = existing
-					return nil
-				}
+		if registration != nil {
+			existing, xerr := s.existingDraftResult(ctx, in, authorize)
+			if xerr != nil {
+				return xerr
 			}
-			if authorize != nil {
-				current, xerr := s.slugExists(ctx, slug)
-				if xerr != nil {
-					return xerr
-				}
-				if aerr := authorize(slug, current); aerr != nil {
-					return aerr
-				}
+			if existing != nil {
+				result = existing
+				return nil
 			}
-			return s.saveDraftLocked(ctx, slug, title, creatorUID, stamped, in.identity, &result)
-		})
+		}
+		if authorize != nil {
+			current, xerr := s.slugExists(ctx, slug)
+			if xerr != nil {
+				return xerr
+			}
+			if aerr := authorize(slug, current); aerr != nil {
+				return aerr
+			}
+		}
+		return s.saveDraftLocked(ctx, slug, title, creatorUID, stamped, in.identity, &result)
 	})
 	if err != nil {
 		return nil, err
@@ -861,12 +855,15 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 }
 
 func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput, authorize func(string, bool) error) (*DraftResult, error) {
-	html, ok, err := s.blobs.GetDraft(ctx, in.Slug)
-	if err != nil || !ok {
-		return nil, err
-	}
 	meta, err := s.meta.GetMeta(ctx, in.Slug)
 	if err != nil {
+		return nil, err
+	}
+	if completed, ok := canonicalDraftCreateResult(meta, in.Slug, s.baseURL); ok {
+		return completed, nil
+	}
+	html, ok, err := s.blobs.GetDraft(ctx, in.Slug)
+	if err != nil || !ok {
 		return nil, err
 	}
 	if authorize != nil {
@@ -885,7 +882,8 @@ func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput, a
 	creatorComplete := in.CreatorUID == "" || (meta != nil && meta.CreatorUID() != "")
 	identityComplete := canonical && docID == in.Slug && in.identity != nil && shareURL == in.identity.shareURL
 	if !hasDraftMeta || !identityComplete || !creatorComplete {
-		if err := s.setDraftMeta(ctx, in.Slug, in.Title, in.CreatorUID, in.identity); err != nil {
+		stamped := core.StampAids(html)
+		if err := s.setDraftMeta(ctx, in.Slug, in.Title, in.CreatorUID, in.identity, int64(len(html)), len(stamped.AIDs)); err != nil {
 			return nil, err
 		}
 		meta, err = s.meta.GetMeta(ctx, in.Slug)
@@ -911,7 +909,7 @@ func (s *DocService) saveDraftLocked(ctx context.Context, slug, title, creatorUI
 	if err != nil {
 		return apperr.Upstream("draft write failed", "draft_write_failed", err)
 	}
-	if err := s.setDraftMeta(ctx, slug, title, creatorUID, identity); err != nil {
+	if err := s.setDraftMeta(ctx, slug, title, creatorUID, identity, size, len(stamped.AIDs)); err != nil {
 		return err
 	}
 	*result = &DraftResult{Slug: slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, slug), Size: size, AIDs: len(stamped.AIDs)}
@@ -999,7 +997,7 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title, publish
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string, identity *canonicalIdentity) error {
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string, identity *canonicalIdentity, size int64, aids int) error {
 	prev, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
 		return err
@@ -1024,6 +1022,7 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID s
 	if identity != nil {
 		extra[storage.CanonicalDocIDExtraKey] = identity.docID
 		extra[storage.CanonicalShareURLExtraKey] = identity.shareURL
+		extra[storage.CanonicalDraftCreateExtraKey] = map[string]any{"size": size, "aids": aids}
 	}
 	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 		Slug:     slug,
@@ -1031,6 +1030,25 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID s
 		Versions: prev.Versions,
 		Extra:    extra,
 	})
+}
+
+func canonicalDraftCreateResult(meta *storage.DocMeta, slug, baseURL string) (*DraftResult, bool) {
+	if meta == nil || meta.Extra == nil {
+		return nil, false
+	}
+	marker, ok := meta.Extra[storage.CanonicalDraftCreateExtraKey].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	size, _ := marker["size"].(float64)
+	if n, ok := marker["size"].(int64); ok {
+		size = float64(n)
+	}
+	aids, _ := marker["aids"].(float64)
+	if n, ok := marker["aids"].(int); ok {
+		aids = float64(n)
+	}
+	return &DraftResult{Slug: slug, DocID: slug, URL: fmt.Sprintf("%s/d/%s/draft", baseURL, slug), Size: int64(size), AIDs: int(aids)}, true
 }
 
 // clearDraftMeta removes the draft marker from meta (no-op if none / no meta).
@@ -1131,12 +1149,13 @@ func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth Del
 		if err != nil {
 			return err
 		}
-		if strings.TrimSpace(auth.PublisherToken) == "" {
-			return apperr.Unauthorized("safe remote human delete unavailable", "delete_delegation_required")
-		}
 		docID, _, canonical := meta.CanonicalIdentity()
 		if canonical && docID != slug {
 			return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+		}
+		hasBotToken := strings.TrimSpace(auth.PublisherToken) != ""
+		if !hasBotToken && (canonical || s.register != nil || strings.TrimSpace(auth.ActorUID) == "") {
+			return apperr.Unauthorized("safe remote human delete unavailable", "delete_delegation_required")
 		}
 		if canonical && s.register == nil {
 			return apperr.Upstream("docs-backend deletion unavailable", "delete_failed", nil)

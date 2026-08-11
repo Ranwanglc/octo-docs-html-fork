@@ -35,6 +35,10 @@ const CanonicalDocIDExtraKey = "canonical_doc_id"
 // CanonicalShareURLExtraKey stores the canonical read URL for idempotent retries.
 const CanonicalShareURLExtraKey = "canonical_share_url"
 
+// CanonicalDraftCreateExtraKey records completion of the one-shot canonical
+// draft create, surviving promotion and later versions.
+const CanonicalDraftCreateExtraKey = "canonical_draft_create"
+
 // PublishCommentsMergedVersionExtraKey stores the latest version whose
 // publish-time comment merge/reconciliation completed durably.
 const PublishCommentsMergedVersionExtraKey = "publish_comments_merged_version"

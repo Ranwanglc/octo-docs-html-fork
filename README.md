@@ -110,7 +110,7 @@ the server behaves as a standalone deploy.
 | **Login (http provider)** | `OCTO_SERVER_BASE_URL`, `LOGIN_ENABLED` | `/v1/auth/login` verifies a viewer against octo-server and populates the session |
 | **Bot-token auth** | `BOT_AUTH_ENABLED` (+ `OCTO_SERVER_BASE_URL`) | accepts an Octo bot token; the bot's owner uid becomes the doc creator/author |
 | **Doc-binding channel** | `OCTO_DOC_BINDING_URL`, `OCTO_DOC_BINDING_TTL_MS` | asks octo-server whether a uid may see a slug's binding (per-uid visibility), cached briefly |
-| **Web-docs registration/delete** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN` | registers HTML docs; bot deletes use the verified request bot token; human deletes fail closed until a safe backend capability is available |
+| **Web-docs registration/delete** | `DOCS_BACKEND_REGISTER_URL`, `DOCS_BACKEND_REGISTER_TOKEN` | registers HTML docs; remote deletes use the verified request bot token; standalone legacy docs may be deleted locally by an authorized human |
 | **Comment-event webhook** | `OCTO_WEBHOOK_URL`, `OCTO_DOC_EVENT_WEBHOOK_TOKEN` | pushes new-comment events to Octo IM (token required, sent as `X-Octo-Doc-Webhook-Token`) |
 | **Superadmin/owner** | `OWNER` | designates which signed-in Login sees the `/me` catalog |
 
@@ -125,7 +125,7 @@ and promoting the draft mints an immutable version. The client
 ```bash
 export BASE=https://docs.example.com
 
-# Create a private canonical draft, then promote it to an immutable version.
+# Create a private canonical draft (do not invent an unknown slug), then promote it.
 # Save data.doc_id from the 201 response and use it for all later operations:
 CREATE=$(curl -sS -H "Authorization: Bearer ${OCTO_BOT_TOKEN}" \
   -H "Content-Type: application/json" \

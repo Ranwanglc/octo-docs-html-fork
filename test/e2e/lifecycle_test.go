@@ -129,8 +129,8 @@ func TestFullLifecycle(t *testing.T) {
 		t.Fatal("fork mode missing")
 	}
 
-	// Human-only deletion cannot propagate to docs-backend, so it fails closed
-	// and leaves the local legacy document intact.
+	// A verified manager can delete a standalone legacy document locally because
+	// this service has no docs-backend registrar to reconcile.
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/docs/"+slug, nil)
 	req.Header.Set("X-Octo-Uid", e2eUID)
 	res, err := http.DefaultClient.Do(req)
@@ -138,12 +138,12 @@ func TestFullLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusUnauthorized {
+	if res.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(res.Body)
-		t.Fatalf("human DELETE = %d, want 401: %s", res.StatusCode, raw)
+		t.Fatalf("human DELETE = %d, want 200: %s", res.StatusCode, raw)
 	}
-	if versions, err := blobs.ListVersions(ctx, slug); err != nil || len(versions) != 1 || versions[0] != 1 {
-		t.Fatalf("versions after failed human delete = %v, %v; want [1], nil", versions, err)
+	if versions, err := blobs.ListVersions(ctx, slug); err != nil || len(versions) != 0 {
+		t.Fatalf("versions after standalone human delete = %v, %v; want [], nil", versions, err)
 	}
 }
 

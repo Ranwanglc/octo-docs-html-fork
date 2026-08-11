@@ -42,14 +42,22 @@ func TestBotPublishStampsOwnerUIDAsCreator(t *testing.T) {
 	h := newTestServer(t, ownerAuthCfg())
 	publishAsBot(t, h, "docO")
 
-	// Human deletion fails closed without safe remote delegation.
-	rec := do(t, h, http.MethodDelete, "/v1/docs/docO",
-		map[string]string{octoUIDHeaderName: "owner-1"}, "")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("owner delete = %d; want 401 fail-closed: %s", rec.Code, rec.Body.String())
+	// Standalone legacy deletion remains authenticated: an anonymous request is
+	// hidden even though an authorized owner may perform the local delete below.
+	rec := do(t, h, http.MethodDelete, "/v1/docs/docO", nil, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unauthenticated owner-doc delete = %d; want hidden 404: %s", rec.Code, rec.Body.String())
 	}
-	if got := do(t, h, http.MethodGet, "/d/docO/v/1", map[string]string{octoUIDHeaderName: "owner-1"}, ""); got.Code != http.StatusOK {
-		t.Fatalf("failed human delete must retain local document: %d %s", got.Code, got.Body.String())
+
+	// No canonical registrar is configured, so the owner already verified by
+	// requireDocManage may delete this standalone legacy document locally.
+	rec = do(t, h, http.MethodDelete, "/v1/docs/docO",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner delete of standalone legacy doc = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := do(t, h, http.MethodGet, "/d/docO/v/1", map[string]string{octoUIDHeaderName: "owner-1"}, ""); got.Code != http.StatusNotFound {
+		t.Fatalf("deleted standalone legacy document still renders: %d %s", got.Code, got.Body.String())
 	}
 
 	// The bot's own uid must NOT be the creator: a user logging in as the bot uid

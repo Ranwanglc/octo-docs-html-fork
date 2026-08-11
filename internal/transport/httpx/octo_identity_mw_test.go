@@ -460,13 +460,22 @@ func TestBotAuthEnabledProviderDisabledWriteTokenNoLongerAuthorizes(t *testing.T
 		t.Fatalf("delete with write token (retired) = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 
-	// Human deletion fails closed when safe remote delegation is unavailable.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", authorHdrNoCT(), "")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("delete as creator = %d; want 401 fail-closed: %s", rec.Code, rec.Body.String())
+	// No credential still cannot delete the standalone legacy document. Keep
+	// this assertion separate from the retired write-token case above so the
+	// local-delete contract does not weaken authentication.
+	rec = do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", nil, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete without authentication = %d; want hidden 404: %s", rec.Code, rec.Body.String())
 	}
-	if got := do(t, h, http.MethodGet, "/d/botFallbackWrite/v/1", authorHdrNoCT(), ""); got.Code != http.StatusOK {
-		t.Fatalf("failed human delete must retain local document: %d %s", got.Code, got.Body.String())
+
+	// For a standalone legacy document (no canonical registrar), the human
+	// already verified by requireDocManage may delete the local document.
+	rec = do(t, h, http.MethodDelete, "/v1/docs/botFallbackWrite", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete standalone legacy doc as creator = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := do(t, h, http.MethodGet, "/d/botFallbackWrite/v/1", authorHdrNoCT(), ""); got.Code != http.StatusNotFound {
+		t.Fatalf("deleted standalone legacy document still renders: %d %s", got.Code, got.Body.String())
 	}
 }
 

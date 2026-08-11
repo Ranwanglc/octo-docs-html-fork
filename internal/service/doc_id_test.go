@@ -249,9 +249,10 @@ func TestUnknownRefDoesNotCreateWhenRegistrarEnabled(t *testing.T) {
 }
 
 func TestConcurrentCanonicalPublishRetryWaitsAndReturnsV1(t *testing.T) {
-	store := memory.New()
+	base := memory.New()
 	registrar := &retryRegistrar{second: make(chan struct{})}
 	locker := &gatedLocker{inner: sluglock.NewMemory(), entered: make(chan struct{}), release: make(chan struct{})}
+	store := &recordingLockStore{Store: base, locker: locker}
 	docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
 		WithDocsBackendRegistration(registrar, nil)
 	input := func(html string) service.PublishInput {
@@ -288,9 +289,10 @@ func TestConcurrentCanonicalPublishRetryWaitsAndReturnsV1(t *testing.T) {
 }
 
 func TestConcurrentCanonicalDraftRetryWaitsAndDoesNotOverwrite(t *testing.T) {
-	store := memory.New()
+	base := memory.New()
 	registrar := &retryRegistrar{second: make(chan struct{})}
 	locker := &gatedLocker{inner: sluglock.NewMemory(), entered: make(chan struct{}), release: make(chan struct{})}
+	store := &recordingLockStore{Store: base, locker: locker}
 	docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20).
 		WithDocsBackendRegistration(registrar, nil)
 	input := func(html string) service.PublishInput {
@@ -339,6 +341,54 @@ func TestCanonicalRetryDoesNotCreateSecondVersion(t *testing.T) {
 	}
 	if versions, _ := store.ListVersions(ctx, "doc-42"); len(versions) != 1 {
 		t.Fatalf("versions=%v", versions)
+	}
+}
+
+func TestCanonicalDraftCreateReplayAfterPromoteDoesNotRestoreDraft(t *testing.T) {
+	registrar := &canonicalRegistrar{result: &docsbackend.RegistrationResult{DocID: "doc-draft", OctoDocSlug: "doc-draft", ShareURL: "u", Created: true}}
+	docs, store := canonicalDocs(t, registrar)
+	ctx := context.Background()
+	create := service.PublishInput{HTML: "old draft", IdempotencyKey: "draft-key", PublisherToken: "bot"}
+	if _, err := docs.SaveDraftMounted(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.Promote(ctx, "doc-draft", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "doc-draft", HTML: "new version"}); err != nil {
+		t.Fatal(err)
+	}
+	registrar.result.Created = false
+	if _, err := docs.SaveDraftMounted(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := store.GetDraft(ctx, "doc-draft"); ok {
+		t.Fatal("consumed canonical create key restored its old draft")
+	}
+	versions, _ := store.ListVersions(ctx, "doc-draft")
+	if len(versions) != 2 {
+		t.Fatalf("versions=%v, want promoted and updated versions only", versions)
+	}
+}
+
+func TestCanonicalDraftCreateReplayRepairsMissingCompletionMarker(t *testing.T) {
+	registrar := &canonicalRegistrar{result: &docsbackend.RegistrationResult{DocID: "doc-half", OctoDocSlug: "doc-half", ShareURL: "u", Created: false}}
+	docs, store := canonicalDocs(t, registrar)
+	ctx := context.Background()
+	if _, err := store.PutDraft(ctx, "doc-half", "persisted"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.SaveDraftMounted(ctx, service.PublishInput{HTML: "must not overwrite", IdempotencyKey: "half-key", PublisherToken: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteDraft(ctx, "doc-half"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.SaveDraftMounted(ctx, service.PublishInput{HTML: "must not restore", IdempotencyKey: "half-key", PublisherToken: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := store.GetDraft(ctx, "doc-half"); ok {
+		t.Fatal("repaired completion marker was not durable")
 	}
 }
 
@@ -513,14 +563,14 @@ func TestHumanDeleteFailsClosedWithoutBotFallback(t *testing.T) {
 	}
 }
 
-func TestHumanDeleteEmptySecretFailsClosedAndRetainsLocalData(t *testing.T) {
+func TestLegacyHumanDeleteWithRegistrarFailsClosedAndRetainsLocalData(t *testing.T) {
 	registrar := &canonicalRegistrar{}
 	docs, store := canonicalDocs(t, registrar)
 	ctx := context.Background()
 	_, _ = store.PutDoc(ctx, "closed", 1, "x")
 	_ = store.PutMeta(ctx, "closed", storage.DocMeta{Slug: "closed", Versions: []storage.VersionRef{{N: 1}}})
 	if err := docs.RemoveAuthorized(ctx, "closed", service.DeleteAuth{ActorUID: "human"}); err == nil {
-		t.Fatal("delete succeeded without delegation secret")
+		t.Fatal("delete succeeded without a remote credential")
 	}
 	if versions, _ := store.ListVersions(ctx, "closed"); len(versions) != 1 {
 		t.Fatalf("local data deleted: %v", versions)
@@ -530,21 +580,24 @@ func TestHumanDeleteEmptySecretFailsClosedAndRetainsLocalData(t *testing.T) {
 	}
 }
 
-func TestLegacyHumanDeleteWithoutRegistrarFailsClosed(t *testing.T) {
+func TestLegacyHumanDeleteWithoutRegistrarIsLocalOnly(t *testing.T) {
 	docs, store := canonicalDocs(t, nil)
 	ctx := context.Background()
 	_, _ = store.PutDoc(ctx, "legacy-human", 1, "blob")
 	_ = store.PutMeta(ctx, "legacy-human", storage.DocMeta{Slug: "legacy-human", Title: "keep", Versions: []storage.VersionRef{{N: 1}}})
-	if err := docs.RemoveAuthorized(ctx, "legacy-human", service.DeleteAuth{ActorUID: "human", SuperAdmin: true}); err == nil {
-		t.Fatal("human delete succeeded without delegated backend capability")
+	if err := docs.RemoveAuthorized(ctx, "legacy-human", service.DeleteAuth{ActorUID: "human", SuperAdmin: true}); err != nil {
+		t.Fatalf("authorized standalone legacy delete: %v", err)
 	}
-	if versions, _ := store.ListVersions(ctx, "legacy-human"); len(versions) != 1 {
-		t.Fatalf("blob deleted: %v", versions)
+	if versions, _ := store.ListVersions(ctx, "legacy-human"); len(versions) != 0 {
+		t.Fatalf("blob remains: %v", versions)
 	}
-	if got, _ := store.GetMeta(ctx, "legacy-human"); got == nil || got.Title != "keep" {
-		t.Fatalf("meta changed: %+v", got)
-	}
-	if err := docs.Remove(ctx, "legacy-human"); err == nil {
+
+	_, _ = store.PutDoc(ctx, "legacy-public", 1, "blob")
+	_ = store.PutMeta(ctx, "legacy-public", storage.DocMeta{Slug: "legacy-public", Versions: []storage.VersionRef{{N: 1}}})
+	if err := docs.Remove(ctx, "legacy-public"); err == nil {
 		t.Fatal("public Remove bypassed authentication")
+	}
+	if versions, _ := store.ListVersions(ctx, "legacy-public"); len(versions) != 1 {
+		t.Fatalf("public Remove deleted local data: %v", versions)
 	}
 }

@@ -64,6 +64,26 @@ func (s *failOnceMetaStore) PutMeta(ctx context.Context, slug string, meta stora
 	return s.Store.PutMeta(ctx, slug, meta)
 }
 
+type recordingLocker struct {
+	inner sluglock.Locker
+	mu    sync.Mutex
+	keys  []string
+}
+
+func (l *recordingLocker) With(ctx context.Context, key string, fn func() error) error {
+	l.mu.Lock()
+	l.keys = append(l.keys, key)
+	l.mu.Unlock()
+	return l.inner.With(ctx, key, fn)
+}
+
+type recordingLockStore struct {
+	*memory.Store
+	locker sluglock.Locker
+}
+
+func (s *recordingLockStore) Locker() sluglock.Locker { return s.locker }
+
 func blockerService(store *memory.Store, registrar *blockerRegistrar) *service.DocService {
 	lock := sluglock.NewMemory()
 	return service.NewDocService(store, store, service.NewCommentService(store, lock), lock, "", 5<<20).WithDocsBackendRegistration(registrar, nil)
@@ -104,6 +124,23 @@ func TestCanonicalInitializationUsesSharedStoreGuardAcrossServices(t *testing.T)
 				t.Fatalf("versions=%v", vs)
 			}
 		})
+	}
+}
+
+func TestCanonicalCreateUsesOneSharedDocIDLock(t *testing.T) {
+	base := memory.New()
+	locker := &recordingLocker{inner: sluglock.NewMemory()}
+	store := &recordingLockStore{Store: base, locker: locker}
+	reg := &blockerRegistrar{}
+	local := sluglock.NewMemory()
+	docs := service.NewDocService(store, store, service.NewCommentService(store, local), local, "", 5<<20).WithDocsBackendRegistration(reg, nil)
+	if _, err := docs.Publish(context.Background(), service.PublishInput{HTML: "x", IdempotencyKey: "key", PublisherToken: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	locker.mu.Lock()
+	defer locker.mu.Unlock()
+	if len(locker.keys) != 1 || locker.keys[0] != "doc-guard" {
+		t.Fatalf("shared lock keys=%v, want one docID lock", locker.keys)
 	}
 }
 
