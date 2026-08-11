@@ -414,10 +414,10 @@ func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) 
 		if normalized != "" && in.mountContextKnown && in.MountType != "" && in.MountType != normalized {
 			return apperr.Conflict("document mount is immutable", "mount_conflict")
 		}
-		if in.GroupNo != "" && groupNo != "" && in.GroupNo != groupNo {
+		if in.GroupNo != "" && in.GroupNo != groupNo {
 			return apperr.Conflict("document group is immutable", "mount_conflict")
 		}
-		if in.ThreadID != "" && threadID != "" && in.ThreadID != threadID {
+		if in.ThreadID != "" && in.ThreadID != threadID {
 			return apperr.Conflict("document thread is immutable", "mount_conflict")
 		}
 		if normalized != "" || in.MountType == "" {
@@ -797,10 +797,10 @@ func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in
 	if in.MountTypePresent && hasMount && existingMount != "" && in.MountType != "" && in.MountType != existingMount {
 		return nil, PublishInput{}, apperr.Conflict("document mount is immutable", "mount_conflict")
 	}
-	if in.GroupNo != "" && existingGroup != "" && in.GroupNo != existingGroup {
+	if in.GroupNo != "" && in.GroupNo != existingGroup {
 		return nil, PublishInput{}, apperr.Conflict("document group is immutable", "mount_conflict")
 	}
-	if in.ThreadID != "" && existingThread != "" && in.ThreadID != existingThread {
+	if in.ThreadID != "" && in.ThreadID != existingThread {
 		return nil, PublishInput{}, apperr.Conflict("document thread is immutable", "mount_conflict")
 	}
 	in.UserPublish, in.SpaceID = existingUser, existingSpace
@@ -967,6 +967,9 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 	if err != nil {
 		return PublishInput{}, err
 	}
+	if meta == nil {
+		return PublishInput{}, apperr.Conflict("document metadata is missing", "publish_provenance_conflict")
+	}
 	if mountType, ok := meta.MountType(); ok {
 		normalized, normalizeErr := normalizeMountType(mountType)
 		if normalizeErr != nil {
@@ -975,10 +978,8 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 		in.MountType = normalized
 		in.mountContextKnown = true
 	}
-	if meta != nil {
-		in.UserPublish, in.SpaceID, in.GroupNo, in.ThreadID = meta.PublishProvenance()
-		in.CreatorUID = meta.CreatorUID()
-	}
+	in.UserPublish, in.SpaceID, in.GroupNo, in.ThreadID = meta.PublishProvenance()
+	in.CreatorUID = meta.CreatorUID()
 	return in, nil
 }
 

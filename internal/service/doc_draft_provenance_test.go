@@ -80,6 +80,51 @@ func TestSaveDraftWithProvenanceInheritsExistingUserProvenance(t *testing.T) {
 	}
 }
 
+func TestUserPublishRejectsAddingEmptyMountCoordinates(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	if err := store.PutMeta(ctx, "user-space", storage.DocMeta{Slug: "user-space", Extra: map[string]any{
+		storage.UserPublishExtraKey: true, storage.SpaceIDExtraKey: "space-a", storage.MountTypeExtraKey: "space", storage.CreatorUIDExtraKey: "owner",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		in   PublishInput
+	}{
+		{name: "group", in: PublishInput{GroupNo: "group-added"}},
+		{name: "thread", in: PublishInput{ThreadID: "thread-added"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.in.Slug, tc.in.HTML = "user-space", "<p>changed</p>"
+			_, err := docs.Publish(ctx, tc.in)
+			requireAppCode(t, err, "mount_conflict")
+		})
+	}
+}
+
+func TestUserDraftRejectsAddingEmptyMountCoordinates(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	if err := store.PutMeta(ctx, "user-space-draft", storage.DocMeta{Slug: "user-space-draft", Extra: map[string]any{
+		storage.UserPublishExtraKey: true, storage.SpaceIDExtraKey: "space-a", storage.MountTypeExtraKey: "space", storage.CreatorUIDExtraKey: "owner",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		in   PublishInput
+	}{
+		{name: "group", in: PublishInput{GroupNo: "group-added"}},
+		{name: "thread", in: PublishInput{ThreadID: "thread-added"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := docs.SaveDraftWithProvenance(ctx, "user-space-draft", "<p>draft</p>", "", tc.in)
+			requireAppCode(t, err, "mount_conflict")
+		})
+	}
+}
+
 func TestSaveDraftWithProvenanceAllowsNewUserAndLegacyBotDrafts(t *testing.T) {
 	docs, store := draftProvenanceFixture()
 	ctx := context.Background()
