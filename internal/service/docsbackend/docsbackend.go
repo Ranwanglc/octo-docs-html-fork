@@ -44,14 +44,6 @@ type Rename struct {
 	Title string `json:"title"`
 }
 
-// Deletion identifies an HTML registration to remove.
-type Deletion struct {
-	OctoDocSlug string `json:"octoDocSlug"`
-	SpaceID     string `json:"spaceId,omitempty"`
-	Owner       string `json:"owner,omitempty"`
-	UserPublish bool   `json:"-"`
-}
-
 // Client posts registration mutations. Empty URL returns nil from New; all
 // methods are nil-safe and never return errors to callers.
 type Client struct {
@@ -126,13 +118,6 @@ func internalRegisterURL(registerURL string) string {
 	return strings.TrimRight(registerURL, "/") + "/internal/html/register"
 }
 
-func internalDeleteURL(registerURL string) string {
-	if strings.HasSuffix(registerURL, "/v1/bot/docs") {
-		return strings.TrimSuffix(registerURL, "/v1/bot/docs") + "/internal/html"
-	}
-	return strings.TrimRight(registerURL, "/") + "/internal/html"
-}
-
 // Rename PATCHes the registered title by octo-doc slug. token is the publishing
 // bot's own bearer token; empty falls back to the process-configured token.
 func (c *Client) Rename(ctx context.Context, slug, title, token string) {
@@ -145,19 +130,11 @@ func (c *Client) Rename(ctx context.Context, slug, title, token string) {
 // Delete removes the registered docs-backend row by octo-doc slug. Delete is
 // by-slug and idempotent, so the caller identity is immaterial; token may be
 // empty (falls back to the process-configured token).
-func (c *Client) Delete(ctx context.Context, deletion Deletion, token string) error {
+func (c *Client) Delete(ctx context.Context, slug, token string) {
 	if c == nil {
-		return fmt.Errorf("docs-backend registrar is disabled")
+		return
 	}
-	if deletion.UserPublish {
-		if c.internalToken == "" {
-			return fmt.Errorf("docs-backend internal register token is not configured")
-		}
-		_, err := c.doJSON(ctx, http.MethodDelete, internalDeleteURL(c.registerURL), deletion, deletion.OctoDocSlug, "delete", "", true)
-		return err
-	}
-	_, err := c.doJSON(ctx, http.MethodDelete, c.octoDocURL(deletion.OctoDocSlug), nil, deletion.OctoDocSlug, "delete", token, false)
-	return err
+	_, _ = c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token, false)
 }
 
 func (c *Client) octoDocURL(slug string) string {

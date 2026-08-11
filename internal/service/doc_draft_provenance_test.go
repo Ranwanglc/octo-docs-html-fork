@@ -92,3 +92,95 @@ func TestSaveDraftWithProvenanceAllowsNewUserAndLegacyBotDrafts(t *testing.T) {
 		t.Fatalf("legacy bot draft: %v", err)
 	}
 }
+
+func TestPublishRejectsUserClaimOfBlobWithoutMetaBeforeWriting(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	const oldHTML = "<p>legacy</p>"
+	if _, err := store.PutDoc(ctx, "blob-residue", 1, oldHTML); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := docs.Publish(ctx, PublishInput{
+		Slug: "blob-residue", HTML: "<p>user</p>", UserPublish: true, SpaceID: "space-a", CreatorUID: "u1",
+	})
+	requireAppCode(t, err, "publish_provenance_conflict")
+	if got, ok, getErr := store.GetDoc(ctx, "blob-residue", 1); getErr != nil || !ok || got != oldHTML {
+		t.Fatalf("legacy blob changed: got=%q ok=%v err=%v", got, ok, getErr)
+	}
+	if versions, listErr := store.ListVersions(ctx, "blob-residue"); listErr != nil || len(versions) != 1 {
+		t.Fatalf("versions after rejection = %v, err=%v", versions, listErr)
+	}
+	if meta, getErr := store.GetMeta(ctx, "blob-residue"); getErr != nil || meta != nil {
+		t.Fatalf("meta written after rejection: meta=%+v err=%v", meta, getErr)
+	}
+}
+
+func TestSaveDraftRejectsUserClaimOfDraftWithoutMetaBeforeWriting(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	const oldHTML = "<p>legacy draft</p>"
+	if _, err := store.PutDraft(ctx, "draft-residue", oldHTML); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := docs.SaveDraftWithProvenance(ctx, "draft-residue", "<p>user</p>", "", PublishInput{
+		UserPublish: true, SpaceID: "space-a", CreatorUID: "u1",
+	})
+	requireAppCode(t, err, "publish_provenance_conflict")
+	if got, ok, getErr := store.GetDraft(ctx, "draft-residue"); getErr != nil || !ok || got != oldHTML {
+		t.Fatalf("legacy draft changed: got=%q ok=%v err=%v", got, ok, getErr)
+	}
+	if meta, getErr := store.GetMeta(ctx, "draft-residue"); getErr != nil || meta != nil {
+		t.Fatalf("meta written after rejection: meta=%+v err=%v", meta, getErr)
+	}
+}
+
+func TestLegacyGroupMetadataRejectsConflictingGroupBeforeBackfill(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	if err := store.PutMeta(ctx, "legacy-group", storage.DocMeta{Slug: "legacy-group", Extra: map[string]any{
+		storage.GroupNoExtraKey: "group-old",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := docs.Publish(ctx, PublishInput{
+		Slug: "legacy-group", HTML: "<p>new</p>", MountType: "group", GroupNo: "group-new",
+	})
+	requireAppCode(t, err, "mount_conflict")
+	meta, getErr := store.GetMeta(ctx, "legacy-group")
+	if getErr != nil || meta == nil {
+		t.Fatalf("meta = %+v, err=%v", meta, getErr)
+	}
+	_, _, groupNo, _ := meta.PublishProvenance()
+	if groupNo != "group-old" {
+		t.Fatalf("persisted group overwritten: %q", groupNo)
+	}
+	if versions, listErr := store.ListVersions(ctx, "legacy-group"); listErr != nil || len(versions) != 0 {
+		t.Fatalf("versions after rejection = %v, err=%v", versions, listErr)
+	}
+}
+
+func TestLegacyThreadMetadataBackfillsMountAndPreservesThread(t *testing.T) {
+	docs, store := draftProvenanceFixture()
+	ctx := context.Background()
+	if err := store.PutMeta(ctx, "legacy-thread", storage.DocMeta{Slug: "legacy-thread", Extra: map[string]any{
+		storage.ThreadIDExtraKey: "thread-old",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := docs.SaveDraftWithProvenance(ctx, "legacy-thread", "<p>draft</p>", "", PublishInput{}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.GetMeta(ctx, "legacy-thread")
+	if err != nil || meta == nil {
+		t.Fatalf("meta = %+v, err=%v", meta, err)
+	}
+	mount, hasMount := meta.MountType()
+	_, _, _, threadID := meta.PublishProvenance()
+	if !hasMount || mount != "thread" || threadID != "thread-old" {
+		t.Fatalf("backfilled provenance: mount=%q hasMount=%v thread=%q", mount, hasMount, threadID)
+	}
+}

@@ -114,6 +114,10 @@ the server behaves as a standalone deploy.
 | **Comment-event webhook** | `OCTO_WEBHOOK_URL`, `OCTO_DOC_EVENT_WEBHOOK_TOKEN` | pushes new-comment events to Octo IM (token required, sent as `X-Octo-Doc-Webhook-Token`) |
 | **Superadmin/owner** | `OWNER` | designates which signed-in Login sees the `/me` catalog |
 
+### User-owned Space publishing
+
+A user-owned Space document is created only when the request explicitly supplies a valid `space_id`. A raw user token without `space_id` keeps the legacy direct-publish behavior. Once user provenance is persisted, every later publishing mutation (direct republish, draft save/promote, and element replacement) revalidates the current user's membership in that persisted Space; omitting `space_id` does not bypass this check. Bot/legacy provenance cannot be converted to user provenance, and non-empty mount/Space provenance is immutable.
+
 ## Agent workflow
 
 octo-docs-html is **API-first**: an agent turns a prompt into a self-contained

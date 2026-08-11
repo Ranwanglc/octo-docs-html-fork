@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
@@ -38,6 +40,92 @@ func publishAsBot(t *testing.T, h http.Handler, slug string) {
 		`{"slug":"`+slug+`","version":1,"html":"<html><body><p>hi</p></body></html>","meta":{"title":"T"}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("publish as bot %s = %d: %s", slug, rec.Code, rec.Body.String())
+	}
+}
+
+type recordingDraftRegistrar struct {
+	mu            sync.Mutex
+	registrations []docsbackend.Registration
+}
+
+func (r *recordingDraftRegistrar) Register(_ context.Context, reg docsbackend.Registration, _ string) (*docsbackend.RegistrationResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.registrations = append(r.registrations, reg)
+	return &docsbackend.RegistrationResult{DocID: "doc-" + reg.OctoDocSlug, OctoDocSlug: reg.OctoDocSlug, ShareURL: "https://example.test/" + reg.OctoDocSlug}, nil
+}
+
+func (*recordingDraftRegistrar) Rename(context.Context, string, string, string) {}
+func (*recordingDraftRegistrar) Delete(context.Context, string, string)         {}
+
+func (r *recordingDraftRegistrar) last() (docsbackend.Registration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.registrations) == 0 {
+		return docsbackend.Registration{}, false
+	}
+	return r.registrations[len(r.registrations)-1], true
+}
+
+func newDraftRegistrarServer(t *testing.T, cfg *config.Config) (http.Handler, *memory.Store, *recordingDraftRegistrar) {
+	t.Helper()
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	registrar := &recordingDraftRegistrar{}
+	docs := service.NewDocService(store, store, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes).
+		WithDocsBackendRegistration(registrar, nil)
+	assets := service.NewAssetService(store, store, locker, cfg.MaxAssetBytes, cfg.AssetMIMEAllow)
+	auth := service.NewAuthService(store, cfg, locker)
+	srv := httpx.New(httpx.Deps{
+		Config: cfg, Logger: log.New("silent"), Docs: docs, Comments: comments,
+		Assets: assets, Auth: auth, OverlayJS: "/* overlay */",
+	})
+	return srv.Handler(), store, registrar
+}
+
+func TestBotDraftFirstPreservesMountProvenanceThroughPromote(t *testing.T) {
+	withStubIdentity(t, stubIdentity{botUID: "bot-mount", botName: "Mount Bot", botSpaceID: "space-1", botOwnerUID: "owner-mount"})
+
+	for _, tc := range []struct {
+		name, mountType, field, value string
+	}{
+		{name: "group", mountType: "group", field: "group_no", value: "group-7"},
+		{name: "thread", mountType: "thread", field: "thread_id", value: "thread-9"},
+		{name: "space", mountType: "space"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, store, registrar := newDraftRegistrarServer(t, ownerAuthCfg())
+			slug := "draft-mount-" + tc.name
+			headers := map[string]string{"Authorization": "Bearer bot-token", "Content-Type": "application/json"}
+			mountField := ""
+			if tc.field != "" {
+				mountField = `,"` + tc.field + `":"` + tc.value + `"`
+			}
+			body := `{"html":"<html><body>draft</body></html>","mount_type":"` + tc.mountType + `"` + mountField + `}`
+			if rec := do(t, h, http.MethodPut, "/v1/docs/"+slug+"/draft", headers, body); rec.Code != http.StatusOK {
+				t.Fatalf("save draft = %d: %s", rec.Code, rec.Body.String())
+			}
+			if rec := do(t, h, http.MethodPost, "/v1/docs/"+slug+"/draft/promote", headers, ""); rec.Code != http.StatusOK {
+				t.Fatalf("promote = %d: %s", rec.Code, rec.Body.String())
+			}
+
+			reg, ok := registrar.last()
+			if !ok || reg.OctoDocSlug != slug || reg.MountType != tc.mountType {
+				t.Fatalf("registration = %+v, ok=%v; want slug=%q mount=%q", reg, ok, slug, tc.mountType)
+			}
+			meta, err := store.GetMeta(context.Background(), slug)
+			if err != nil || meta == nil {
+				t.Fatalf("metadata = %+v, err=%v", meta, err)
+			}
+			_, _, groupNo, threadID := meta.PublishProvenance()
+			if tc.mountType == "group" && groupNo != tc.value {
+				t.Fatalf("persisted group_no = %q; want %q", groupNo, tc.value)
+			}
+			if tc.mountType == "thread" && threadID != tc.value {
+				t.Fatalf("persisted thread_id = %q; want %q", threadID, tc.value)
+			}
+		})
 	}
 }
 

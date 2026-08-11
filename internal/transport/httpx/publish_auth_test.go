@@ -81,6 +81,17 @@ func TestPublishNewSlugAllowsAuthenticatedIdentity(t *testing.T) {
 	}
 }
 
+func TestRawUserTokenWithoutSpaceKeepsLegacyDirectPublish(t *testing.T) {
+	withStubIdentity(t, stubIdentity{uid: "new-author"})
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPost, "/v1/docs", map[string]string{
+		octoUIDHeaderName: "new-author", "Content-Type": "application/json", "token": "user-token",
+	}, publishBody("token-no-space", "legacy-direct"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct publish = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestUserPublishSpaceMembership(t *testing.T) {
 	withStubIdentity(t, stubIdentity{uid: "new-author", spaces: map[string]bool{"space-1": true}})
 	h := newTestServer(t, nil)

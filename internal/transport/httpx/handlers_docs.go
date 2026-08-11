@@ -157,7 +157,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
-	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && (body.SpaceIDPresent || userToken(r) != "")
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
 	if userPublish {
 		spaceID := strings.TrimSpace(body.SpaceID)
 		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
@@ -175,10 +175,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
-		CreatorUID:     creatorUID,
-		PublisherToken: botTokenFromCtx(r.Context()),
-		SpaceID:        body.SpaceID,
-		UserPublish:    userPublish,
+		CreatorUID:          creatorUID,
+		PublisherToken:      botTokenFromCtx(r.Context()),
+		SpaceID:             body.SpaceID,
+		UserPublish:         userPublish,
+		AuthorizeProvenance: s.provenanceAuthorizer(r),
 	}, func(exists bool) error {
 		if !exists {
 			return nil
@@ -209,7 +210,7 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	// Stamp creator on first draft (draft-first create) with the same owner rule
 	// as publish, so the draft's author survives into the promoted version.
 	creatorUID := creatorUIDFromCtx(r.Context())
-	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && (body.SpaceIDPresent || userToken(r) != "")
+	userPublish := botSessionFromCtx(r.Context()) == nil && octoSessionFromCtx(r.Context()) != nil && body.SpaceIDPresent
 	if userPublish {
 		spaceID := strings.TrimSpace(body.SpaceID)
 		if !body.SpaceIDPresent || !service.ValidSpaceID(spaceID) {
@@ -224,7 +225,12 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	res, err := s.docs.SaveDraftWithProvenance(r.Context(), slug, body.HTML, body.Title, service.PublishInput{
-		CreatorUID: creatorUID, UserPublish: userPublish, SpaceID: body.SpaceID,
+		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
+		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
+		CreatorUID:          creatorUID,
+		UserPublish:         userPublish,
+		SpaceID:             body.SpaceID,
+		AuthorizeProvenance: s.provenanceAuthorizer(r),
 	})
 	if err != nil {
 		return err
@@ -247,12 +253,32 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&raw)
 	}
-	res, err := s.docs.Promote(r.Context(), slug, raw.Title)
+	res, err := s.docs.PromoteAuthorized(r.Context(), slug, raw.Title, s.provenanceAuthorizer(r))
 	if err != nil {
 		return err
 	}
 	writeData(w, 200, res)
 	return nil
+}
+
+func (s *Server) provenanceAuthorizer(r *http.Request) service.ProvenanceAuthorizer {
+	if botSessionFromCtx(r.Context()) != nil {
+		return nil
+	}
+	uid, token := creatorUIDFromCtx(r.Context()), userToken(r)
+	return func(ctx context.Context, provenance service.PublishProvenance) error {
+		if !provenance.UserPublish {
+			return nil
+		}
+		provider, err := octoidentity.Get()
+		if err != nil {
+			return apperr.Upstream("space membership provider unavailable", "space_membership_unavailable", err)
+		}
+		if !provider.IsSpaceMember(ctx, uid, provenance.SpaceID, token) {
+			return apperr.Forbidden("space membership required", "space_membership_required")
+		}
+		return nil
+	}
 }
 
 // handleRenderDraft renders the draft slot (GET/HEAD /d/{slug}/draft) with the
