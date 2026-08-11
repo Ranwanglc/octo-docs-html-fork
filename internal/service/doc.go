@@ -1144,8 +1144,7 @@ func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth Del
 		if s.register != nil {
 			deleteCtx, cancel := context.WithTimeout(ctx, docsBackendSideEffectTimeout)
 			defer cancel()
-			var derr error
-			derr = s.register.Delete(deleteCtx, slug, auth.PublisherToken)
+			derr := s.register.Delete(deleteCtx, slug, auth.PublisherToken)
 			if derr != nil {
 				return apperr.Upstream("docs-backend deletion failed", "delete_failed", derr)
 			}

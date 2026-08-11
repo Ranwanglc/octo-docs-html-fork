@@ -1,6 +1,6 @@
 // Package e2e exercises the full server against real PostgreSQL + S3 (MinIO),
-// proving the complete publish → render → comment → agent-reply → fork/export →
-// delete round-trip works end to end. Gated on OCTO_TEST_DATABASE_URL +
+// proving the complete publish → render → comment → agent-reply → fork/export
+// flow works end to end. Gated on OCTO_TEST_DATABASE_URL +
 // OCTO_TEST_S3_BUCKET; skipped otherwise.
 package e2e_test
 
@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/postgres"
 	s3store "github.com/Mininglamp-OSS/octo-docs-html/internal/storage/s3"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
@@ -66,10 +67,21 @@ func TestFullLifecycle(t *testing.T) {
 	t.Cleanup(srv.Close)
 	slug := "e2e-lifecycle"
 	t.Cleanup(func() {
-		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/docs/"+slug, nil)
-		req.Header.Set("X-Octo-Uid", e2eUID)
-		http.DefaultClient.Do(req) //nolint:errcheck
+		_ = blobs.DeleteDoc(ctx, slug)
+		_ = pg.DeleteComments(ctx, slug)
+		_ = pg.DeleteMeta(ctx, slug)
 	})
+
+	// This e2e server has no docs-backend registrar. Seed an explicitly existing
+	// legacy ref: slug-bearing publish edits that ref; it must not create an
+	// arbitrary unknown slug under the canonical identity contract.
+	if err := pg.PutMeta(ctx, slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "Legacy E2E",
+		Extra: map[string]any{storage.CreatorUIDExtraKey: e2eUID},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Publish. postJSON returns the unwrapped data object.
 	pub := postJSON(t, srv.URL+"/v1/docs", e2eUID,
@@ -115,6 +127,23 @@ func TestFullLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(getText(t, srv.URL+"/d/"+slug+"/v/1/fork"), `"mode":"fork"`) {
 		t.Fatal("fork mode missing")
+	}
+
+	// Human-only deletion cannot propagate to docs-backend, so it fails closed
+	// and leaves the local legacy document intact.
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/docs/"+slug, nil)
+	req.Header.Set("X-Octo-Uid", e2eUID)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("human DELETE = %d, want 401: %s", res.StatusCode, raw)
+	}
+	if versions, err := blobs.ListVersions(ctx, slug); err != nil || len(versions) != 1 || versions[0] != 1 {
+		t.Fatalf("versions after failed human delete = %v, %v; want [1], nil", versions, err)
 	}
 }
 
