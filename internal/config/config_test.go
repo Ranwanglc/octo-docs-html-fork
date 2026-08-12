@@ -79,6 +79,22 @@ func TestValidate(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Error("S3_ENDPOINT without credentials should fail validation")
 	}
+	// An explicit internal register URL must be a well-formed http(s) URL; a
+	// typo'd internal address should fail at boot, not on every publish.
+	for _, bad := range []string{"internal:9090/x", "not a url", "://x", "ftp://internal/x", "javascript:alert(1)"} {
+		c = valid()
+		c.DocsBackendInternalRegisterURL = bad
+		if err := c.Validate(); err == nil {
+			t.Errorf("DOCS_BACKEND_INTERNAL_REGISTER_URL=%q should fail validation", bad)
+		}
+	}
+	for _, ok := range []string{"", "http://octo-docs-backend:9090/internal/html/register", "https://internal.example.com/x"} {
+		c = valid()
+		c.DocsBackendInternalRegisterURL = ok
+		if err := c.Validate(); err != nil {
+			t.Errorf("DOCS_BACKEND_INTERNAL_REGISTER_URL=%q should pass validation: %v", ok, err)
+		}
+	}
 }
 
 func TestSafeSlug(t *testing.T) {
@@ -137,13 +153,14 @@ func TestLoadDocsBackendRegisterKnobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DocsBackendRegisterURL != "" || cfg.DocsBackendRegisterToken != "" || cfg.DocsBackendInternalRegisterToken != "" {
-		t.Fatalf("unset docs-backend register config = url %q bot token %q internal token %q", cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken)
+	if cfg.DocsBackendRegisterURL != "" || cfg.DocsBackendRegisterToken != "" || cfg.DocsBackendInternalRegisterToken != "" || cfg.DocsBackendInternalRegisterURL != "" {
+		t.Fatalf("unset docs-backend register config = url %q bot token %q internal token %q internal url %q", cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken, cfg.DocsBackendInternalRegisterURL)
 	}
 
 	t.Setenv("DOCS_BACKEND_REGISTER_URL", "https://docs-backend.example.com/v1/bot/docs/")
 	t.Setenv("DOCS_BACKEND_REGISTER_TOKEN", "bot-token")
 	t.Setenv("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN", "internal-token")
+	t.Setenv("DOCS_BACKEND_INTERNAL_REGISTER_URL", "http://octo-docs-backend:9090/internal/html/register/")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +173,10 @@ func TestLoadDocsBackendRegisterKnobs(t *testing.T) {
 	}
 	if cfg.DocsBackendInternalRegisterToken != "internal-token" {
 		t.Errorf("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN = %q", cfg.DocsBackendInternalRegisterToken)
+	}
+	// Trailing slash trimmed, same as DocsBackendRegisterURL.
+	if cfg.DocsBackendInternalRegisterURL != "http://octo-docs-backend:9090/internal/html/register" {
+		t.Errorf("DOCS_BACKEND_INTERNAL_REGISTER_URL = %q", cfg.DocsBackendInternalRegisterURL)
 	}
 }
 
