@@ -76,7 +76,12 @@ func New(baseURL, serviceToken string, timeout time.Duration) *HTTPIdentity {
 	return &HTTPIdentity{
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		serviceToken: serviceToken,
-		client:       &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 

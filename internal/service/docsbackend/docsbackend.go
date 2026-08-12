@@ -62,8 +62,8 @@ type Published struct {
 	Title string `json:"title,omitempty"`
 }
 
-// Client posts registration mutations. Empty URL returns nil from New; all
-// methods are nil-safe and never return errors to callers.
+// Client posts registration mutations. Empty URL returns nil from New. Optional
+// Rename is nil-safe; required mutations return errors so callers can fail closed.
 type Client struct {
 	registerURL string
 	token       string
@@ -91,8 +91,13 @@ func newWithTimeout(registerURL, token string, timeout time.Duration, logger *sl
 	return &Client{
 		registerURL: registerURL,
 		token:       strings.TrimSpace(token),
-		http:        &http.Client{Timeout: timeout},
-		logger:      logger,
+		http: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		logger: logger,
 	}
 }
 

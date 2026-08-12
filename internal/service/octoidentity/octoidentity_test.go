@@ -56,6 +56,36 @@ func TestVerifyTokenOK(t *testing.T) {
 	}
 }
 
+func TestHTTPIdentityRejectsEveryRedirectWithoutForwardingToken(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			targetCalls := 0
+			target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				targetCalls++
+				body, _ := io.ReadAll(r.Body)
+				if strings.Contains(r.Header.Get("token")+string(body), "secret") {
+					t.Error("redirect target received a user, bot, or service token")
+				}
+			}))
+			defer target.Close()
+
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", target.URL+"/stolen")
+				w.WriteHeader(status)
+			}))
+			defer source.Close()
+
+			id := octoidentity.New(source.URL, "service-secret", time.Second)
+			_, _ = id.VerifyToken(context.Background(), "user-secret")
+			_, _ = id.VerifyBot(context.Background(), "bot-secret")
+			_, _ = id.GetUser(context.Background(), "u1", "caller-secret")
+			if targetCalls != 0 {
+				t.Fatalf("redirect target calls = %d, want 0", targetCalls)
+			}
+		})
+	}
+}
+
 func TestVerifyTokenNon2xxReturnsNil(t *testing.T) {
 	srv := newStub(t, map[string]http.HandlerFunc{
 		"POST /v1/auth/verify": func(w http.ResponseWriter, _ *http.Request) {
