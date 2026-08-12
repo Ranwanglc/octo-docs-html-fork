@@ -31,9 +31,13 @@ func ownerAuthCfg() *config.Config {
 	}
 }
 
-func publishAsBot(t *testing.T, h http.Handler, slug string) {
+func publishAsBot(t *testing.T, h http.Handler, slug string, creatorUID ...string) {
 	t.Helper()
-	seedLegacyDoc(t, h, slug, "owner-1", "T", "<html><body><p>hi</p></body></html>")
+	ownerUID := "owner-1"
+	if len(creatorUID) != 0 {
+		ownerUID = creatorUID[0]
+	}
+	seedLegacyDoc(t, h, slug, ownerUID, "T", "<html><body><p>hi</p></body></html>")
 }
 
 // 验收1: bot 发布 → creator = bot 的 OwnerUID（用户 uid），不是 bot uid。
@@ -146,6 +150,16 @@ func TestDraftFirstCreateByUser(t *testing.T) {
 		`{"idempotency_key":"new-slug-u","html":"<html><body><p>draft</p></body></html>"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("canonical draft create = %d; want 201: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugU/share",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical draft creator share = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/v1/docs/newSlugU/share",
+		map[string]string{octoUIDHeaderName: "other-user"}, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("canonical draft non-creator share = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -355,10 +369,15 @@ func TestBotAuthAcceptsTokenHeader(t *testing.T) {
 		t.Fatalf("publish via token header = %d; want 200 (bot must resolve from token header): %s", rec.Code, rec.Body.String())
 	}
 
-	// Bot deletion remains allowed through delegated remote authorization.
-	rec = do(t, h, http.MethodDelete, "/v1/docs/docTokHdr",
-		map[string]string{"token": "bot-token"}, "")
+	// Resolving the token header as bot auth stamps the owner's uid, not the bot's.
+	rec = do(t, h, http.MethodPost, "/v1/docs/docTokHdr/share",
+		map[string]string{octoUIDHeaderName: "owner-1"}, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("bot delete = %d; want 200: %s", rec.Code, rec.Body.String())
+		t.Fatalf("owner share after token-header publish = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/v1/docs/docTokHdr/share",
+		map[string]string{octoUIDHeaderName: "bot-1"}, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("bot uid share after token-header publish = %d; want 404: %s", rec.Code, rec.Body.String())
 	}
 }

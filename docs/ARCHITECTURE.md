@@ -230,7 +230,7 @@ POST /v1/docs  (Authorization: Bearer *** multipart or JSON)
 	Canonical create: `{idempotency_key, html, ...}` with no `slug`. The server
 	synchronously obtains a doc ID before writing and stores everything under it.
 	A request carrying `slug` addresses that exact existing local ref instead;
-	legacy first-create-by-slug remains deprecated compatibility behavior only.
+	an unknown ref returns 404 and cannot create a document.
   ├─ requireWriteAuth         constant-time token check
   ├─ size cap check           (MAX_HTML_BYTES, default 5 MiB)
   ├─ canonical create registration (before local writes; mounted or unmounted)
@@ -239,17 +239,14 @@ POST /v1/docs  (Authorization: Bearer *** multipart or JSON)
   ├─ blobStore.putDoc         immutable write + head-verify
   ├─ metaStore.putMeta        monotonic versions[]
   ├─ commentStore.publish_merge   reconcile anchors + merge local comments
-  └─ docs-backend register       bounded idempotent retries; never republishes HTML
+  └─ docs-backend notification  after persistence; bounded retries
      → { slug, version, url, doc_id, share_url, registered, status, size, aids, merged_comments }
 ```
 
-`created:false` from docs-backend is an existing-row success. If registration
-still fails after the bounded retry window, the response uses
-`registered:false,status:"registration_failed"`. The immutable HTML version is
-already committed; callers must not retry by publishing HTML again.
-Group, space, and thread mounts use the same fail-closed status when
-registration is unavailable. Only unmounted publishes use
-`published_unregistered`, where docs-backend registration does not apply.
+`created:false` from docs-backend is an existing-row success. Canonical creation
+fails closed before local writes when registration is unavailable; retrying the
+same idempotency key safely resumes or returns the existing result. Existing
+legacy refs are edited in place and are not newly registered.
 
 **Rollout prerequisite:** Mininglamp-OSS/octo-docs-backend#129 must be merged
 and deployed before HTML PR #24 is deployed, because thread registration

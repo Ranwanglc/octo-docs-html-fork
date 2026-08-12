@@ -94,10 +94,8 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
 		r.Get("/docs/{slug}/versions", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersions))))
 		r.With(s.requireDocManage).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
-		// Draft slot. Draft-first creation must work before any version exists, so
-		// these use requireDocAuthorOrFirstCreate: any authenticated session may
-		// create a brand-new slug (creator stamped on that write); once owned it is
-		// strict author-only. Author is accepted via Bearer (CLI) or per-doc cookie.
+		// Existing-ref draft operations are author-only. New canonical drafts use
+		// POST /docs/draft with a bot credential and an idempotency key.
 		r.With(s.requireDocAuthorOrFirstCreate).Method(http.MethodPut, "/docs/{slug}/draft", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleSaveDraft))))
 		r.With(s.requireDocAuthorOrFirstCreate).Post("/docs/{slug}/draft/promote", s.cors(s.limit(writeLimiter, false, s.wrap(s.handlePromote))))
 		// Share: mint / rotate / revoke the per-doc read-only code (manage-only).

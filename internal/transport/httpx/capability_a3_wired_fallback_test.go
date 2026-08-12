@@ -66,25 +66,26 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	}
 }
 
-// Registered docs do not fall back to legacy creator metadata.
-// on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
+// A3② falls back to creator_uid when the owner's admin row is missing, even for
+// a registered document. A4 keeps its registered-document gate.
 func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
 	mirror := &stubMirror{slugToDoc: map[string]string{"docReg": "dReg"}} // registered, no owner row
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docReg") // creator_uid = owner-2
+	publishAsBot(t, h, "docReg", "owner-2")
 
 	// A3① misses (bot uid != owner-2); A3② wired returns docRegistered=true,
 	// ok=false; without the old gate, fallback proceeds and
 	// creator_uid==ownerUID lands owner-2 as CapAuthor.
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 404: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bot bearer share on registered-no-owner-row = %d; want 200 (owner fallback): %s", rec.Code, rec.Body.String())
 	}
 }
 
-// Unrelated member rows do not restore legacy creator fallback.
+// Unrelated member rows do not substitute for the owner's row or suppress the
+// creator fallback that prevents owner lockout.
 func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-3", botName: "Bot Three", botSpaceID: "s3", botOwnerUID: "owner-3"})
 	mirror := &stubMirror{
@@ -95,12 +96,12 @@ func TestA3OwnerNoLockoutWhenDocRegisteredButAdminRowMissing(t *testing.T) {
 		},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
-	publishAsBot(t, h, "docReg3") // creator_uid = owner-3
+	publishAsBot(t, h, "docReg3", "owner-3")
 
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg3/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 404: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bot bearer share w/ unrelated rows = %d; want 200 (owner fallback): %s", rec.Code, rec.Body.String())
 	}
 }
 
