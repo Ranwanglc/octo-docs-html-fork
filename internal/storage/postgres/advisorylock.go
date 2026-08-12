@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,7 +69,16 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
 		defer closeCancel()
 		closeErr := physical.Close(closeCtx)
-		retErr = errors.Join(retErr, fmt.Errorf("pg_advisory_unlock: %w", unlockErr), closeErr)
+		if retErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("pg_advisory_unlock: %w", unlockErr), closeErr)
+			return
+		}
+		// The critical section already committed durably: surfacing an unlock
+		// failure as a publish error would invite a retry that re-runs the
+		// locked section and mints a duplicate version (the exact failure mode
+		// Promote refuses to create). The session is destroyed anyway, so the
+		// lock dies with the connection.
+		slog.Default().Warn("pg_advisory_unlock failed after commit; connection destroyed", "key", key, "err", unlockErr, "close_err", closeErr)
 	}()
 
 	return fn()

@@ -30,8 +30,6 @@ type publishBody struct {
 	// docs-backend (and thus appear in the sidebar) without a doc_binding lookup.
 	MountType        string
 	MountTypePresent bool
-	GroupNo          string
-	ThreadID         string
 }
 
 func (s *Server) readPublishBody(w http.ResponseWriter, r *http.Request) (publishBody, error) {
@@ -55,8 +53,6 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	}
 	b.MountType = r.FormValue("mount_type")
 	_, b.MountTypePresent = r.MultipartForm.Value["mount_type"]
-	b.GroupNo = r.FormValue("group_no")
-	b.ThreadID = r.FormValue("thread_id")
 	if file, _, err := r.FormFile("file"); err == nil {
 		defer func() { _ = file.Close() }()
 		data, rerr := io.ReadAll(file)
@@ -84,8 +80,6 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		// Mount info forwarded to docs-backend registration. snake_case matches the
 		// rest of the publish contract; the bot supplies where it is publishing.
 		MountType *string `json:"mount_type"`
-		GroupNo   string  `json:"group_no"`
-		ThreadID  string  `json:"thread_id"`
 	}
 	if r.Body != nil {
 		// Publish bodies carry the document HTML, so cap at the HTML limit plus JSON
@@ -110,7 +104,6 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 	}
 	body := publishBody{
 		Slug: raw.Slug, IdempotencyKey: raw.IdempotencyKey, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
-		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
 	}
 	if raw.MountType != nil {
 		body.MountType = *raw.MountType
@@ -159,7 +152,6 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
-		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
 		PublisherToken: publisherToken, PublisherUID: publisherUID, PublisherSpaceID: publisherSpaceID, IdempotencyKey: body.IdempotencyKey,
 	}, func(canonicalSlug string, exists bool) error {
@@ -192,7 +184,6 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) error
 	res, err := s.docs.SaveDraftMountedAuthorized(r.Context(), service.PublishInput{
 		HTML: body.HTML, Title: body.Title, IdempotencyKey: body.IdempotencyKey,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
-		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID: creatorUIDFromCtx(r.Context()), PublisherToken: botTokenFromCtx(r.Context()),
 		PublisherUID: publisherUID, PublisherSpaceID: publisherSpaceID,
 	}, func(canonicalSlug string, exists bool) error {
@@ -227,7 +218,6 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {
 	res, err := s.docs.SaveDraftMountedAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Title: body.Title,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
-		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID: creatorUIDFromCtx(r.Context()), PublisherToken: publisherToken,
 	}, func(canonicalSlug string, exists bool) error {
 		if !exists {
@@ -397,13 +387,16 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 	}
 	auth := service.DeleteAuth{PublisherToken: botTokenFromCtx(r.Context())}
 	if auth.PublisherToken == "" {
+		// No bot credential: only a standalone legacy deploy (no docs-backend
+		// registrar) may delete locally as a signed-in human. With a registrar
+		// wired this path fails closed inside RemoveAuthorized — production
+		// deletion is bot-delegated only.
 		session, serr := s.resolveViewerSession(r)
 		if serr != nil {
 			return serr
 		}
 		if session != nil {
 			auth.ActorUID = session.Login
-			auth.SuperAdmin = session.Role == "superAdmin"
 		}
 	}
 	if err := s.docs.RemoveAuthorized(r.Context(), slug, auth); err != nil {

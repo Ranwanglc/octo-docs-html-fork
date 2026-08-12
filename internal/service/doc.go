@@ -46,17 +46,16 @@ type DocRegistrar interface {
 	Register(ctx context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error)
 	Rename(ctx context.Context, slug, title, token string)
 	Delete(ctx context.Context, slug, token string) error
+	// Published notifies the backend that canonical content is durable. Every
+	// registrar implements it: silent omission would drop notifications without
+	// a compile error.
+	Published(ctx context.Context, docID, title, token string) error
 }
 
 // DeleteAuth carries verified bot or HTTP-layer human authorization.
 type DeleteAuth struct {
 	PublisherToken string
 	ActorUID       string
-	SuperAdmin     bool
-}
-
-type publishNotifier interface {
-	Published(ctx context.Context, docID, title, token string) error
 }
 
 type lockerProvider interface {
@@ -124,10 +123,12 @@ type PublishInput struct {
 	// caller (bot) knows where it is publishing, so no user-token binding query
 	// is needed. MountTypePresent distinguishes an omitted field from an explicit
 	// empty value; neither implicitly unmounts an existing mounted document.
+	//
+	// Group/thread placement is resolved by docs-backend from the publishing
+	// bot's own context (doc_meta has no group_no/thread_id columns), so the
+	// publish contract intentionally carries no group/thread identifiers.
 	MountType        string // "group" | "space" | "thread" (all registerable)
 	MountTypePresent bool
-	GroupNo          string
-	ThreadID         string
 
 	// CreatorUID is the publishing bot's uid, stamped into DocMeta on first
 	// create only (a republish never reassigns ownership). Empty ⇒ no creator
@@ -146,10 +147,15 @@ type PublishInput struct {
 	IdempotencyKey string
 
 	mountContextKnown bool
-	pinnedAID         string
-	pinnedTag         string
-	anchorMigrations  map[string]string
-	identity          *canonicalIdentity
+	// legacyDocID is the docs-backend doc id recorded under the pre-canonical
+	// registration scheme. It only decorates the publish result (doc_id/
+	// registered:true) for existing documents; legacy rows are never
+	// re-registered by the publish path.
+	legacyDocID      string
+	pinnedAID        string
+	pinnedTag        string
+	anchorMigrations map[string]string
+	identity         *canonicalIdentity
 }
 
 type canonicalIdentity struct {
@@ -178,6 +184,10 @@ type PublishResult struct {
 	// Mount info carried through the synchronous post-publish registration step.
 	mountType         string
 	mountContextKnown bool
+
+	// legacyRegistration marks results whose Registered/doc_id came from the
+	// pre-canonical fallback (read-only shim): no backend side effects apply.
+	legacyRegistration bool
 
 	// publisherToken authenticates synchronous registration as the publisher.
 	publisherToken string
@@ -256,6 +266,8 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 			}
 			if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
 				in.identity = &canonicalIdentity{docID: docID, shareURL: shareURL}
+			} else if legacyID, ok := meta.LegacyRegistration(); ok {
+				in.legacyDocID = legacyID
 			}
 		} else if authorize != nil {
 			return nil, apperr.NotFound("document not found")
@@ -269,9 +281,13 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 			return nil, err
 		}
 		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
+			s.compensateRegistration(ctx, registration, in.PublisherToken, "registration_invalid")
 			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
 		}
 		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || registration.PublisherUID != in.PublisherUID || registration.SpaceID != in.PublisherSpaceID) {
+			// The row belongs to another publisher's idempotency replay: do not
+			// delete it. Loud, actionable signal for the operator.
+			s.log().Error("canonical_registration_identity_mismatch", "idempotency_key", in.IdempotencyKey, "doc_id", registration.DocID, "publisher_uid", registration.PublisherUID, "space_id", registration.SpaceID)
 			return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
 		}
 		in.Slug = registration.DocID
@@ -504,6 +520,14 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		mountType:         in.MountType,
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
+	}
+	// Legacy registered documents keep reporting their recorded backend doc id.
+	// Canonical identity (in.identity) wins whenever present; legacy rows are
+	// never re-registered by this path.
+	if in.identity == nil && in.legacyDocID != "" {
+		result.DocID = in.legacyDocID
+		result.Registered = true
+		result.legacyRegistration = true
 	}
 	s.applyIdentity(result, in.identity)
 	return result, nil
@@ -774,6 +798,7 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 		return nil, err
 	}
 	in.MountType = mountType
+	in.mountContextKnown = in.MountTypePresent
 	explicitCreate := strings.TrimSpace(in.IdempotencyKey) != ""
 	if explicitCreate && slug != "" {
 		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
@@ -812,9 +837,11 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 			return nil, err
 		}
 		if config.SafeSlug(registration.DocID) == "" || registration.OctoDocSlug != registration.DocID {
+			s.compensateRegistration(ctx, registration, in.PublisherToken, "registration_invalid")
 			return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
 		}
 		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || registration.PublisherUID != in.PublisherUID || registration.SpaceID != in.PublisherSpaceID) {
+			s.log().Error("canonical_draft_registration_identity_mismatch", "idempotency_key", in.IdempotencyKey, "doc_id", registration.DocID, "publisher_uid", registration.PublisherUID, "space_id", registration.SpaceID)
 			return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
 		}
 		slug = registration.DocID
@@ -843,7 +870,7 @@ func (s *DocService) SaveDraftMountedAuthorized(ctx context.Context, in PublishI
 				return aerr
 			}
 		}
-		return s.saveDraftLocked(ctx, slug, title, creatorUID, stamped, in.identity, &result)
+		return s.saveDraftLocked(ctx, slug, title, creatorUID, stamped, in.identity, in.MountType, in.mountContextKnown, &result)
 	})
 	if err != nil {
 		return nil, err
@@ -883,7 +910,7 @@ func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput, a
 	identityComplete := canonical && docID == in.Slug && in.identity != nil && shareURL == in.identity.shareURL
 	if !hasDraftMeta || !identityComplete || !creatorComplete {
 		stamped := core.StampAids(html)
-		if err := s.setDraftMeta(ctx, in.Slug, in.Title, in.CreatorUID, in.identity, int64(len(html)), len(stamped.AIDs)); err != nil {
+		if err := s.setDraftMeta(ctx, in.Slug, in.Title, in.CreatorUID, in.identity, in.MountType, in.mountContextKnown, int64(len(html)), len(stamped.AIDs)); err != nil {
 			return nil, err
 		}
 		meta, err = s.meta.GetMeta(ctx, in.Slug)
@@ -904,12 +931,12 @@ func (s *DocService) existingDraftResult(ctx context.Context, in PublishInput, a
 }
 
 // saveDraftLocked initializes the draft without acquiring the document lock.
-func (s *DocService) saveDraftLocked(ctx context.Context, slug, title, creatorUID string, stamped core.StampResult, identity *canonicalIdentity, result **DraftResult) error {
+func (s *DocService) saveDraftLocked(ctx context.Context, slug, title, creatorUID string, stamped core.StampResult, identity *canonicalIdentity, mountType string, mountKnown bool, result **DraftResult) error {
 	size, err := s.blobs.PutDraft(ctx, slug, stamped.HTML)
 	if err != nil {
 		return apperr.Upstream("draft write failed", "draft_write_failed", err)
 	}
-	if err := s.setDraftMeta(ctx, slug, title, creatorUID, identity, size, len(stamped.AIDs)); err != nil {
+	if err := s.setDraftMeta(ctx, slug, title, creatorUID, identity, mountType, mountKnown, size, len(stamped.AIDs)); err != nil {
 		return err
 	}
 	*result = &DraftResult{Slug: slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, slug), Size: size, AIDs: len(stamped.AIDs)}
@@ -997,7 +1024,7 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title, publish
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string, identity *canonicalIdentity, size int64, aids int) error {
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID string, identity *canonicalIdentity, mountType string, mountKnown bool, size int64, aids int) error {
 	prev, err := s.meta.GetMeta(ctx, slug)
 	if err != nil {
 		return err
@@ -1018,6 +1045,9 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title, creatorUID s
 
 	if creatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = creatorUID
+	}
+	if mountKnown {
+		extra[storage.MountTypeExtraKey] = mountType
 	}
 	if identity != nil {
 		extra[storage.CanonicalDocIDExtraKey] = identity.docID
@@ -1093,6 +1123,8 @@ func (s *DocService) existingPublishInput(ctx context.Context, slug, html, title
 	}
 	if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
 		in.identity = &canonicalIdentity{docID: docID, shareURL: shareURL}
+	} else if legacyID, ok := meta.LegacyRegistration(); ok {
+		in.legacyDocID = legacyID
 	}
 
 	return in, nil
@@ -1126,16 +1158,11 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 	return &VersionList{Slug: slug, Title: title, Versions: versions}, nil
 }
 
-// Remove deletes all versions, metadata, and comments for a slug. It holds the
-// per-slug lock across all three deletes so it is serialized against a concurrent
-// Publish of the same slug (which holds the same lock); otherwise a delete could
-// interleave with a publish and leave orphaned blobs or meta pointing at a
-// missing blob.
-func (s *DocService) Remove(ctx context.Context, slug string) error {
-	return s.RemoveAuthorized(ctx, slug, DeleteAuth{})
-}
-
-// RemoveAuthorized deletes an existing ref via explicit bot or human auth.
+// RemoveAuthorized deletes an existing ref via explicit bot or human auth. The
+// caller MUST have already resolved and authenticated a concrete credential:
+// the publisher's bot bearer token, or a verified human ActorUID. A zero-value
+// DeleteAuth never deletes, which is the fail-closed contract the old Remove
+// wrapper violated by delegating with empty credentials.
 func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, auth DeleteAuth) error {
 	return s.lock.With(ctx, slug, func() error {
 		exists, err := s.slugExists(ctx, slug)
@@ -1193,7 +1220,7 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 	if result == nil {
 		return
 	}
-	if result.Registered {
+	if result.Registered && !result.legacyRegistration {
 		s.notifyPublished(parent, result)
 	}
 	if registered || result.Registered {
@@ -1220,8 +1247,7 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 }
 
 func (s *DocService) notifyPublished(parent context.Context, result *PublishResult) {
-	notifier, ok := s.register.(publishNotifier)
-	if !ok || strings.TrimSpace(result.publisherToken) == "" {
+	if s.register == nil || strings.TrimSpace(result.publisherToken) == "" {
 		return
 	}
 	if parent == nil {
@@ -1230,7 +1256,7 @@ func (s *DocService) notifyPublished(parent context.Context, result *PublishResu
 	var err error
 	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(parent, docsBackendAttemptTimeout)
-		err = notifier.Published(attemptCtx, result.DocID, result.title, result.publisherToken)
+		err = s.register.Published(attemptCtx, result.DocID, result.title, result.publisherToken)
 		cancel()
 		if err == nil {
 			return
@@ -1289,11 +1315,38 @@ func (s *DocService) preRegister(ctx context.Context, in PublishInput) (*docsbac
 		if docsbackend.IsCanonicalDocumentDeleted(err) {
 			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
 		}
+		if docsbackend.IsRegistrationContractIncomplete(err) {
+			// Deterministic contract gap; retrying cannot fix it.
+			return nil, apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
+		}
 		if attempt < docsBackendRegisterAttempts && !waitForRetry(ctx, docsBackendRegisterDelay) {
 			break
 		}
 	}
 	return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
+}
+
+// compensateRegistration deletes a docs-backend row that was allocated by a
+// canonical create which then failed validation locally. The only caller is
+// the malformed-identity path, where the allocated row is unusable and
+// replaying the same idempotency key would hit the rejected row forever. The
+// identity-mismatch path deliberately does NOT compensate: that row belongs to
+// another publisher's replay and must not be touched.
+func (s *DocService) compensateRegistration(ctx context.Context, registration *docsbackend.RegistrationResult, token, reason string) {
+	if s.register == nil || registration == nil || strings.TrimSpace(registration.DocID) == "" {
+		return
+	}
+	if strings.TrimSpace(token) == "" {
+		s.log().Warn("canonical_registration_orphan", "reason", reason, "doc_id", registration.DocID, "note", "no publisher token available for compensating delete")
+		return
+	}
+	delCtx, cancel := context.WithTimeout(ctx, docsBackendSideEffectTimeout)
+	defer cancel()
+	if err := s.register.Delete(delCtx, registration.DocID, token); err != nil {
+		s.log().Error("canonical_registration_orphan_cleanup_failed", "reason", reason, "doc_id", registration.DocID, "err", err.Error())
+		return
+	}
+	s.log().Warn("canonical_registration_orphan_cleaned", "reason", reason, "doc_id", registration.DocID)
 }
 
 func normalizeMountType(mountType string) (string, error) {

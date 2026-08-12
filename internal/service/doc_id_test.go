@@ -26,6 +26,7 @@ type canonicalRegistrar struct {
 	tokens    []string
 	deletes   []struct{ ref, token string }
 	deleteErr error
+	published []string
 }
 
 func (r *canonicalRegistrar) Register(_ context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error) {
@@ -34,6 +35,10 @@ func (r *canonicalRegistrar) Register(_ context.Context, reg docsbackend.Registr
 	return r.result, r.err
 }
 func (*canonicalRegistrar) Rename(context.Context, string, string, string) {}
+func (r *canonicalRegistrar) Published(_ context.Context, docID, _, _ string) error {
+	r.published = append(r.published, docID)
+	return nil
+}
 func (r *canonicalRegistrar) Delete(_ context.Context, ref, token string) error {
 	r.deletes = append(r.deletes, struct{ ref, token string }{ref, token})
 	return r.deleteErr
@@ -80,8 +85,9 @@ func (r *retryRegistrar) Register(context.Context, docsbackend.Registration, str
 	}
 	return &docsbackend.RegistrationResult{DocID: "doc-concurrent", OctoDocSlug: "doc-concurrent", ShareURL: "u", PublisherUID: "bot", SpaceID: "space", Created: r.calls != 1}, nil
 }
-func (*retryRegistrar) Rename(context.Context, string, string, string) {}
-func (*retryRegistrar) Delete(context.Context, string, string) error   { return nil }
+func (*retryRegistrar) Rename(context.Context, string, string, string)          {}
+func (*retryRegistrar) Delete(context.Context, string, string) error            { return nil }
+func (*retryRegistrar) Published(context.Context, string, string, string) error { return nil }
 
 type gatedLocker struct {
 	inner   sluglock.Locker
@@ -552,7 +558,7 @@ func TestHumanDeleteFailsClosedWithoutBotFallback(t *testing.T) {
 	ctx := context.Background()
 	_, _ = store.PutDoc(ctx, "doc-human", 1, "x")
 	_ = store.PutMeta(ctx, "doc-human", storage.DocMeta{Slug: "doc-human", Versions: []storage.VersionRef{{N: 1}}, Extra: map[string]any{storage.CanonicalDocIDExtraKey: "doc-human"}})
-	if err := docs.RemoveAuthorized(ctx, "doc-human", service.DeleteAuth{ActorUID: "human-admin", SuperAdmin: true}); err == nil {
+	if err := docs.RemoveAuthorized(ctx, "doc-human", service.DeleteAuth{ActorUID: "human-admin"}); err == nil {
 		t.Fatal("human delete succeeded without safe backend capability")
 	}
 	if len(registrar.deletes) != 0 {
@@ -585,7 +591,7 @@ func TestLegacyHumanDeleteWithoutRegistrarIsLocalOnly(t *testing.T) {
 	ctx := context.Background()
 	_, _ = store.PutDoc(ctx, "legacy-human", 1, "blob")
 	_ = store.PutMeta(ctx, "legacy-human", storage.DocMeta{Slug: "legacy-human", Title: "keep", Versions: []storage.VersionRef{{N: 1}}})
-	if err := docs.RemoveAuthorized(ctx, "legacy-human", service.DeleteAuth{ActorUID: "human", SuperAdmin: true}); err != nil {
+	if err := docs.RemoveAuthorized(ctx, "legacy-human", service.DeleteAuth{ActorUID: "human"}); err != nil {
 		t.Fatalf("authorized standalone legacy delete: %v", err)
 	}
 	if versions, _ := store.ListVersions(ctx, "legacy-human"); len(versions) != 0 {
@@ -594,10 +600,154 @@ func TestLegacyHumanDeleteWithoutRegistrarIsLocalOnly(t *testing.T) {
 
 	_, _ = store.PutDoc(ctx, "legacy-public", 1, "blob")
 	_ = store.PutMeta(ctx, "legacy-public", storage.DocMeta{Slug: "legacy-public", Versions: []storage.VersionRef{{N: 1}}})
-	if err := docs.Remove(ctx, "legacy-public"); err == nil {
-		t.Fatal("public Remove bypassed authentication")
+	if err := docs.RemoveAuthorized(ctx, "legacy-public", service.DeleteAuth{}); err == nil {
+		t.Fatal("credential-free RemoveAuthorized bypassed authentication")
 	}
 	if versions, _ := store.ListVersions(ctx, "legacy-public"); len(versions) != 1 {
 		t.Fatalf("public Remove deleted local data: %v", versions)
+	}
+}
+
+// TestLegacyRegisteredPublishKeepsDocID locks the read-compat shim: a document
+// registered under the pre-canonical scheme keeps reporting its recorded
+// backend doc id (and registered:true) on republish, without any backend
+// side effects.
+func TestLegacyRegisteredPublishKeepsDocID(t *testing.T) {
+	docs, store := canonicalDocs(t, &canonicalRegistrar{})
+	ctx := context.Background()
+	_, _ = store.PutDoc(ctx, "legacy-doc", 1, "v1")
+	_ = store.PutMeta(ctx, "legacy-doc", storage.DocMeta{
+		Slug: "legacy-doc", Title: "Legacy", Versions: []storage.VersionRef{{N: 1}},
+		Extra: map[string]any{
+			storage.LegacyDocsBackendDocIDExtraKey:        "doc-legacy-42",
+			storage.LegacyDocsBackendRegistrationStateKey: storage.LegacyDocsBackendRegistrationRegistered,
+			storage.MountTypeExtraKey:                     "group",
+		},
+	})
+	res, err := docs.PublishAuthorized(ctx, service.PublishInput{
+		Slug: "legacy-doc", HTML: "<html><body><p>v2</p></body></html>",
+	}, func(string, bool) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DocID != "doc-legacy-42" || !res.Registered {
+		t.Fatalf("legacy result = %+v", res)
+	}
+	if res.Slug != "legacy-doc" {
+		t.Fatalf("legacy slug rewritten: %q", res.Slug)
+	}
+}
+
+// TestLegacyRegisteredPublishSendsNoPublishedNotification guards the shim's
+// boundary: legacy doc ids decorate the result only; the backend never gets a
+// Published notification for them.
+func TestLegacyRegisteredPublishSendsNoPublishedNotification(t *testing.T) {
+	registrar := &canonicalRegistrar{}
+	docs, store := canonicalDocs(t, registrar)
+	ctx := context.Background()
+	_, _ = store.PutDoc(ctx, "legacy-silent", 1, "v1")
+	_ = store.PutMeta(ctx, "legacy-silent", storage.DocMeta{
+		Slug: "legacy-silent", Versions: []storage.VersionRef{{N: 1}},
+		Extra: map[string]any{
+			storage.LegacyDocsBackendDocIDExtraKey:        "doc-legacy-7",
+			storage.LegacyDocsBackendRegistrationStateKey: storage.LegacyDocsBackendRegistrationRegistered,
+		},
+	})
+	if _, err := docs.PublishAuthorized(ctx, service.PublishInput{
+		Slug: "legacy-silent", HTML: "<html><body><p>v2</p></body></html>", PublisherToken: "bot-token",
+	}, func(string, bool) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrar.published) != 0 {
+		t.Fatalf("published notifications = %v", registrar.published)
+	}
+}
+
+// TestCanonicalPublishNotifiesPublished covers the notifyPublished path now
+// that Published is a required DocRegistrar method: a canonical create with a
+// publisher token sends exactly one notification for the allocated doc id.
+func TestCanonicalPublishNotifiesPublished(t *testing.T) {
+	registrar := &canonicalRegistrar{result: &docsbackend.RegistrationResult{
+		DocID: "doc-canon", OctoDocSlug: "doc-canon", ShareURL: "https://octo.test/d/doc-canon",
+		PublisherUID: "uid", SpaceID: "space", Created: true,
+	}}
+	docs, _ := canonicalDocs(t, registrar)
+	if _, err := docs.PublishAuthorized(context.Background(), service.PublishInput{
+		HTML: "<html><body><p>x</p></body></html>", IdempotencyKey: "k-1",
+		PublisherToken: "bot-token", PublisherUID: "uid", PublisherSpaceID: "space",
+	}, func(string, bool) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrar.published) != 1 || registrar.published[0] != "doc-canon" {
+		t.Fatalf("published = %v", registrar.published)
+	}
+}
+
+// TestCanonicalRegistrationContractIncomplete guards the decode-time gate end
+// to end through the real client: a canonical response missing
+// publisherUid/spaceId fails fast with a distinct, diagnosable upstream error
+// instead of masquerading as an identity mismatch.
+func TestCanonicalRegistrationContractIncomplete(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"docId":"doc-x","octoDocSlug":"doc-x","shareUrl":"https://octo.test/d/doc-x","created":true}`))
+	}))
+	defer ts.Close()
+	docs := service.NewDocService(memory.New(), memory.New(), nil, sluglock.NewMemory(), "https://octo.test", 5<<20).
+		WithDocsBackendRegistration(docsbackend.New(ts.URL, "cfg-token", nil), nil)
+	_, err := docs.PublishAuthorized(context.Background(), service.PublishInput{
+		HTML: "<html><body><p>x</p></body></html>", IdempotencyKey: "k-2",
+		PublisherToken: "bot-token", PublisherUID: "uid", PublisherSpaceID: "space",
+	}, func(string, bool) error { return nil })
+	appErr, ok := err.(*apperr.Error)
+	if !ok || appErr.Code != "registration_contract_incomplete" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestCanonicalRegistrationInvalidIdentityCompensates covers the orphan-row
+// guard: a malformed identity response triggers a compensating backend delete
+// with the request token so the idempotency key is not poisoned forever.
+func TestCanonicalRegistrationInvalidIdentityCompensates(t *testing.T) {
+	registrar := &canonicalRegistrar{result: &docsbackend.RegistrationResult{
+		DocID: "bad id", OctoDocSlug: "bad id", ShareURL: "https://octo.test/d/bad",
+		PublisherUID: "uid", SpaceID: "space", Created: true,
+	}}
+	docs, _ := canonicalDocs(t, registrar)
+	_, err := docs.PublishAuthorized(context.Background(), service.PublishInput{
+		HTML: "<html><body><p>x</p></body></html>", IdempotencyKey: "k-3",
+		PublisherToken: "bot-token", PublisherUID: "uid", PublisherSpaceID: "space",
+	}, func(string, bool) error { return nil })
+	appErr, ok := err.(*apperr.Error)
+	if !ok || appErr.Code != "registration_invalid" {
+		t.Fatalf("err = %v", err)
+	}
+	if len(registrar.deletes) != 1 || registrar.deletes[0].ref != "bad id" || registrar.deletes[0].token != "bot-token" {
+		t.Fatalf("compensating deletes = %+v", registrar.deletes)
+	}
+}
+
+// TestCanonicalDraftCreatePersistsMount locks the draft mount fix: a canonical
+// draft create records the mount alongside the identity so a later promote
+// keeps the mount context.
+func TestCanonicalDraftCreatePersistsMount(t *testing.T) {
+	registrar := &canonicalRegistrar{result: &docsbackend.RegistrationResult{
+		DocID: "doc-m", OctoDocSlug: "doc-m", ShareURL: "https://octo.test/d/doc-m",
+		PublisherUID: "uid", SpaceID: "space", Created: true,
+	}}
+	docs, store := canonicalDocs(t, registrar)
+	if _, err := docs.SaveDraftMountedAuthorized(context.Background(), service.PublishInput{
+		HTML: "<html><body><p>x</p></body></html>", IdempotencyKey: "k-m",
+		MountType: "space", MountTypePresent: true,
+		PublisherToken: "bot-token", PublisherUID: "uid", PublisherSpaceID: "space",
+	}, func(string, bool) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.GetMeta(context.Background(), "doc-m")
+	if err != nil || meta == nil {
+		t.Fatalf("meta = %+v, err = %v", meta, err)
+	}
+	if mount, ok := meta.MountType(); !ok || mount != "space" {
+		t.Fatalf("mount = %q, ok = %v", mount, ok)
 	}
 }

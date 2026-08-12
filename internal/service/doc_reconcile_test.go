@@ -36,6 +36,8 @@ func (r *noopRegistrar) Rename(context.Context, string, string, string) {
 }
 func (*noopRegistrar) Delete(context.Context, string, string) error { return nil }
 
+func (*noopRegistrar) Published(context.Context, string, string, string) error { return nil }
+
 // afterPublished invokes the injected reconciler after confirmed registration
 // so grants written during the post-commit registration gap survive A4.
 func TestAfterPublishedTriggersGrantReconciler(t *testing.T) {

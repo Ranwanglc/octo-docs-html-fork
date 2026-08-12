@@ -29,6 +29,32 @@ func IsCanonicalDocumentDeleted(err error) bool {
 	return ok
 }
 
+// logRef picks the log identifier for a registration: the octo-doc slug for
+// legacy slug registration, the idempotency key for canonical creates (whose
+// slug is not known until the response arrives).
+func logRef(reg Registration) string {
+	if strings.TrimSpace(reg.OctoDocSlug) != "" {
+		return reg.OctoDocSlug
+	}
+	return reg.IdempotencyKey
+}
+
+// RegistrationContractIncompleteError marks a canonical registration response
+// that lacks the publisher identity fields the caller needs for its identity
+// gate. Distinct from the 403 identity-mismatch path: this is a contract
+// problem with the backend deployment, not an authorization failure.
+type RegistrationContractIncompleteError struct{}
+
+func (*RegistrationContractIncompleteError) Error() string {
+	return "docs-backend canonical registration response missing publisherUid/spaceId"
+}
+
+// IsRegistrationContractIncomplete reports whether err is the contract error.
+func IsRegistrationContractIncomplete(err error) bool {
+	_, ok := err.(*RegistrationContractIncompleteError)
+	return ok
+}
+
 // Registration is the POST /v1/bot/docs payload docs-backend accepts for
 // octo-doc backed HTML documents.
 type Registration struct {
@@ -109,7 +135,7 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	if strings.TrimSpace(token) == "" && strings.TrimSpace(reg.IdempotencyKey) != "" {
 		return nil, fmt.Errorf("docs-backend canonical create requires publisher token")
 	}
-	body, err := c.doJSON(ctx, http.MethodPost, c.registerURL, reg, reg.OctoDocSlug, "register", token)
+	body, err := c.doJSON(ctx, http.MethodPost, c.registerURL, reg, logRef(reg), "register", token)
 	if err != nil {
 		return nil, err
 	}
@@ -120,8 +146,16 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	if strings.TrimSpace(result.DocID) == "" || strings.TrimSpace(result.OctoDocSlug) == "" || strings.TrimSpace(result.ShareURL) == "" {
 		return nil, fmt.Errorf("decode docs-backend registration: required response field missing")
 	}
-	if strings.TrimSpace(reg.IdempotencyKey) != "" && result.DocID != result.OctoDocSlug {
-		return nil, fmt.Errorf("decode docs-backend registration: doc identity mismatch")
+	if strings.TrimSpace(reg.IdempotencyKey) != "" {
+		if result.DocID != result.OctoDocSlug {
+			return nil, fmt.Errorf("decode docs-backend registration: doc identity mismatch")
+		}
+		// Canonical creates run the caller's publisher-identity gate downstream;
+		// a backend that omits either field makes that gate fail with an
+		// indistinguishable 403. Surface the contract gap explicitly instead.
+		if strings.TrimSpace(result.PublisherUID) == "" || strings.TrimSpace(result.SpaceID) == "" {
+			return nil, &RegistrationContractIncompleteError{}
+		}
 	}
 
 	return &result, nil

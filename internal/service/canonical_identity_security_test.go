@@ -22,8 +22,9 @@ type identityRegistrar struct {
 func (r *identityRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
 	return r.result, nil
 }
-func (*identityRegistrar) Rename(context.Context, string, string, string) {}
-func (*identityRegistrar) Delete(context.Context, string, string) error   { return nil }
+func (*identityRegistrar) Rename(context.Context, string, string, string)          {}
+func (*identityRegistrar) Delete(context.Context, string, string) error            { return nil }
+func (*identityRegistrar) Published(context.Context, string, string, string) error { return nil }
 
 func identityDocs(r service.DocRegistrar) (*service.DocService, *memory.Store) {
 	store := memory.New()

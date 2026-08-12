@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -71,7 +72,14 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		if errors.Is(discardErr, driver.ErrBadConn) {
 			discardErr = nil
 		}
-		retErr = errors.Join(retErr, fmt.Errorf("release_lock: %w", unlockErr), discardErr)
+		if retErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release_lock: %w", unlockErr), discardErr)
+			return
+		}
+		// The critical section already committed durably: an unlock failure here
+		// must not masquerade as a publish error and invite a retry that mints a
+		// duplicate version. The session is discarded, so the lock dies with it.
+		slog.Default().Warn("release_lock failed after commit; connection discarded", "name", name, "err", unlockErr, "discard_err", discardErr)
 	}()
 
 	return fn()

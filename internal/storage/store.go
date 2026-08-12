@@ -32,6 +32,16 @@ const MountTypeExtraKey = "mount_type"
 // CanonicalDocIDExtraKey marks identities allocated by docs-backend.
 const CanonicalDocIDExtraKey = "canonical_doc_id"
 
+// Legacy registration keys written before the canonical doc-id scheme. Documents
+// already registered under the old scheme keep their backend identity here; the
+// read path below falls back to it so republishes of existing documents keep
+// reporting the recorded doc id instead of regressing to doc_id:"".
+const (
+	LegacyDocsBackendDocIDExtraKey          = "docs_backend_doc_id"
+	LegacyDocsBackendRegistrationStateKey   = "docs_backend_registration_state"
+	LegacyDocsBackendRegistrationRegistered = "registered"
+)
+
 // CanonicalShareURLExtraKey stores the canonical read URL for idempotent retries.
 const CanonicalShareURLExtraKey = "canonical_share_url"
 
@@ -72,6 +82,21 @@ func (m *DocMeta) CanonicalIdentity() (string, string, bool) {
 	docID, _ := m.Extra[CanonicalDocIDExtraKey].(string)
 	shareURL, _ := m.Extra[CanonicalShareURLExtraKey].(string)
 	return docID, shareURL, docID != ""
+}
+
+// LegacyRegistration returns the pre-canonical docs-backend doc id when the
+// document was registered under the old scheme. Share URLs were never
+// persisted for legacy rows, so only the doc id is recoverable.
+func (m *DocMeta) LegacyRegistration() (string, bool) {
+	if m == nil || m.Extra == nil {
+		return "", false
+	}
+	state, _ := m.Extra[LegacyDocsBackendRegistrationStateKey].(string)
+	if state != LegacyDocsBackendRegistrationRegistered {
+		return "", false
+	}
+	docID, _ := m.Extra[LegacyDocsBackendDocIDExtraKey].(string)
+	return docID, docID != ""
 }
 
 // GrantsExtraKey is the DocMeta.Extra key holding per-uid access grants: a

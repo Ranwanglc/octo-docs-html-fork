@@ -50,8 +50,10 @@ curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
 # data: { "slug":"demo", "version":1, "url":"https://.../d/<doc_id>?sp=<space>", "doc_id":"...", "share_url":"https://.../d/<doc_id>?sp=<space>", "registered":true, "status":"published", "size":..., "aids":..., "merged_comments":... }
 ```
 
-Body: `{slug, html, title?, version?, comments?, mount_type?, group_no?, thread_id?}`. `slug` is kebab-case
+Body: `{slug, html, title?, version?, comments?, mount_type?}`. `slug` is kebab-case
 (`^[a-zA-Z0-9_-]{1,64}$`). HTML is capped at `MAX_HTML_BYTES` (413 over limit).
+Group/thread placement is resolved by docs-backend from the publishing bot's own
+context; the body intentionally carries no group/thread identifiers.
 
 For a registerable `group`, `space`, or `thread` mount, the service writes the
 immutable HTML version exactly once, then retries only docs-backend registration
@@ -71,7 +73,7 @@ depends on that backend contract.
 
 ### `POST /v1/docs/draft` — create a canonical draft (bot author)
 Creates a new mutable draft without a caller-chosen reference. Body:
-`{html, idempotency_key, meta?: {title}, mount_type?, group_no?, thread_id?}`.
+`{html, idempotency_key, meta?: {title}, mount_type?}`.
 Returns **201** with `data.doc_id` and `data.slug` (equal); persist `data.slug`
 for later save, promote, publish, and delete calls. Missing or empty `html` returns
 `400 html_required` before backend registration or local writes.
@@ -88,10 +90,13 @@ Returns the same shape as publish.
 `data: { slug, title, versions: [{ n, created }] }`.
 
 ### `DELETE /v1/docs/{slug}` — unpublish (author)
-Deletes all versions, the draft, comments, and assets for the slug. For canonical
-doc IDs, the docs-backend delete occurs first; an authenticated owner retry after
-that remote soft delete succeeds idempotently so interrupted local cleanup can
-finish. Unauthorized deletion remains an error.
+Deletes all versions, the draft, comments, and assets for the slug. Deletion is
+bot-delegated: the endpoint requires the publishing bot's bearer token (no
+cookie/human path). For canonical doc IDs, the docs-backend delete occurs first;
+an authenticated retry after that remote soft delete succeeds idempotently so
+interrupted local cleanup can finish — between the remote delete and the local
+wipe the document is still served locally while its backend row is gone, and a
+retry closes that window. Unauthorized deletion remains an error.
 
 ## Sharing
 

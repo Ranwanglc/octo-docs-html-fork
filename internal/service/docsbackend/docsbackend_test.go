@@ -40,3 +40,38 @@ func TestClientRejectsEveryRedirectWithoutForwardingBearerToken(t *testing.T) {
 		})
 	}
 }
+
+func TestClientCanonicalRegisterRejectsIncompletePublisherIdentity(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"docId":"d1","octoDocSlug":"d1","shareUrl":"https://x/d/d1","created":true}`))
+	}))
+	defer ts.Close()
+	client := newWithTimeout(ts.URL, "", time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := client.Register(context.Background(), Registration{IdempotencyKey: "k"}, "tok")
+	if !IsRegistrationContractIncomplete(err) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestClientLegacyRegisterSkipsPublisherIdentityCheck(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"docId":"d1","octoDocSlug":"slug-1","shareUrl":"https://x/d/d1"}`))
+	}))
+	defer ts.Close()
+	client := newWithTimeout(ts.URL, "", time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	res, err := client.Register(context.Background(), Registration{OctoDocSlug: "slug-1"}, "tok")
+	if err != nil || res == nil {
+		t.Fatalf("legacy register rejected: %v", err)
+	}
+}
+
+func TestLogRefPrefersSlugThenIdempotencyKey(t *testing.T) {
+	if got := logRef(Registration{OctoDocSlug: "s", IdempotencyKey: "k"}); got != "s" {
+		t.Fatalf("logRef = %q", got)
+	}
+	if got := logRef(Registration{IdempotencyKey: "k"}); got != "k" {
+		t.Fatalf("logRef = %q", got)
+	}
+}

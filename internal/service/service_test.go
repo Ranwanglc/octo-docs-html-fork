@@ -236,7 +236,7 @@ func TestPublishRegistersGroupMountedDoc(t *testing.T) {
 
 	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "group-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Group Title",
-		MountType: "group", GroupNo: "g-1",
+		MountType: "group",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +258,7 @@ func TestPublishRegistersUnderPublisherToken(t *testing.T) {
 
 	if _, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "pub-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Pub Title",
-		MountType: "group", GroupNo: "g-1",
+		MountType:      "group",
 		PublisherToken: "publisher-token",
 	}); err != nil {
 		t.Fatal(err)
@@ -277,7 +277,7 @@ func TestPublishRegisterFallsBackToConfiguredToken(t *testing.T) {
 
 	if _, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "fallback-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Fallback Title",
-		MountType: "group", GroupNo: "g-1",
+		MountType: "group",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -482,6 +482,8 @@ func (r *cancelRegistrar) Rename(context.Context, string, string, string) {
 
 func (*cancelRegistrar) Delete(context.Context, string, string) error { return nil }
 
+func (*cancelRegistrar) Published(context.Context, string, string, string) error { return nil }
+
 func TestCanonicalPublishCancellationStopsRegistrationRetries(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
@@ -599,8 +601,9 @@ func (r *timeoutRegistrar) Register(context.Context, docsbackend.Registration, s
 	return nil, context.DeadlineExceeded
 }
 
-func (*timeoutRegistrar) Rename(context.Context, string, string, string) {}
-func (*timeoutRegistrar) Delete(context.Context, string, string) error   { return nil }
+func (*timeoutRegistrar) Rename(context.Context, string, string, string)          {}
+func (*timeoutRegistrar) Delete(context.Context, string, string) error            { return nil }
+func (*timeoutRegistrar) Published(context.Context, string, string, string) error { return nil }
 
 func TestCanonicalPublishRetriesRegistrationTimeoutWithoutWrite(t *testing.T) {
 	store := memory.New()
@@ -773,10 +776,12 @@ func TestConcurrentPublishConsistent(t *testing.T) {
 	}
 }
 
-// TestConcurrentPublishAndRemove exercises Publish and Remove of the same slug
-// racing through the shared per-slug lock; it must not panic or deadlock and must
-// leave a self-consistent final state (either fully removed, or a valid version
-// list whose latest blob exists).
+// TestConcurrentPublishAndRemove exercises Publish and RemoveAuthorized of the
+// same slug racing through the shared per-slug lock; it must not panic or
+// deadlock and must leave a self-consistent final state (either fully removed,
+// or a valid version list whose latest blob exists). The delete carries an
+// explicit bot credential — the zero-value DeleteAuth is fail-closed by
+// contract, not a race participant.
 func TestConcurrentPublishAndRemove(t *testing.T) {
 	ds, _ := newDoc(t)
 	ctx := context.Background()
@@ -788,7 +793,9 @@ func TestConcurrentPublishAndRemove(t *testing.T) {
 		})
 		done <- err
 	}()
-	go func() { done <- ds.Remove(ctx, "rp") }()
+	go func() {
+		done <- ds.RemoveAuthorized(ctx, "rp", service.DeleteAuth{PublisherToken: "bot-token"})
+	}()
 	for range 2 {
 		if err := <-done; err != nil && !strings.Contains(err.Error(), "document not found") {
 			t.Fatalf("op failed: %v", err)
