@@ -144,6 +144,10 @@ type PublishInput struct {
 	// identity marker part of the publish metadata commit, rather than a second
 	// best-effort write after content has been committed.
 	canonical *canonicalIdentity
+	// onDurableCommit runs once identity-bearing content metadata has committed.
+	// It is used only by canonical creation to retain the remote identity when a
+	// later, non-atomic side effect (such as comment merging) fails.
+	onDurableCommit func()
 }
 
 // PublishProvenance is the durable ownership context effective for a write.
@@ -380,50 +384,54 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 		}
 		in.Slug = reg.DocID
 		identity = canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
-		if registered {
-			if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
-				return stateErr
-			} else if exists {
-				return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
-			}
-		}
-		// An idempotency replay must return the original write, never mint v2.
-		if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
-			return e
-		} else if len(versions) > 0 {
-			latest := versions[0]
-			for _, v := range versions[1:] {
-				if v > latest {
-					latest = v
-				}
-			}
-			meta, e := s.meta.GetMeta(ctx, in.Slug)
-			if e != nil {
-				return e
-			}
-			if meta != nil {
-				if docID, shareURL, ok := meta.CanonicalIdentity(); !ok || docID != reg.DocID {
+		// Canonical creation takes idem then slug. Legacy publishing takes only
+		// the slug lock, so it can never wait on idem and this order has no cycle.
+		return s.lock.With(ctx, reg.DocID, func() error {
+			if registered {
+				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
+					return stateErr
+				} else if exists {
 					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
-				} else {
-					result = &PublishResult{Slug: in.Slug, Version: latest, URL: shareURL, DocID: docID, ShareURL: shareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
 				}
-				registered = false
-				return nil
 			}
-		}
-		if authorize != nil {
-			if e := authorize(false); e != nil {
+			// An idempotency replay must return the original write, never mint v2.
+			if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
 				return e
+			} else if len(versions) > 0 {
+				latest := versions[0]
+				for _, v := range versions[1:] {
+					if v > latest {
+						latest = v
+					}
+				}
+				meta, e := s.meta.GetMeta(ctx, in.Slug)
+				if e != nil {
+					return e
+				}
+				if meta != nil {
+					if docID, shareURL, ok := meta.CanonicalIdentity(); !ok || docID != reg.DocID {
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					} else {
+						result = &PublishResult{Slug: in.Slug, Version: latest, URL: shareURL, DocID: docID, ShareURL: shareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
+					}
+					registered = false
+					return nil
+				}
 			}
-		}
-		in.canonical = &identity
-		r, e := s.publishLocked(ctx, in, stamped)
-		result = r
-		if e == nil {
-			firstDurableContent = true
-			registered = false
-		}
-		return e
+			if authorize != nil {
+				if e := authorize(false); e != nil {
+					return e
+				}
+			}
+			in.canonical = &identity
+			in.onDurableCommit = func() { registered = false }
+			r, e := s.publishLocked(ctx, in, stamped)
+			result = r
+			if e == nil {
+				firstDurableContent = true
+			}
+			return e
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -476,8 +484,10 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		return nil, apperr.Upstream("blob write failed", "blob_write_failed", err)
 	}
 	if _, ok, herr := s.blobs.HeadDoc(ctx, in.Slug, version); herr != nil {
+		s.cleanupCanonicalContent(ctx, in)
 		return nil, apperr.Upstream("blob head failed", "blob_head_failed", herr)
 	} else if !ok {
+		s.cleanupCanonicalContent(ctx, in)
 		return nil, apperr.Upstream("blob write did not persist", "blob_write_lost", nil)
 	}
 
@@ -487,12 +497,11 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		// idempotency-key lock). Do not leave an unmarked blob behind when the
 		// single identity-and-content metadata commit fails: a replay can then
 		// safely self-heal as v1.
-		if in.canonical != nil {
-			if cleanupErr := s.blobs.DeleteDoc(ctx, in.Slug); cleanupErr != nil {
-				s.log().Error("canonical_content_rollback_failed", "doc_id", in.canonical.docID, "err", cleanupErr.Error())
-			}
-		}
+		s.cleanupCanonicalContent(ctx, in)
 		return nil, err
+	}
+	if in.onDurableCommit != nil {
+		in.onDurableCommit()
 	}
 
 	merge, err := s.comments.PublishMergeWithMigrationsLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version, in.pinnedAID, in.pinnedTag, in.anchorMigrations)
@@ -523,6 +532,15 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		owner:             in.CreatorUID,
 		userPublish:       in.UserPublish,
 	}, nil
+}
+
+func (s *DocService) cleanupCanonicalContent(ctx context.Context, in PublishInput) {
+	if in.canonical == nil {
+		return
+	}
+	if cleanupErr := s.blobs.DeleteDoc(ctx, in.Slug); cleanupErr != nil {
+		s.log().Error("canonical_content_rollback_failed", "doc_id", in.canonical.docID, "err", cleanupErr.Error())
+	}
 }
 
 func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) error {
