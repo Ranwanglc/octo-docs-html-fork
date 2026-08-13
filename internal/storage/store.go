@@ -43,6 +43,10 @@ const CanonicalShareURLExtraKey = "canonical_share_url"
 // creation, preventing stale draft replays after promotion.
 const CanonicalDraftCreateExtraKey = "canonical_draft_create"
 
+// CanonicalDraftAIDsExtraKey stores the stamped AID count for inexpensive
+// canonical draft replays, without re-parsing the draft HTML.
+const CanonicalDraftAIDsExtraKey = "canonical_draft_aids"
+
 // Publish provenance keys persist registration identity and mount details.
 const (
 	UserPublishExtraKey               = "user_publish"

@@ -164,8 +164,12 @@ func TestCanonicalDraftReplayAfterPromoteDoesNotResurrectDraft(t *testing.T) {
 	if registers, _, published := registrar.counts(); registers != 1 || published != 1 {
 		t.Fatalf("registers=%d published=%d, want initial registration only and one publication notification", registers, published)
 	}
-	if _, err := docs.CreateCanonicalDraft(context.Background(), in); err != nil {
+	replay, err := docs.CreateCanonicalDraft(context.Background(), in)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if replay.DocID != "d_draft" || replay.URL != "https://docs/d_draft" {
+		t.Fatalf("draft replay=%+v, want promoted canonical identity", replay)
 	}
 	if _, exists, err := store.GetDraft(context.Background(), "d_draft"); err != nil || exists {
 		t.Fatalf("draft exists=%v err=%v; replay must not resurrect promoted draft", exists, err)

@@ -906,12 +906,22 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		}
 		if prev != nil {
 			if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
-				if draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug); derr == nil && exists {
-					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: len(core.StampAids(draft).AIDs)}
+				draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug)
+				if derr != nil {
+					return derr
+				}
+				if exists {
+					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: canonicalDraftAIDCount(prev.Extra[storage.CanonicalDraftAIDsExtraKey])}
 					registered = false
 					return nil
 				}
-				result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
+				// Promotion clears the draft but retains the canonical marker. A
+				// create replay must return its durable identity, never a stale URL.
+				if docID, shareURL, canonical := prev.CanonicalIdentity(); canonical && len(prev.Versions) > 0 {
+					result = &DraftResult{Slug: in.Slug, DocID: docID, URL: shareURL}
+				} else {
+					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
+				}
 				registered = false
 				return nil
 			}
@@ -932,6 +942,7 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		extra[storage.CanonicalDocIDExtraKey] = reg.DocID
 		extra[storage.CanonicalShareURLExtraKey] = reg.ShareURL
 		extra[storage.CanonicalDraftCreateExtraKey] = true
+		extra[storage.CanonicalDraftAIDsExtraKey] = len(stamped.AIDs)
 		if e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); e != nil {
 			return e
 		}
@@ -946,6 +957,17 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		return &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}, nil
 	}
 	return result, nil
+}
+
+func canonicalDraftAIDCount(value any) int {
+	switch count := value.(type) {
+	case int:
+		return count
+	case float64:
+		return int(count)
+	default:
+		return 0
+	}
 }
 
 // SaveDraft stamps and writes the mutable draft slot for a slug, creating the
