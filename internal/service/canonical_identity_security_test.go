@@ -97,6 +97,44 @@ func TestCanonicalReplayRejectsLegacySlugCollision(t *testing.T) {
 	}
 }
 
+func TestCanonicalCreateRejectsDraftOnlySlugCollision(t *testing.T) {
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_squat", OctoDocSlug: "d_draft_squat", ShareURL: "https://docs/d_draft_squat", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs, store := canonicalTestDocs(t, registrar)
+	if _, err := store.PutDraft(context.Background(), "d_draft_squat", "squatted draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeta(context.Background(), "d_draft_squat", storage.DocMeta{Slug: "d_draft_squat"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := docs.Publish(context.Background(), canonicalInput())
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Status != http.StatusConflict || appErr.Code != "canonical_identity_conflict" {
+		t.Fatalf("error=%v, want 409 canonical identity conflict", err)
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 1 {
+		t.Fatalf("rollback deletes=%d, want 1", deletes)
+	}
+}
+
+func TestCanonicalDraftCreateRejectsDraftOnlySlugCollision(t *testing.T) {
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_create_squat", OctoDocSlug: "d_draft_create_squat", ShareURL: "https://docs/d_draft_create_squat", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs, store := canonicalTestDocs(t, registrar)
+	if _, err := store.PutDraft(context.Background(), "d_draft_create_squat", "squatted draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeta(context.Background(), "d_draft_create_squat", storage.DocMeta{Slug: "d_draft_create_squat"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := docs.CreateCanonicalDraft(context.Background(), canonicalInput())
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Status != http.StatusConflict || appErr.Code != "canonical_identity_conflict" {
+		t.Fatalf("error=%v, want 409 canonical identity conflict", err)
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 1 {
+		t.Fatalf("rollback deletes=%d, want 1", deletes)
+	}
+}
+
 type failingCanonicalBlobStore struct{ *memory.Store }
 
 func (*failingCanonicalBlobStore) PutDoc(context.Context, string, int, string) (int64, error) {
@@ -126,6 +164,114 @@ func TestCanonicalReplayWriteFailureDoesNotDeleteExistingIdentity(t *testing.T) 
 	}
 	if _, deletes, _ := registrar.counts(); deletes != 0 {
 		t.Fatalf("replay rollback deletes=%d, want 0", deletes)
+	}
+}
+
+type failCanonicalMarkerMetaStore struct {
+	*memory.Store
+	fail bool
+}
+
+func (s *failCanonicalMarkerMetaStore) PutMeta(ctx context.Context, slug string, meta storage.DocMeta) error {
+	if s.fail && meta.Extra[storage.CanonicalDocIDExtraKey] != nil {
+		s.fail = false
+		return errors.New("simulated canonical marker write failure")
+	}
+	return s.Store.PutMeta(ctx, slug, meta)
+}
+
+func TestCanonicalMarkerWriteIsAtomicAndReplaySelfHeals(t *testing.T) {
+	store := memory.New()
+	meta := &failCanonicalMarkerMetaStore{Store: store, fail: true}
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_atomic", OctoDocSlug: "d_atomic", ShareURL: "https://docs/d_atomic", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(store, meta, NewCommentService(meta, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("publish succeeded despite marker failure")
+	}
+	if meta, err := store.GetMeta(context.Background(), "d_atomic"); err != nil || meta != nil {
+		t.Fatalf("partial identity metadata=%+v err=%v", meta, err)
+	}
+	if versions, err := store.ListVersions(context.Background(), "d_atomic"); err != nil || len(versions) != 0 {
+		t.Fatalf("partial content versions=%v err=%v", versions, err)
+	}
+	registrar.mu.Lock()
+	registrar.result.Created = false
+	registrar.mu.Unlock()
+	result, err := docs.Publish(context.Background(), canonicalInput())
+	if err != nil {
+		t.Fatalf("self-heal replay: %v", err)
+	}
+	if result.Version != 1 || result.DocID != "d_atomic" {
+		t.Fatalf("self-heal result=%+v, want canonical v1", result)
+	}
+}
+
+type probeRegistrar struct {
+	mu        sync.Mutex
+	registers int
+	deletes   int
+}
+
+func (r *probeRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.registers++
+	if r.registers == 1 {
+		return &docsbackend.RegistrationResult{DocID: "d_probe", OctoDocSlug: "d_probe", ShareURL: "https://docs/d_probe", PublisherUID: "publisher", SpaceID: "space", Created: true}, nil
+	}
+	if r.deletes > 0 {
+		return nil, &docsbackend.CanonicalDocumentDeletedError{}
+	}
+	return &docsbackend.RegistrationResult{DocID: "d_probe", OctoDocSlug: "d_probe", ShareURL: "https://docs/d_probe", PublisherUID: "publisher", SpaceID: "space", Created: false}, nil
+}
+func (*probeRegistrar) Rename(context.Context, string, string, string) {}
+func (*probeRegistrar) Delete(context.Context, string, string)         {}
+func (r *probeRegistrar) DeleteCanonical(context.Context, string, string) error {
+	r.mu.Lock()
+	r.deletes++
+	r.mu.Unlock()
+	return nil
+}
+
+type gatedFailBlobStore struct {
+	*memory.Store
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *gatedFailBlobStore) PutDoc(context.Context, string, int, string) (int64, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return 0, errors.New("first canonical write fails")
+}
+
+func TestCanonicalIdempotencyLockPreventsRollbackReplayInterleaving(t *testing.T) {
+	store := memory.New()
+	lock := sluglock.NewMemory()
+	blobs := &gatedFailBlobStore{Store: store, entered: make(chan struct{}), release: make(chan struct{})}
+	registrar := &probeRegistrar{}
+	docs := NewDocService(blobs, store, NewCommentService(store, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	firstDone := make(chan error, 1)
+	go func() { _, err := docs.Publish(context.Background(), canonicalInput()); firstDone <- err }()
+	<-blobs.entered
+	secondDone := make(chan error, 1)
+	go func() { _, err := docs.Publish(context.Background(), canonicalInput()); secondDone <- err }()
+	close(blobs.release)
+	if err := <-firstDone; err == nil {
+		t.Fatal("first publish succeeded")
+	}
+	err := <-secondDone
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "canonical_document_deleted" {
+		t.Fatalf("second publish=%v, want deleted-identity conflict after serialized rollback", err)
+	}
+	registrar.mu.Lock()
+	deletes, registers := registrar.deletes, registrar.registers
+	registrar.mu.Unlock()
+	if deletes != 1 || registers != 2 {
+		t.Fatalf("rollback/replay calls deletes=%d registers=%d, want 1/2", deletes, registers)
 	}
 }
 
