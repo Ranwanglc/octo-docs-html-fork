@@ -64,9 +64,12 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	_, b.SpaceIDPresent = r.MultipartForm.Value["space_id"]
 	if file, _, err := r.FormFile("file"); err == nil {
 		defer func() { _ = file.Close() }()
-		data, rerr := io.ReadAll(file)
+		data, rerr := io.ReadAll(io.LimitReader(file, s.cfg.MaxHTMLBytes+1))
 		if rerr != nil {
 			return publishBody{}, apperr.Validation("could not read file", "file_read_failed")
+		}
+		if int64(len(data)) > s.cfg.MaxHTMLBytes {
+			return publishBody{}, apperr.PayloadTooLarge("document exceeds configured maximum", "html_too_large")
 		}
 		b.HTML = string(data)
 	} else if h := r.FormValue("html"); h != "" {
@@ -188,12 +191,15 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 			return apperr.Forbidden("space membership required", "space_membership_required")
 		}
 	}
+	publisherUID, publisherSpaceID := trustedPublisherFromCtx(r.Context())
 	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:          creatorUID,
 		PublisherToken:      botTokenFromCtx(r.Context()),
+		PublisherUID:        publisherUID,
+		PublisherSpaceID:    publisherSpaceID,
 		IdempotencyKey:      body.IdempotencyKey,
 		SpaceID:             spaceID,
 		UserPublish:         userPublish,
@@ -223,7 +229,8 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) error
 	if botSessionFromCtx(r.Context()) == nil {
 		return apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
 	}
-	res, err := s.docs.CreateCanonicalDraft(r.Context(), service.PublishInput{HTML: body.HTML, Title: body.Title, MountType: body.MountType, MountTypePresent: body.MountTypePresent, IdempotencyKey: body.IdempotencyKey, PublisherToken: botTokenFromCtx(r.Context()), CreatorUID: creatorUIDFromCtx(r.Context())})
+	publisherUID, publisherSpaceID := trustedPublisherFromCtx(r.Context())
+	res, err := s.docs.CreateCanonicalDraft(r.Context(), service.PublishInput{HTML: body.HTML, Title: body.Title, MountType: body.MountType, MountTypePresent: body.MountTypePresent, IdempotencyKey: body.IdempotencyKey, PublisherToken: botTokenFromCtx(r.Context()), CreatorUID: creatorUIDFromCtx(r.Context()), PublisherUID: publisherUID, PublisherSpaceID: publisherSpaceID})
 	if err != nil {
 		return err
 	}

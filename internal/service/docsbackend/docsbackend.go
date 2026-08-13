@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,8 +26,8 @@ func (*CanonicalDocumentDeletedError) Error() string { return "canonical documen
 
 // IsCanonicalDocumentDeleted reports the terminal canonical replay condition.
 func IsCanonicalDocumentDeleted(err error) bool {
-	_, ok := err.(*CanonicalDocumentDeletedError)
-	return ok
+	var target *CanonicalDocumentDeletedError
+	return errors.As(err, &target)
 }
 
 // RegistrationContractIncompleteError indicates a backend response missing
@@ -39,8 +40,8 @@ func (*RegistrationContractIncompleteError) Error() string {
 
 // IsRegistrationContractIncomplete reports a missing canonical identity contract.
 func IsRegistrationContractIncomplete(err error) bool {
-	_, ok := err.(*RegistrationContractIncompleteError)
-	return ok
+	var target *RegistrationContractIncompleteError
+	return errors.As(err, &target)
 }
 
 // Registration is the POST /v1/bot/docs payload docs-backend accepts for

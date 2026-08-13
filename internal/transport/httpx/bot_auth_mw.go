@@ -93,3 +93,12 @@ func botTokenFromCtx(ctx context.Context) string {
 	}
 	return ""
 }
+
+// trustedPublisherFromCtx returns identity established by botAuthMiddleware,
+// never request-supplied identity fields.
+func trustedPublisherFromCtx(ctx context.Context) (string, string) {
+	if sess := botSessionFromCtx(ctx); sess != nil {
+		return sess.Login, botSpaceFromCtx(ctx)
+	}
+	return "", ""
+}

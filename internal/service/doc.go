@@ -47,9 +47,8 @@ type DocRegistrar interface {
 	Register(ctx context.Context, reg docsbackend.Registration, token string) (*docsbackend.RegistrationResult, error)
 	Rename(ctx context.Context, slug, title, token string)
 	Delete(ctx context.Context, slug, token string)
+	DeleteCanonical(ctx context.Context, slug, token string) error
 }
-
-type lockerProvider interface{ Locker() sluglock.Locker }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
 // CommentService uses, so that a publish (which holds the slug lock across the
@@ -311,12 +310,23 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	if s.register == nil {
 		return nil, apperr.Upstream("docs-backend registrar is disabled", "registration_failed", nil)
 	}
+	mountType, err := normalizeMountType(in.MountType)
+	if err != nil {
+		return nil, err
+	}
+	in.MountType = mountType
+	in.mountContextKnown = in.MountTypePresent || mountType != ""
 	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 	if err != nil {
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
+	registered := true
+	defer func() {
+		if registered {
+			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
+		}
+	}()
 	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
-		s.register.Delete(ctx, reg.DocID, in.PublisherToken)
 		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
 	}
 	if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
@@ -324,13 +334,12 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	}
 	in.Slug = reg.DocID
 	identity := &canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
-	provider, ok := s.meta.(lockerProvider)
-	if !ok || provider.Locker() == nil {
+	if s.lock == nil {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
 	stamped := core.StampAids(in.HTML)
 	var result *PublishResult
-	err = provider.Locker().With(ctx, in.Slug, func() error {
+	err = s.lock.With(ctx, in.Slug, func() error {
 		// An idempotency replay must return the original write, never mint v2.
 		if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
 			return e
@@ -346,7 +355,11 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 				return e
 			}
 			if meta != nil {
-				result = &PublishResult{Slug: in.Slug, Version: latest, URL: reg.ShareURL, DocID: in.Slug, ShareURL: reg.ShareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
+				if docID, shareURL, ok := meta.CanonicalIdentity(); !ok || docID != reg.DocID {
+					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+				} else {
+					result = &PublishResult{Slug: in.Slug, Version: latest, URL: shareURL, DocID: docID, ShareURL: shareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
+				}
 				return nil
 			}
 		}
@@ -378,6 +391,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	if err != nil {
 		return nil, err
 	}
+	registered = false
 	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
 	return result, nil
 }
@@ -785,6 +799,12 @@ type DraftResult struct {
 // CreateCanonicalDraft allocates a canonical identity before saving its first
 // draft. It uses the shared metadata locker exactly once after registration.
 func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) (*DraftResult, error) {
+	if in.HTML == "" {
+		return nil, apperr.Validation("html (file) required", "html_required")
+	}
+	if int64(len(in.HTML)) > s.maxBytes {
+		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
+	}
 	if strings.TrimSpace(in.Slug) != "" {
 		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
 	}
@@ -797,28 +817,48 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	if s.register == nil {
 		return nil, apperr.Upstream("docs-backend registrar is disabled", "registration_failed", nil)
 	}
+	mountType, err := normalizeMountType(in.MountType)
+	if err != nil {
+		return nil, err
+	}
+	in.MountType = mountType
+	in.mountContextKnown = in.MountTypePresent || mountType != ""
 	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 	if err != nil {
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
+	registered := true
+	defer func() {
+		if registered {
+			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
+		}
+	}()
 	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
-		s.register.Delete(ctx, reg.DocID, in.PublisherToken)
 		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
 	}
-	provider, ok := s.meta.(lockerProvider)
-	if !ok || provider.Locker() == nil {
+	if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
+		return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
+	}
+	if s.lock == nil {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
 	in.Slug = reg.DocID
 	stamped := core.StampAids(in.HTML)
 	var result *DraftResult
-	err = provider.Locker().With(ctx, in.Slug, func() error {
+	err = s.lock.With(ctx, in.Slug, func() error {
 		prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
 		if e != nil {
 			return e
 		}
-		if prev != nil && prev.HasDraft() {
-			return nil
+		if prev != nil {
+			if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
+				if draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug); derr == nil && exists {
+					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: len(core.StampAids(draft).AIDs)}
+					return nil
+				}
+				result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
+				return nil
+			}
 		}
 		size, e := s.blobs.PutDraft(ctx, in.Slug, stamped.HTML)
 		if e != nil {
@@ -845,6 +885,7 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	if err != nil {
 		return nil, err
 	}
+	registered = false
 	if result == nil {
 		return &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}, nil
 	}
