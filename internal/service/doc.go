@@ -190,6 +190,11 @@ type PublishResult struct {
 
 type canonicalIdentity struct{ docID, shareURL string }
 
+type canonicalDraftIdentity struct {
+	docID, shareURL string
+	aids            int
+}
+
 // RenderData is the render payload for a document version.
 type RenderData struct {
 	HTML     string
@@ -968,20 +973,8 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		if e != nil {
 			return apperr.Upstream("draft write failed", "draft_write_failed", e)
 		}
-		if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized); e != nil {
-			return e
-		}
-		meta, e := s.meta.GetMeta(ctx, in.Slug)
-		if e != nil {
-			return e
-		}
-		extra := map[string]any{}
-		maps.Copy(extra, meta.Extra)
-		extra[storage.CanonicalDocIDExtraKey] = reg.DocID
-		extra[storage.CanonicalShareURLExtraKey] = reg.ShareURL
-		extra[storage.CanonicalDraftCreateExtraKey] = true
-		extra[storage.CanonicalDraftAIDsExtraKey] = len(stamped.AIDs)
-		if e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); e != nil {
+		canonicalDraft := &canonicalDraftIdentity{docID: reg.DocID, shareURL: reg.ShareURL, aids: len(stamped.AIDs)}
+		if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized, canonicalDraft); e != nil {
 			return e
 		}
 		result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
@@ -1044,7 +1037,7 @@ func (s *DocService) SaveDraftWithProvenance(ctx context.Context, slug, html, ti
 		if perr != nil {
 			return apperr.Upstream("draft write failed", "draft_write_failed", perr)
 		}
-		if merr := s.setDraftMeta(ctx, slug, title, prev, normalized); merr != nil {
+		if merr := s.setDraftMeta(ctx, slug, title, prev, normalized, nil); merr != nil {
 			return merr
 		}
 		result = &DraftResult{
@@ -1265,7 +1258,7 @@ func (s *DocService) promoteAuthorized(ctx context.Context, slug, title, publish
 // meta record if the slug is new. It leaves Versions untouched. creatorUID is
 // stamped on first create only (same rule as upsertMeta), never reassigning an
 // existing creator.
-func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev *storage.DocMeta, provenance PublishInput) error {
+func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev *storage.DocMeta, provenance PublishInput, canonical *canonicalDraftIdentity) error {
 	newMeta := prev == nil
 	if newMeta {
 		prev = &storage.DocMeta{Slug: slug, Title: slug, Versions: []storage.VersionRef{}}
@@ -1294,6 +1287,12 @@ func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev 
 		extra[storage.MountTypeExtraKey] = provenance.MountType
 		extra[storage.GroupNoExtraKey] = provenance.GroupNo
 		extra[storage.ThreadIDExtraKey] = provenance.ThreadID
+	}
+	if canonical != nil {
+		extra[storage.CanonicalDocIDExtraKey] = canonical.docID
+		extra[storage.CanonicalShareURLExtraKey] = canonical.shareURL
+		extra[storage.CanonicalDraftCreateExtraKey] = true
+		extra[storage.CanonicalDraftAIDsExtraKey] = canonical.aids
 	}
 	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
 		Slug:     slug,
