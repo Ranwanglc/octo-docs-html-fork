@@ -1106,7 +1106,20 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 
 // PromoteAuthorized promotes a draft after validating effective provenance.
 func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, authorize ProvenanceAuthorizer) (*PublishResult, error) {
+	return s.promoteAuthorized(ctx, slug, title, "", authorize)
+}
+
+// PromoteAuthorizedWithPublisherToken promotes a draft with the bot credential
+// needed to acknowledge a canonical document's durable version to docs-backend.
+// It is additive so existing callers of PromoteAuthorized retain their legacy
+// behavior and authorization contract.
+func (s *DocService) PromoteAuthorizedWithPublisherToken(ctx context.Context, slug, title, publisherToken string, authorize ProvenanceAuthorizer) (*PublishResult, error) {
+	return s.promoteAuthorized(ctx, slug, title, publisherToken, authorize)
+}
+
+func (s *DocService) promoteAuthorized(ctx context.Context, slug, title, publisherToken string, authorize ProvenanceAuthorizer) (*PublishResult, error) {
 	var result *PublishResult
+	var canonical *canonicalIdentity
 	err := s.lock.With(ctx, slug, func() error {
 		html, ok, gerr := s.blobs.GetDraft(ctx, slug)
 		if gerr != nil {
@@ -1121,6 +1134,19 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, 
 			return ierr
 		}
 		in.AuthorizeProvenance = authorize
+		// Canonical draft creation has already registered its durable identity.
+		// Keep that identity through promotion so this committed version takes the
+		// canonical notification route instead of the legacy registration route.
+		meta, metaErr := s.meta.GetMeta(ctx, slug)
+		if metaErr != nil {
+			return metaErr
+		}
+		if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
+			if docID != slug {
+				return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+			}
+			canonical = &canonicalIdentity{docID: docID, shareURL: shareURL}
+		}
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr
@@ -1139,6 +1165,12 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, 
 	})
 	if err != nil {
 		return nil, err
+	}
+	if canonical != nil {
+		result.DocID, result.URL, result.ShareURL, result.Registered = canonical.docID, canonical.shareURL, canonical.shareURL, true
+		result.Status = publishStatusPublished
+		s.notifyCanonicalPublished(ctx, result, publisherToken)
+		return result, nil
 	}
 	s.afterPublished(ctx, result)
 	return result, nil

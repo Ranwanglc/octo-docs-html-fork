@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -14,23 +15,38 @@ import (
 )
 
 type canonicalTestRegistrar struct {
+	mu        sync.Mutex
 	result    *docsbackend.RegistrationResult
+	registers int
 	deletes   int
 	published int
 }
 
 func (r *canonicalTestRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.registers++
 	return r.result, nil
 }
 func (*canonicalTestRegistrar) Rename(context.Context, string, string, string) {}
 func (*canonicalTestRegistrar) Delete(context.Context, string, string)         {}
 func (r *canonicalTestRegistrar) DeleteCanonical(context.Context, string, string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.deletes++
 	return nil
 }
 func (r *canonicalTestRegistrar) Published(context.Context, string, string, string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.published++
 	return nil
+}
+
+func (r *canonicalTestRegistrar) counts() (registers, deletes, published int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registers, r.deletes, r.published
 }
 
 func canonicalTestDocs(t *testing.T, registrar *canonicalTestRegistrar) (*DocService, *memory.Store) {
@@ -125,14 +141,126 @@ func TestCanonicalDraftReplayAfterPromoteDoesNotResurrectDraft(t *testing.T) {
 	if _, err := docs.CreateCanonicalDraft(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := docs.PromoteAuthorized(context.Background(), "d_draft", "", nil); err != nil {
+	result, err := docs.PromoteAuthorizedWithPublisherToken(context.Background(), "d_draft", "", "bot-token", nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.DocID != "d_draft" || result.ShareURL != "https://docs/d_draft" || !result.Registered {
+		t.Fatalf("promote result=%+v, want canonical identity", result)
+	}
+	if registers, _, published := registrar.counts(); registers != 1 || published != 1 {
+		t.Fatalf("registers=%d published=%d, want initial registration only and one publication notification", registers, published)
 	}
 	if _, err := docs.CreateCanonicalDraft(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
 	if _, exists, err := store.GetDraft(context.Background(), "d_draft"); err != nil || exists {
 		t.Fatalf("draft exists=%v err=%v; replay must not resurrect promoted draft", exists, err)
+	}
+}
+
+func TestCanonicalCreateSameIdempotencyKeyIsSerialized(t *testing.T) {
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_concurrent", OctoDocSlug: "d_concurrent", ShareURL: "https://docs/d_concurrent", PublisherUID: "publisher", SpaceID: "space"}}
+	docs, store := canonicalTestDocs(t, registrar)
+	start := make(chan struct{})
+	results := make(chan *PublishResult, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := docs.Publish(context.Background(), canonicalInput())
+			results <- result
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for result := range results {
+		if result == nil || result.DocID != "d_concurrent" || result.Version != 1 {
+			t.Fatalf("concurrent result=%+v", result)
+		}
+	}
+	versions, err := store.ListVersions(context.Background(), "d_concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 || versions[0] != 1 {
+		t.Fatalf("versions=%v, want [1]", versions)
+	}
+}
+
+type gateFirstSlugLock struct {
+	sluglock.Locker
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() error) error {
+	return l.Locker.With(ctx, slug, func() error {
+		wait := false
+		l.once.Do(func() {
+			close(l.entered)
+			wait = true
+		})
+		if wait {
+			select {
+			case <-l.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return fn()
+	})
+}
+
+func TestCanonicalCreateRacingLegacyPublishKeepsCanonicalIdentity(t *testing.T) {
+	store := memory.New()
+	baseLock := sluglock.NewMemory()
+	lock := &gateFirstSlugLock{Locker: baseLock, entered: make(chan struct{}), release: make(chan struct{})}
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_collision", OctoDocSlug: "d_collision", ShareURL: "https://docs/d_collision", PublisherUID: "publisher", SpaceID: "space"}}
+	docs := NewDocService(store, store, NewCommentService(store, baseLock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+
+	canonicalDone := make(chan error, 1)
+	go func() {
+		_, err := docs.Publish(context.Background(), canonicalInput())
+		canonicalDone <- err
+	}()
+	<-lock.entered
+	legacyDone := make(chan *PublishResult, 1)
+	legacyErr := make(chan error, 1)
+	go func() {
+		result, err := docs.Publish(context.Background(), PublishInput{Slug: "d_collision", HTML: "<p>legacy racing write</p>"})
+		legacyDone <- result
+		legacyErr <- err
+	}()
+	close(lock.release)
+	if err := <-canonicalDone; err != nil {
+		t.Fatalf("canonical publish: %v", err)
+	}
+	if err := <-legacyErr; err != nil {
+		t.Fatalf("legacy publish: %v", err)
+	}
+	legacy := <-legacyDone
+	if legacy.DocID != "d_collision" || !legacy.Registered {
+		t.Fatalf("legacy result=%+v, want canonical routing", legacy)
+	}
+	meta, err := store.GetMeta(context.Background(), "d_collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if docID, _, ok := meta.CanonicalIdentity(); !ok || docID != "d_collision" {
+		t.Fatalf("canonical identity lost after racing legacy publish: %+v", meta)
 	}
 }
 

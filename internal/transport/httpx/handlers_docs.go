@@ -299,7 +299,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) error {
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&raw)
 	}
-	res, err := s.docs.PromoteAuthorized(r.Context(), slug, raw.Title, s.provenanceAuthorizer(r))
+	res, err := s.docs.PromoteAuthorizedWithPublisherToken(r.Context(), slug, raw.Title, botTokenFromCtx(r.Context()), s.provenanceAuthorizer(r))
 	if err != nil {
 		return err
 	}
