@@ -61,7 +61,7 @@ func canonicalInput() PublishInput {
 }
 
 func TestCanonicalCreateRejectsPublisherMismatchAndRollsBack(t *testing.T) {
-	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "doc-mismatch", OctoDocSlug: "doc-mismatch", ShareURL: "https://docs/doc-mismatch", PublisherUID: "other", SpaceID: "space"}}
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "doc-mismatch", OctoDocSlug: "doc-mismatch", ShareURL: "https://docs/doc-mismatch", PublisherUID: "other", SpaceID: "space", Created: true}}
 	docs, store := canonicalTestDocs(t, registrar)
 	_, err := docs.Publish(context.Background(), canonicalInput())
 	var appErr *apperr.Error
@@ -101,13 +101,26 @@ func (*failingCanonicalBlobStore) PutDoc(context.Context, string, int, string) (
 func TestCanonicalPostRegistrationWriteFailureRollsBackRemoteIdentity(t *testing.T) {
 	store := memory.New()
 	lock := sluglock.NewMemory()
-	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_rollback", OctoDocSlug: "d_rollback", ShareURL: "https://docs/d_rollback", PublisherUID: "publisher", SpaceID: "space"}}
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_rollback", OctoDocSlug: "d_rollback", ShareURL: "https://docs/d_rollback", PublisherUID: "publisher", SpaceID: "space", Created: true}}
 	docs := NewDocService(&failingCanonicalBlobStore{Store: store}, store, NewCommentService(store, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
 	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
 		t.Fatal("publish succeeded")
 	}
 	if registrar.deletes != 1 {
 		t.Fatalf("rollback deletes=%d, want 1", registrar.deletes)
+	}
+}
+
+func TestCanonicalReplayWriteFailureDoesNotDeleteExistingIdentity(t *testing.T) {
+	store := memory.New()
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_replay", OctoDocSlug: "d_replay", ShareURL: "https://docs/d_replay", PublisherUID: "publisher", SpaceID: "space"}}
+	docs := NewDocService(&failingCanonicalBlobStore{Store: store}, store, NewCommentService(store, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("publish succeeded")
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 0 {
+		t.Fatalf("replay rollback deletes=%d, want 0", deletes)
 	}
 }
 

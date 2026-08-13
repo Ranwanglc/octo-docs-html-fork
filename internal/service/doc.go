@@ -347,7 +347,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 		}
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
-	registered := true
+	registered := reg.Created
 	defer func() {
 		if registered {
 			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
@@ -367,6 +367,15 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	stamped := core.StampAids(in.HTML)
 	var result *PublishResult
 	err = s.lock.With(ctx, in.Slug, func() error {
+		// A local failure must compensate before releasing this identity's lock.
+		// Otherwise a replay can commit between unlock and DeleteCanonical, and
+		// the first attempt would delete the replay's durable identity.
+		defer func() {
+			if registered {
+				_ = s.register.DeleteCanonical(context.Background(), reg.DocID, in.PublisherToken)
+				registered = false
+			}
+		}()
 		// An idempotency replay must return the original write, never mint v2.
 		if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
 			return e
@@ -387,6 +396,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 				} else {
 					result = &PublishResult{Slug: in.Slug, Version: latest, URL: shareURL, DocID: docID, ShareURL: shareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
 				}
+				registered = false
 				return nil
 			}
 		}
@@ -413,12 +423,14 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 			e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra})
 		}
 		result = r
+		if e == nil {
+			registered = false
+		}
 		return e
 	})
 	if err != nil {
 		return nil, err
 	}
-	registered = false
 	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
 	s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
 	return result, nil
@@ -861,7 +873,7 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		}
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
-	registered := true
+	registered := reg.Created
 	defer func() {
 		if registered {
 			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
@@ -880,6 +892,14 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	stamped := core.StampAids(in.HTML)
 	var result *DraftResult
 	err = s.lock.With(ctx, in.Slug, func() error {
+		// See publishCanonicalAuthorized: compensation belongs inside the lock so
+		// a replay cannot commit this identity before a failed attempt deletes it.
+		defer func() {
+			if registered {
+				_ = s.register.DeleteCanonical(context.Background(), reg.DocID, in.PublisherToken)
+				registered = false
+			}
+		}()
 		prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
 		if e != nil {
 			return e
@@ -888,9 +908,11 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
 				if draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug); derr == nil && exists {
 					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: len(core.StampAids(draft).AIDs)}
+					registered = false
 					return nil
 				}
 				result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
+				registered = false
 				return nil
 			}
 		}
@@ -914,12 +936,12 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			return e
 		}
 		result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
+		registered = false
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	registered = false
 	if result == nil {
 		return &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}, nil
 	}
