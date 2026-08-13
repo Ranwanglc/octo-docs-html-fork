@@ -775,10 +775,80 @@ type VersionList struct {
 
 // DraftResult is the result of saving a draft.
 type DraftResult struct {
-	Slug string `json:"slug"`
-	URL  string `json:"url"`
-	Size int64  `json:"size"`
-	AIDs int    `json:"aids"`
+	Slug  string `json:"slug"`
+	DocID string `json:"doc_id,omitempty"`
+	URL   string `json:"url"`
+	Size  int64  `json:"size"`
+	AIDs  int    `json:"aids"`
+}
+
+// CreateCanonicalDraft allocates a canonical identity before saving its first
+// draft. It uses the shared metadata locker exactly once after registration.
+func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) (*DraftResult, error) {
+	if strings.TrimSpace(in.Slug) != "" {
+		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if strings.TrimSpace(in.IdempotencyKey) == "" {
+		return nil, apperr.Validation("idempotency_key required for canonical create", "idempotency_key_required")
+	}
+	if strings.TrimSpace(in.PublisherToken) == "" {
+		return nil, apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
+	}
+	if s.register == nil {
+		return nil, apperr.Upstream("docs-backend registrar is disabled", "registration_failed", nil)
+	}
+	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
+	if err != nil {
+		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
+	}
+	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
+		s.register.Delete(ctx, reg.DocID, in.PublisherToken)
+		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+	}
+	provider, ok := s.meta.(lockerProvider)
+	if !ok || provider.Locker() == nil {
+		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
+	}
+	in.Slug = reg.DocID
+	stamped := core.StampAids(in.HTML)
+	var result *DraftResult
+	err = provider.Locker().With(ctx, in.Slug, func() error {
+		prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
+		if e != nil {
+			return e
+		}
+		if prev != nil && prev.HasDraft() {
+			return nil
+		}
+		size, e := s.blobs.PutDraft(ctx, in.Slug, stamped.HTML)
+		if e != nil {
+			return apperr.Upstream("draft write failed", "draft_write_failed", e)
+		}
+		if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized); e != nil {
+			return e
+		}
+		meta, e := s.meta.GetMeta(ctx, in.Slug)
+		if e != nil {
+			return e
+		}
+		extra := map[string]any{}
+		maps.Copy(extra, meta.Extra)
+		extra[storage.CanonicalDocIDExtraKey] = reg.DocID
+		extra[storage.CanonicalShareURLExtraKey] = reg.ShareURL
+		extra[storage.CanonicalDraftCreateExtraKey] = true
+		if e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra}); e != nil {
+			return e
+		}
+		result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}, nil
+	}
+	return result, nil
 }
 
 // SaveDraft stamps and writes the mutable draft slot for a slug, creating the

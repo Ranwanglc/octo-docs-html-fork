@@ -211,6 +211,26 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// handleCreateDraft creates a canonical draft without accepting a caller slug.
+func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) error {
+	body, err := s.readPublishBody(w, r)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(body.Slug) != "" {
+		return apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if botSessionFromCtx(r.Context()) == nil {
+		return apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
+	}
+	res, err := s.docs.CreateCanonicalDraft(r.Context(), service.PublishInput{HTML: body.HTML, Title: body.Title, MountType: body.MountType, MountTypePresent: body.MountTypePresent, IdempotencyKey: body.IdempotencyKey, PublisherToken: botTokenFromCtx(r.Context()), CreatorUID: creatorUIDFromCtx(r.Context())})
+	if err != nil {
+		return err
+	}
+	writeData(w, http.StatusOK, res)
+	return nil
+}
+
 // handleSaveDraft writes the mutable draft slot (PUT /v1/docs/{slug}/draft).
 // Write-auth gated. The body is the same shape as publish, minus version.
 func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) error {

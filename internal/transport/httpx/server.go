@@ -88,6 +88,7 @@ func (s *Server) Handler() http.Handler {
 
 		// Documents.
 		r.With(s.requireWriteOrBotOwnerAuth).Method(http.MethodPost, "/docs", s.cors(s.limit(writeLimiter, false, s.wrap(s.handlePublish))))
+		r.With(s.requireWriteOrBotOwnerAuth).Post("/docs/draft", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleCreateDraft))))
 		// Owner-scope doc index; owner check lives inside handleListDocs (same style as /me and /auth/me).
 		r.Get("/docs", s.cors(s.wrap(s.handleListDocs)))
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
