@@ -29,6 +29,10 @@ func (*deleteRegistrar) Rename(context.Context, string, string, string) {}
 func (r *deleteRegistrar) Delete(_ context.Context, slug, _ string) {
 	r.deleted <- slug
 }
+func (r *deleteRegistrar) DeleteCanonical(ctx context.Context, slug, token string) error {
+	r.Delete(ctx, slug, token)
+	return nil
+}
 
 func TestRegisteredUserDocumentRemoveIsRejectedUntilBackendCascadeExists(t *testing.T) {
 	store := memory.New()

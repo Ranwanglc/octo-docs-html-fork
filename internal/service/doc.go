@@ -1234,6 +1234,57 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 	return s.RemoveAuthorized(ctx, slug, nil)
 }
 
+// RemoveCanonical deletes the remote canonical identity before local state. A
+// failed local cleanup intentionally leaves the already-idempotent backend
+// delete retryable: the next request repeats the remote delete then completes
+// the remaining local work.
+func (s *DocService) RemoveCanonical(ctx context.Context, slug, token string) (bool, error) {
+	canonical := false
+	err := s.lock.With(ctx, slug, func() error {
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return nil
+		}
+		docID, _, ok := meta.CanonicalIdentity()
+		if !ok {
+			return nil
+		}
+		canonical = true
+		if docID != slug {
+			return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+		}
+		if s.register == nil {
+			return apperr.Upstream("docs-backend deletion unavailable", "delete_failed", nil)
+		}
+		if strings.TrimSpace(token) == "" {
+			return apperr.Unauthorized("canonical delete requires bot authentication", "publisher_bot_required")
+		}
+		if err := s.register.DeleteCanonical(ctx, docID, token); err != nil {
+			return apperr.Upstream("docs-backend deletion failed", "delete_failed", err)
+		}
+		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
+			return err
+		}
+		assets, err := s.meta.ListAssetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		for _, asset := range assets {
+			if err := s.meta.DeleteAssetMeta(ctx, slug, asset.SHA256); err != nil {
+				return err
+			}
+		}
+		if _, err := s.comments.WipeLocked(ctx, slug); err != nil {
+			return err
+		}
+		return s.meta.DeleteMeta(ctx, slug)
+	})
+	return canonical, err
+}
+
 // RemoveAuthorized deletes user-owned documents only when they were never
 // registered in docs-backend; registered documents must start deletion there.
 func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, authorize ProvenanceAuthorizer) error {
@@ -1608,11 +1659,6 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
-	}
-	if strings.HasPrefix(in.Slug, "d_") && strings.TrimSpace(in.IdempotencyKey) != "" {
-		extra[storage.CanonicalDocIDExtraKey] = in.Slug
-		// The URL is supplied by the registration result after the write; the
-		// marker alone is sufficient for type routing during this request.
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,

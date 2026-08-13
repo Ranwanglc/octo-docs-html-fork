@@ -57,6 +57,9 @@ func (r *recordingDraftRegistrar) Register(_ context.Context, reg docsbackend.Re
 
 func (*recordingDraftRegistrar) Rename(context.Context, string, string, string) {}
 func (*recordingDraftRegistrar) Delete(context.Context, string, string)         {}
+func (*recordingDraftRegistrar) DeleteCanonical(context.Context, string, string) error {
+	return nil
+}
 
 func (r *recordingDraftRegistrar) last() (docsbackend.Registration, bool) {
 	r.mu.Lock()

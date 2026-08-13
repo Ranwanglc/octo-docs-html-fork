@@ -467,6 +467,14 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	canonical, err := s.docs.RemoveCanonical(r.Context(), slug, botTokenFromCtx(r.Context()))
+	if err != nil {
+		return err
+	}
+	if canonical {
+		writeData(w, 200, struct{}{})
+		return nil
+	}
 	if err := s.docs.RemoveAuthorized(r.Context(), slug, s.provenanceAuthorizer(r)); err != nil {
 		return err
 	}

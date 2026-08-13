@@ -34,7 +34,8 @@ func (r *noopRegistrar) Register(_ context.Context, reg docsbackend.Registration
 func (r *noopRegistrar) Rename(context.Context, string, string, string) {
 	r.renamed.Add(1)
 }
-func (*noopRegistrar) Delete(context.Context, string, string) {}
+func (*noopRegistrar) Delete(context.Context, string, string)                {}
+func (*noopRegistrar) DeleteCanonical(context.Context, string, string) error { return nil }
 
 // afterPublished invokes the injected reconciler after confirmed registration
 // so grants written during the post-commit registration gap survive A4.
