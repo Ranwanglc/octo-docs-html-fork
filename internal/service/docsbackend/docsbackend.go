@@ -17,26 +17,53 @@ import (
 
 const defaultTimeout = 5 * time.Second
 
+// CanonicalDocumentDeletedError marks a terminal idempotency-key replay whose
+// canonical document was deleted.
+type CanonicalDocumentDeletedError struct{}
+
+func (*CanonicalDocumentDeletedError) Error() string { return "canonical document deleted" }
+
+func IsCanonicalDocumentDeleted(err error) bool {
+	_, ok := err.(*CanonicalDocumentDeletedError)
+	return ok
+}
+
+// RegistrationContractIncompleteError indicates a backend response missing
+// the identity data needed to authorize a canonical document.
+type RegistrationContractIncompleteError struct{}
+
+func (*RegistrationContractIncompleteError) Error() string {
+	return "docs-backend canonical registration response missing publisherUid/spaceId"
+}
+
+func IsRegistrationContractIncomplete(err error) bool {
+	_, ok := err.(*RegistrationContractIncompleteError)
+	return ok
+}
+
 // Registration is the POST /v1/bot/docs payload docs-backend accepts for
 // octo-doc backed HTML documents.
 type Registration struct {
-	DocType     string `json:"docType"`
-	OctoDocSlug string `json:"octoDocSlug"`
-	MountType   string `json:"mountType"`
-	Title       string `json:"title,omitempty"`
-	Owner       string `json:"owner,omitempty"`
-	SpaceID     string `json:"spaceId,omitempty"`
-	Internal    bool   `json:"-"`
+	DocType        string `json:"docType"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+	OctoDocSlug    string `json:"octoDocSlug,omitempty"`
+	MountType      string `json:"mountType,omitempty"`
+	Title          string `json:"title,omitempty"`
+	Owner          string `json:"owner,omitempty"`
+	SpaceID        string `json:"spaceId,omitempty"`
+	Internal       bool   `json:"-"`
 }
 
 // RegistrationResult is the canonical docs-backend response for HTML doc
 // registration. Created is false when the idempotent slug registration already
 // existed.
 type RegistrationResult struct {
-	DocID       string `json:"docId"`
-	OctoDocSlug string `json:"octoDocSlug"`
-	ShareURL    string `json:"shareUrl"`
-	Created     bool   `json:"created"`
+	DocID        string `json:"docId"`
+	OctoDocSlug  string `json:"octoDocSlug"`
+	PublisherUID string `json:"publisherUid"`
+	SpaceID      string `json:"spaceId"`
+	ShareURL     string `json:"shareUrl"`
+	Created      bool   `json:"created"`
 }
 
 // Rename is the PATCH /v1/bot/docs/octo-doc/:slug payload.
@@ -94,7 +121,14 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 			return nil, fmt.Errorf("docs-backend internal register token is not configured")
 		}
 	}
-	body, err := c.doJSON(ctx, http.MethodPost, endpoint, reg, reg.OctoDocSlug, "register", token, reg.Internal)
+	if strings.TrimSpace(reg.IdempotencyKey) != "" && strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("docs-backend canonical create requires publisher token")
+	}
+	logRef := reg.OctoDocSlug
+	if logRef == "" {
+		logRef = reg.IdempotencyKey
+	}
+	body, err := c.doJSON(ctx, http.MethodPost, endpoint, reg, logRef, "register", token, reg.Internal)
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +139,16 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	if strings.TrimSpace(result.DocID) == "" || strings.TrimSpace(result.OctoDocSlug) == "" || strings.TrimSpace(result.ShareURL) == "" {
 		return nil, fmt.Errorf("decode docs-backend registration: required response field missing")
 	}
-	if result.OctoDocSlug != reg.OctoDocSlug {
+	if strings.TrimSpace(reg.IdempotencyKey) == "" && result.OctoDocSlug != reg.OctoDocSlug {
 		return nil, fmt.Errorf("decode docs-backend registration: slug mismatch %q", result.OctoDocSlug)
+	}
+	if strings.TrimSpace(reg.IdempotencyKey) != "" {
+		if result.DocID != result.OctoDocSlug {
+			return nil, fmt.Errorf("decode docs-backend registration: doc identity mismatch")
+		}
+		if strings.TrimSpace(result.PublisherUID) == "" || strings.TrimSpace(result.SpaceID) == "" {
+			return nil, &RegistrationContractIncompleteError{}
+		}
 	}
 	return &result, nil
 }
@@ -131,10 +173,33 @@ func (c *Client) Rename(ctx context.Context, slug, title, token string) {
 // by-slug and idempotent, so the caller identity is immaterial; token may be
 // empty (falls back to the process-configured token).
 func (c *Client) Delete(ctx context.Context, slug, token string) {
-	if c == nil {
-		return
-	}
+	// Legacy registrations retain their historical best-effort deletion
+	// semantics. Canonical callers use DeleteCanonical below.
 	_, _ = c.doJSON(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token, false)
+}
+
+// DeleteCanonical deletes a canonical registration and reports failures so a
+// partially completed delete can be retried safely.
+func (c *Client) DeleteCanonical(ctx context.Context, slug, token string) error {
+	if c == nil {
+		return fmt.Errorf("docs-backend registrar is disabled")
+	}
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("docs-backend delete requires publisher token")
+	}
+	_, err := c.doJSONStatus(ctx, http.MethodDelete, c.octoDocURL(slug), nil, slug, "delete", token, false, true)
+	return err
+}
+
+func (c *Client) Published(ctx context.Context, docID, title, token string) error {
+	if c == nil {
+		return fmt.Errorf("docs-backend registrar is disabled")
+	}
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("docs-backend publish notification requires publisher token")
+	}
+	_, err := c.doJSON(ctx, http.MethodPost, c.registerURL+"/"+url.PathEscape(docID)+"/published", Rename{Title: title}, docID, "published", token, false)
+	return err
 }
 
 func (c *Client) octoDocURL(slug string) string {
@@ -142,6 +207,10 @@ func (c *Client) octoDocURL(slug string) string {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, slug, op, token string, internal bool) ([]byte, error) {
+	return c.doJSONStatus(ctx, method, endpoint, body, slug, op, token, internal, false)
+}
+
+func (c *Client) doJSONStatus(ctx context.Context, method, endpoint string, body any, slug, op, token string, internal, allowNotFound bool) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -190,6 +259,12 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, 
 		return nil, fmt.Errorf("read docs-backend %s response: %w", op, readErr)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if allowNotFound && resp.StatusCode == http.StatusNotFound {
+			return respBody, nil
+		}
+		if op == "register" && resp.StatusCode == http.StatusGone {
+			return nil, &CanonicalDocumentDeletedError{}
+		}
 		c.logger.Warn("docs_backend_register non-2xx", "slug", slug, "op", op, "http_status", resp.StatusCode)
 		return nil, fmt.Errorf("docs-backend %s returned HTTP %d", op, resp.StatusCode)
 	}
