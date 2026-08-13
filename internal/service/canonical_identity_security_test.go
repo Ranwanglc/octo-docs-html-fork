@@ -383,6 +383,9 @@ func TestCanonicalCreateSameIdempotencyKeyIsSerialized(t *testing.T) {
 	if len(versions) != 1 || versions[0] != 1 {
 		t.Fatalf("versions=%v, want [1]", versions)
 	}
+	if _, _, published := registrar.counts(); published != 1 {
+		t.Fatalf("published notifications=%d, want one first-content signal", published)
+	}
 }
 
 type gateFirstSlugLock struct {

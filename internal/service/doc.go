@@ -349,6 +349,8 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	}
 	stamped := core.StampAids(in.HTML)
 	var result *PublishResult
+	var identity canonicalIdentity
+	firstDurableContent := false
 	err = s.lock.With(ctx, "idem:"+in.IdempotencyKey, func() error {
 		reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 		if err != nil {
@@ -377,7 +379,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 			return apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
 		}
 		in.Slug = reg.DocID
-		identity := &canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
+		identity = canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
 		if registered {
 			if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
 				return stateErr
@@ -414,10 +416,11 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 				return e
 			}
 		}
-		in.canonical = identity
+		in.canonical = &identity
 		r, e := s.publishLocked(ctx, in, stamped)
 		result = r
 		if e == nil {
+			firstDurableContent = true
 			registered = false
 		}
 		return e
@@ -425,12 +428,10 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	if err != nil {
 		return nil, err
 	}
-	result.DocID, result.ShareURL, result.URL, result.Registered = result.Slug, "", "", true
-	if meta, metaErr := s.meta.GetMeta(ctx, result.Slug); metaErr == nil {
-		_, result.ShareURL, _ = meta.CanonicalIdentity()
-		result.URL = result.ShareURL
+	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
+	if firstDurableContent {
+		s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
 	}
-	s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
 	return result, nil
 }
 
