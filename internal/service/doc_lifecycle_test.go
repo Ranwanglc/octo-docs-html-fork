@@ -283,3 +283,123 @@ func TestBotDocumentRemoveStillUsesBotDeleteBySlug(t *testing.T) {
 		t.Fatal("bot delete was not called")
 	}
 }
+
+// stubTitleResolver is a TitleResolver fake driving the Render/GetDraft title
+// pull tests: hit (returns title), miss (ok=false), empty title, and error.
+type stubTitleResolver struct {
+	title string
+	ok    bool
+	err   error
+	// lastSpace records the spaceID the resolver was called with so tests can
+	// assert the call is scoped from meta provenance.
+	lastSpace string
+	calls     int
+}
+
+func (r *stubTitleResolver) resolve(_ context.Context, _, spaceID string) (string, bool, error) {
+	r.calls++
+	r.lastSpace = spaceID
+	return r.title, r.ok, r.err
+}
+
+func newTitleResolverFixture(t *testing.T, resolver TitleResolver) (*DocService, context.Context, string) {
+	t.Helper()
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	docs := NewDocService(store, store, NewCommentService(store, locker), locker, "", 1<<20).
+		WithTitleResolver(resolver)
+	ctx := context.Background()
+	slug := "title-doc"
+	if _, err := store.PutDoc(ctx, slug, 1, "<html><body>v1</body></html>"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutDraft(ctx, slug, "<html><body>draft</body></html>"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeta(ctx, slug, storage.DocMeta{
+		Slug: slug, Title: "Local Title", Versions: []storage.VersionRef{{N: 1}},
+		Extra: map[string]any{
+			storage.UserPublishExtraKey: true, storage.SpaceIDExtraKey: "space-9",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return docs, ctx, slug
+}
+
+// Render pulls the display title from the resolver (docs-backend is the single
+// source of truth) and passes the slug's persisted space_id to it.
+func TestRenderTitleResolverOverridesLocalTitle(t *testing.T) {
+	resolver := &stubTitleResolver{title: "MySQL Title", ok: true}
+	docs, ctx, slug := newTitleResolverFixture(t, resolver.resolve)
+	rd, err := docs.Render(ctx, slug, 1)
+	if err != nil || rd == nil {
+		t.Fatalf("render = %+v, %v", rd, err)
+	}
+	if rd.Title != "MySQL Title" {
+		t.Fatalf("render title = %q; want resolver title", rd.Title)
+	}
+	if resolver.lastSpace != "space-9" {
+		t.Fatalf("resolver called with space %q; want space-9 from meta provenance", resolver.lastSpace)
+	}
+}
+
+// GetDraft applies the same resolver pull.
+func TestGetDraftTitleResolverOverridesLocalTitle(t *testing.T) {
+	resolver := &stubTitleResolver{title: "Draft Backend Title", ok: true}
+	docs, ctx, slug := newTitleResolverFixture(t, resolver.resolve)
+	rd, err := docs.GetDraft(ctx, slug)
+	if err != nil || rd == nil {
+		t.Fatalf("get draft = %+v, %v", rd, err)
+	}
+	if rd.Title != "Draft Backend Title" {
+		t.Fatalf("draft title = %q; want resolver title", rd.Title)
+	}
+}
+
+// Resolver errors are display-only: the local title is kept and the render
+// still succeeds.
+func TestRenderTitleResolverErrorKeepsLocalTitle(t *testing.T) {
+	resolver := &stubTitleResolver{err: errors.New("mysql down")}
+	docs, ctx, slug := newTitleResolverFixture(t, resolver.resolve)
+	rd, err := docs.Render(ctx, slug, 1)
+	if err != nil || rd == nil {
+		t.Fatalf("render = %+v, %v; resolver error must not fail a render", rd, err)
+	}
+	if rd.Title != "Local Title" {
+		t.Fatalf("render title = %q; want local title kept on resolver error", rd.Title)
+	}
+}
+
+// Resolver miss (ok=false) or empty title keeps the local title.
+func TestRenderTitleResolverMissKeepsLocalTitle(t *testing.T) {
+	for name, resolver := range map[string]*stubTitleResolver{
+		"miss":      {ok: false},
+		"empty hit": {title: "", ok: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			docs, ctx, slug := newTitleResolverFixture(t, resolver.resolve)
+			rd, err := docs.Render(ctx, slug, 1)
+			if err != nil || rd == nil {
+				t.Fatalf("render = %+v, %v", rd, err)
+			}
+			if rd.Title != "Local Title" {
+				t.Fatalf("render title = %q; want local title on resolver miss", rd.Title)
+			}
+		})
+	}
+}
+
+// Unwired resolver (nil, e.g. non-MySQL drivers) leaves Render/GetDraft
+// behavior exactly as before: local title only, no resolver call.
+func TestRenderWithoutTitleResolverUsesLocalTitle(t *testing.T) {
+	docs, ctx, slug := newTitleResolverFixture(t, nil)
+	rd, err := docs.Render(ctx, slug, 1)
+	if err != nil || rd == nil || rd.Title != "Local Title" {
+		t.Fatalf("render = %+v, %v; want local title without resolver", rd, err)
+	}
+	draft, err := docs.GetDraft(ctx, slug)
+	if err != nil || draft == nil || draft.Title != "Local Title" {
+		t.Fatalf("get draft = %+v, %v; want local title without resolver", draft, err)
+	}
+}

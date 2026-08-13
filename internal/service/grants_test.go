@@ -39,9 +39,15 @@ type fakeDocMemberMirror struct {
 	// unregistered=true makes DocIDBySlug return ok=false so tests can drive
 	// the "doc not in doc_member yet" state.
 	unregistered bool
+	// resolveSpaces records, in call order, every spaceID DocIDBySlug was
+	// invoked with so space-scoping tests can assert the exact scope passed.
+	resolveSpaces []string
 }
 
-func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (string, bool, error) {
+func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug, spaceID string) (string, bool, error) {
+	f.mu.Lock()
+	f.resolveSpaces = append(f.resolveSpaces, spaceID)
+	f.mu.Unlock()
 	if f.resolveErr != nil {
 		return "", false, f.resolveErr
 	}
@@ -52,6 +58,10 @@ func (f *fakeDocMemberMirror) DocIDBySlug(_ context.Context, slug string) (strin
 		return "node-" + slug, true, nil
 	}
 	return f.docID, true, nil
+}
+
+func (f *fakeDocMemberMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
 }
 
 func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {
@@ -313,6 +323,60 @@ func TestGrantMirrorsDocMember(t *testing.T) {
 	}
 	if got := mirror.calls[1]; got != (mirrorCall{op: "delete", docID: "doc-node-1", uid: "u1"}) {
 		t.Fatalf("RemoveGrant mirror call = %+v", got)
+	}
+}
+
+// P1-1 pin: RemoveGrant resolves the doc through DocIDBySlug with the space
+// scope derived by spaceIDForDoc — (a) ctx space wins, (b) meta provenance,
+// (c) "" legacy fallback. A user-publish doc's meta carries SpaceIDExtraKey,
+// so the remove path must scope to that space; a bot request's ctx space
+// overrides it.
+func TestRemoveGrantDocIDBySlugSpaceScoping(t *testing.T) {
+	newSvc := func(t *testing.T, withProvenance bool) (*service.AuthService, *fakeDocMemberMirror, string) {
+		t.Helper()
+		store := memory.New()
+		slug := "docScope"
+		extra := map[string]any{storage.CreatorUIDExtraKey: "owner-1"}
+		if withProvenance {
+			// Creator-guarded docs carry provenance in meta.
+			extra[storage.UserPublishExtraKey] = true
+			extra[storage.SpaceIDExtraKey] = "space-meta"
+		}
+		if err := store.PutMeta(context.Background(), slug, storage.DocMeta{Slug: slug, Title: "T", Extra: extra}); err != nil {
+			t.Fatalf("seed PutMeta: %v", err)
+		}
+		svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+		mirror := &fakeDocMemberMirror{docID: "doc-S", roles: map[string]int{"reader-1": service.DocMemberRoleReader}}
+		svc.WithDocMemberMirror(mirror)
+		return svc, mirror, slug
+	}
+
+	// (b) provenance space is passed to DocIDBySlug.
+	svc, mirror, slug := newSvc(t, true)
+	if err := svc.RemoveGrant(context.Background(), slug, "reader-1"); err != nil {
+		t.Fatalf("RemoveGrant(provenance): %v", err)
+	}
+	if len(mirror.resolveSpaces) != 1 || mirror.resolveSpaces[0] != "space-meta" {
+		t.Fatalf("DocIDBySlug spaces = %v; want [space-meta] from meta provenance", mirror.resolveSpaces)
+	}
+
+	// (c) no ctx space and no provenance → legacy unfiltered "" scope.
+	svc, mirror, slug = newSvc(t, false)
+	if err := svc.RemoveGrant(context.Background(), slug, "reader-1"); err != nil {
+		t.Fatalf("RemoveGrant(no provenance): %v", err)
+	}
+	if len(mirror.resolveSpaces) != 1 || mirror.resolveSpaces[0] != "" {
+		t.Fatalf("DocIDBySlug spaces = %v; want [\"\"] legacy unfiltered", mirror.resolveSpaces)
+	}
+
+	// (a) ctx space (bot-auth middleware) wins over meta provenance.
+	svc, mirror, slug = newSvc(t, true)
+	ctx := service.ContextWithSpaceID(context.Background(), "space-ctx")
+	if err := svc.RemoveGrant(ctx, slug, "reader-1"); err != nil {
+		t.Fatalf("RemoveGrant(ctx space): %v", err)
+	}
+	if len(mirror.resolveSpaces) != 1 || mirror.resolveSpaces[0] != "space-ctx" {
+		t.Fatalf("DocIDBySlug spaces = %v; want [space-ctx] — ctx space must win over provenance", mirror.resolveSpaces)
 	}
 }
 
@@ -665,7 +729,11 @@ func TestRemoveGrantWiredButUnregisteredCleansMeta(t *testing.T) {
 // catch accidental calls.
 type unregisteredMirror struct{}
 
-func (unregisteredMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+func (unregisteredMirror) DocIDBySlug(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (unregisteredMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
 	return "", false, nil
 }
 
@@ -1123,8 +1191,11 @@ type raceMirror struct {
 	delRole   int
 }
 
-func (r *raceMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+func (r *raceMirror) DocIDBySlug(context.Context, string, string) (string, bool, error) {
 	return r.docID, true, nil
+}
+func (r *raceMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
 }
 func (r *raceMirror) UpsertDirectGrant(context.Context, string, string, int, string) error {
 	panic("raceMirror.UpsertDirectGrant should not be called")
@@ -1332,8 +1403,11 @@ type stalePreLockProbeMirror struct {
 	revokeOnce  bool
 }
 
-func (m *stalePreLockProbeMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+func (m *stalePreLockProbeMirror) DocIDBySlug(context.Context, string, string) (string, bool, error) {
 	return m.docID, true, nil
+}
+func (m *stalePreLockProbeMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
 }
 func (m *stalePreLockProbeMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {
 	m.mu.Lock()

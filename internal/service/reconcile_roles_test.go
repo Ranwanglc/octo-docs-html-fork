@@ -24,8 +24,12 @@ type reconcileMirror struct {
 	inserts    []string
 }
 
-func (m *reconcileMirror) DocIDBySlug(_ context.Context, _ string) (string, bool, error) {
+func (m *reconcileMirror) DocIDBySlug(_ context.Context, _, _ string) (string, bool, error) {
 	return m.docID, true, nil
+}
+
+func (m *reconcileMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
 }
 
 func (m *reconcileMirror) UpsertDirectGrant(_ context.Context, _, uid string, role int, _ string) error {

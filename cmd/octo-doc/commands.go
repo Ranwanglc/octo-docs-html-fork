@@ -70,6 +70,14 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 	}
 	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(mirror)
 	docs := service.NewDocService(blobs, meta, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes)
+	if mirror != nil {
+		// MySQL-wired: docs-backend's doc_meta is the single source of truth
+		// for display titles — pull it at render time. Mirror stays nil for
+		// non-MySQL drivers, so degraded deploys keep the local title.
+		resolver := service.TitleResolver(mirror.TitleBySlug)
+		docs = docs.WithTitleResolver(resolver)
+		comments = comments.WithTitleResolver(resolver)
+	}
 	if cfg.DocsBackendRegisterURL != "" {
 		docs = docs.WithDocsBackendRegistration(
 			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken, nil),

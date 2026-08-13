@@ -21,6 +21,11 @@ type CommentService struct {
 	notify  eventwebhook.Notifier
 	baseURL string
 	logger  *slog.Logger
+	// titleResolver pulls the display title from docs-backend's doc_meta (the
+	// single source of truth) for webhook payloads. Nil when unwired ⇒ the
+	// locally stored title is used. Display-only: a miss/error keeps the local
+	// title and never fails a webhook.
+	titleResolver TitleResolver
 	// fireHook is a seam: tests replace it with a synchronous shim to make
 	// barrier / DB-read-count assertions deterministic. Production leaves it
 	// pointing at fireAsync (installed by WithEventWebhook).
@@ -44,6 +49,17 @@ func (s *CommentService) WithEventWebhook(n eventwebhook.Notifier, baseURL strin
 	s.baseURL = strings.TrimRight(baseURL, "/")
 	s.logger = logger
 	s.fireHook = s.fireAsync
+	return s
+}
+
+// WithTitleResolver attaches the docs-backend title lookup docTitle prefers
+// over the locally stored title (see DocService.WithTitleResolver). Nil
+// resolver is a no-op. Returns s for chaining.
+func (s *CommentService) WithTitleResolver(fn TitleResolver) *CommentService {
+	if s == nil {
+		return nil
+	}
+	s.titleResolver = fn
 	return s
 }
 
@@ -252,10 +268,18 @@ func (s *CommentService) fireAsync(slug, id string, author *core.Author, text, a
 
 // docTitle pulls the current title for a slug; empty on absence or error. Not
 // a fatal lookup — the payload's title is a nicety, not a required field.
+// When a TitleResolver is wired, the docs-backend registered title wins; a
+// miss/error falls back to the locally stored title (display-only).
 func (s *CommentService) docTitle(ctx context.Context, slug string) string {
 	meta, err := s.meta.GetMeta(ctx, slug)
 	if err != nil || meta == nil {
 		return ""
+	}
+	if s.titleResolver != nil {
+		spaceID := spaceIDForDoc(ctx, meta)
+		if title, ok, rerr := s.titleResolver(ctx, slug, spaceID); rerr == nil && ok && title != "" {
+			return title
+		}
 	}
 	return meta.Title
 }

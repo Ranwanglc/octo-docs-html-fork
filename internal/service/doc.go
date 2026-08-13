@@ -32,7 +32,18 @@ type DocService struct {
 	register    DocRegistrar
 	reconcileFn GrantReconciler
 	logger      *slog.Logger
+
+	// titleResolver pulls the display title from docs-backend's doc_meta (the
+	// single source of truth) at render time. Nil when unwired (non-MySQL
+	// drivers / degraded mode) ⇒ the locally stored title is used unchanged.
+	// Display-only: any error or miss keeps the local title and never fails a
+	// render.
+	titleResolver TitleResolver
 }
+
+// TitleResolver resolves a doc's display title from slug + space, mirroring
+// DocMemberMirror.TitleBySlug. ok=false means "no registered title".
+type TitleResolver func(ctx context.Context, slug, spaceID string) (string, bool, error)
 
 // GrantReconciler drains legacy meta.grants entries into doc_member after
 // confirmed registration. Injected (not a hard dep on AuthService) so DocService
@@ -83,6 +94,37 @@ func (s *DocService) WithGrantReconciler(fn GrantReconciler) *DocService {
 	}
 	s.reconcileFn = fn
 	return s
+}
+
+// WithTitleResolver attaches the docs-backend title lookup used by Render /
+// GetDraft to prefer the registered title over the locally stored one. Nil
+// resolver is a no-op (keeps local-title behavior). Returns s for chaining.
+func (s *DocService) WithTitleResolver(fn TitleResolver) *DocService {
+	if s == nil {
+		return nil
+	}
+	s.titleResolver = fn
+	return s
+}
+
+// resolveDisplayTitle returns the display title for a render response: the
+// registered (docs-backend) title when the resolver is wired and hits, else
+// the local fallback. The resolver is display-only — a miss (ok=false or empty
+// title) or any error keeps the local title, logged at debug.
+func (s *DocService) resolveDisplayTitle(ctx context.Context, slug string, meta *storage.DocMeta, local string) string {
+	if s.titleResolver == nil {
+		return local
+	}
+	spaceID := spaceIDForDoc(ctx, meta)
+	title, ok, err := s.titleResolver(ctx, slug, spaceID)
+	if err != nil {
+		s.log().Debug("title_resolver_failed, keeping local title", "slug", slug, "err", err.Error())
+		return local
+	}
+	if !ok || title == "" {
+		return local
+	}
+	return title
 }
 
 func isNilInterface(v any) bool {
@@ -657,7 +699,7 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 		versions = meta.Versions
 		title = meta.Title
 	}
-	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: s.resolveDisplayTitle(ctx, slug, meta, title)}, nil
 }
 
 // VersionList is the response of ListVersions.
@@ -836,7 +878,7 @@ func (s *DocService) GetDraft(ctx context.Context, slug string) (*RenderData, er
 		versions = meta.Versions
 		title = meta.Title
 	}
-	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+	return &RenderData{HTML: html, Versions: versions, Title: s.resolveDisplayTitle(ctx, slug, meta, title)}, nil
 }
 
 // Promote turns the current draft into a new immutable version via the normal
@@ -900,14 +942,14 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, 
 func (s *DocService) setDraftMeta(ctx context.Context, slug, title string, prev *storage.DocMeta, provenance PublishInput) error {
 	newMeta := prev == nil
 	if newMeta {
-		prev = &storage.DocMeta{Slug: slug, Title: slug, Versions: []storage.VersionRef{}}
+		// Title intentionally empty on first create: the display title comes
+		// from docs-backend (TitleResolver at render time) or an explicit title
+		// on save — never synthesized from the slug.
+		prev = &storage.DocMeta{Slug: slug, Title: "", Versions: []storage.VersionRef{}}
 	}
 	metaTitle := prev.Title
 	if title != "" {
 		metaTitle = title
-	}
-	if metaTitle == "" {
-		metaTitle = slug
 	}
 	extra := map[string]any{}
 	maps.Copy(extra, prev.Extra)
@@ -1239,10 +1281,10 @@ func (s *DocService) registrationForMount(slug, title, mountType string) (docsba
 		s.log().Debug("docs_backend_register skipped: unsupported mount_type", "slug", slug, "mount_type", mountType)
 		return docsbackend.Registration{}, false
 	}
+	// An empty title is legitimate: the display title is pulled from
+	// docs-backend at render time (TitleResolver) when available, so never
+	// synthesize one from the slug here.
 	title = strings.TrimSpace(title)
-	if title == "" {
-		title = slug
-	}
 	return docsbackend.Registration{
 		DocType:     "html",
 		OctoDocSlug: slug,
@@ -1348,7 +1390,10 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	hadMeta := prev != nil
 	if prev == nil {
-		prev = &storage.DocMeta{Slug: in.Slug, Title: in.Slug, Versions: []storage.VersionRef{}}
+		// Title intentionally empty on first create: the display title is
+		// pulled from docs-backend (TitleResolver) or supplied by the caller —
+		// never synthesized from the slug.
+		prev = &storage.DocMeta{Slug: in.Slug, Title: "", Versions: []storage.VersionRef{}}
 	}
 	versions := append([]storage.VersionRef{}, prev.Versions...)
 	found := false
@@ -1368,9 +1413,8 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	if in.Title != "" {
 		title = in.Title
 	}
-	if title == "" {
-		title = in.Slug
-	}
+	// An empty title is kept empty: the display title is resolved from
+	// docs-backend at render time; never fall back to the slug.
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra

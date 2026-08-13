@@ -59,7 +59,7 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 	if s.docMembers == nil {
 		return legacyListGrantsFromMeta(meta, meta.CreatorUID()), nil
 	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceIDForDoc(ctx, meta))
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +214,7 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid string,
 	if creator := meta.CreatorUID(); creator != "" && creator == uid {
 		return ErrGrantProtected
 	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceIDForDoc(ctx, meta))
 	if err != nil {
 		return err
 	}
@@ -324,7 +324,7 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		// TOCTOU open; wrapping both here (and reconcile takes the same
 		// lock) serialises the pair.
 		return s.lock.With(ctx, slug, func() error {
-			if err := s.removeGrantFromDocMember(ctx, slug, uid); err != nil {
+			if err := s.removeGrantFromDocMember(ctx, slug, uid, spaceIDForDoc(ctx, meta)); err != nil {
 				return err
 			}
 			// Purge any legacy meta.grants[uid]
@@ -337,8 +337,12 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 	return s.removeGrantFromMeta(ctx, slug, uid)
 }
 
-func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid string) error {
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+// removeGrantFromDocMember resolves the doc with the caller-provided spaceID
+// (already derived via spaceIDForDoc by RemoveGrant from the fetched meta),
+// so a user-publish doc with no ctx space is still scoped to its own space —
+// never the unfiltered slug fallback that could hit another space's row.
+func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid, spaceID string) error {
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceID)
 	if err != nil {
 		return err
 	}
@@ -435,7 +439,7 @@ func (s *AuthService) mirrorGrantUpsert(ctx context.Context, slug, uid, grantedB
 	if s.docMembers == nil {
 		return
 	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceIDForDoc(ctx, nil))
 	if err != nil {
 		slog.Default().Debug("doc_member mirror resolve failed", "slug", slug, "uid", uid, "err", err.Error())
 		return
@@ -456,7 +460,7 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 	if s.docMembers == nil {
 		return
 	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceIDForDoc(ctx, nil))
 	if err != nil {
 		slog.Default().Debug("doc_member mirror resolve failed", "slug", slug, "uid", uid, "err", err.Error())
 		return
@@ -497,7 +501,7 @@ func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug s
 		if meta == nil {
 			return nil
 		}
-		docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+		docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceIDForDoc(ctx, meta))
 		if err != nil {
 			return fmt.Errorf("reconcile slug resolve: %w", err)
 		}

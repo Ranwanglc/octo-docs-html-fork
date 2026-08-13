@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
 // mysqlErrDupEntry is MySQL's ER_DUP_ENTRY (1062): a unique/primary-key
@@ -62,7 +64,12 @@ type DocMember struct {
 // RoleByDocUID / ListMembers replace the legacy meta.grants read path
 // (plan③ A3/A4/A6) so grants have a single source of truth in doc_member.
 type DocMemberMirror interface {
-	DocIDBySlug(ctx context.Context, slug string) (string, bool, error)
+	DocIDBySlug(ctx context.Context, slug, spaceID string) (string, bool, error)
+	// TitleBySlug reads the display title registered for slug in doc_meta.
+	// spaceID scopes the lookup the same way DocIDBySlug does; ok=false when
+	// the slug is unregistered (or the row is status=0). Display-only: callers
+	// must treat errors as "keep the local title", never as a failure.
+	TitleBySlug(ctx context.Context, slug, spaceID string) (string, bool, error)
 	UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error
 	// InsertDirectGrantIfAbsent inserts a direct grant only when no row exists
 	// for (docID,uid); it NEVER updates an existing row and bumps
@@ -247,14 +254,62 @@ func (m *MySQLDocMemberMirror) DeleteGrant(ctx context.Context, docID, uid strin
 	return nil
 }
 
+// spaceIDCtxKey carries the requesting bot's space_id into the service layer
+// so slug→doc_id resolution can be space-scoped. Written by the transport
+// bot-auth middleware; read via SpaceIDFromContext.
+type spaceIDCtxKey struct{}
+
+// ContextWithSpaceID returns a context carrying spaceID for service-layer
+// slug resolution. An empty spaceID stores nothing (callers then fall back to
+// meta provenance / legacy unfiltered lookups).
+func ContextWithSpaceID(ctx context.Context, spaceID string) context.Context {
+	if spaceID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, spaceIDCtxKey{}, spaceID)
+}
+
+// SpaceIDFromContext returns the space_id stashed by ContextWithSpaceID, or ""
+// when absent.
+func SpaceIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(spaceIDCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// spaceIDForDoc derives the space scope for a slug lookup, in priority order:
+// (a) the request context (bot-authenticated requests carry their space); (b)
+// the slug's own persisted registration provenance when meta is already
+// fetched; (c) "" — the legacy unfiltered lookup, kept so degraded /
+// single-node / bot-without-space paths do not regress.
+func spaceIDForDoc(ctx context.Context, meta *storage.DocMeta) string {
+	if id := SpaceIDFromContext(ctx); id != "" {
+		return id
+	}
+	if meta != nil {
+		_, spaceID, _, _ := meta.PublishProvenance()
+		return spaceID
+	}
+	return ""
+}
+
 // DocIDBySlug resolves a doc_id from its octo-doc slug, returning ok=false when
-// the slug is not registered in doc_meta (mirror then skips silently).
-func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug string) (string, bool, error) {
+// the slug is not registered in doc_meta (mirror then skips silently). A slug
+// is unique only WITHIN a space (uk_octo_doc_slug(space_id, octo_doc_slug)),
+// so when spaceID != "" the lookup is space-scoped; spaceID == "" keeps the
+// exact legacy unfiltered behavior for degraded/single-node paths.
+func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug, spaceID string) (string, bool, error) {
+	query := "SELECT doc_id, permission_epoch FROM doc_meta WHERE octo_doc_slug=? AND status<>0"
+	args := []any{slug}
+	if spaceID != "" {
+		query += " AND space_id=?"
+		args = append(args, spaceID)
+	}
+	query += " LIMIT 1"
 	var docID string
 	var epoch sql.NullInt64
-	err := m.db.QueryRowContext(ctx,
-		"SELECT doc_id, permission_epoch FROM doc_meta WHERE octo_doc_slug=? AND status<>0 LIMIT 1",
-		slug).Scan(&docID, &epoch)
+	err := m.db.QueryRowContext(ctx, query, args...).Scan(&docID, &epoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -262,6 +317,29 @@ func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug string) (st
 		return "", false, fmt.Errorf("resolve doc_meta by slug: %w", err)
 	}
 	return docID, true, nil
+}
+
+// TitleBySlug reads doc_meta.title for slug with the same space scoping and
+// status<>0 guard as DocIDBySlug. ok=false when the slug is unregistered.
+// Display-only: any error surfaces to the caller, which must fall back to its
+// local title rather than fail the request.
+func (m *MySQLDocMemberMirror) TitleBySlug(ctx context.Context, slug, spaceID string) (string, bool, error) {
+	query := "SELECT title FROM doc_meta WHERE octo_doc_slug=? AND status<>0"
+	args := []any{slug}
+	if spaceID != "" {
+		query += " AND space_id=?"
+		args = append(args, spaceID)
+	}
+	query += " LIMIT 1"
+	var title string
+	err := m.db.QueryRowContext(ctx, query, args...).Scan(&title)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("resolve doc_meta title by slug: %w", err)
+	}
+	return title, true, nil
 }
 
 // RoleByDocUID returns the role (doc_member.role) uid holds on docID; ok=false

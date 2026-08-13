@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/octoidentity"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
@@ -67,6 +68,9 @@ func (s *Server) botAuthMiddleware(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, botSessionCtxKey{}, sess)
 		ctx = context.WithValue(ctx, botTokenCtxKey{}, token)
 		ctx = context.WithValue(ctx, botSpaceCtxKey{}, bi.SpaceID)
+		// Also expose the space to the service layer so slug→doc_id resolution
+		// (doc_member lookups) can be space-scoped there.
+		ctx = service.ContextWithSpaceID(ctx, bi.SpaceID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

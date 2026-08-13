@@ -37,10 +37,13 @@ type stubMirrorWrite struct {
 	grantedBy string
 }
 
-func (m *stubMirror) DocIDBySlug(_ context.Context, slug string) (string, bool, error) {
+func (m *stubMirror) DocIDBySlug(_ context.Context, slug, _ string) (string, bool, error) {
 	if id, ok := m.slugToDoc[slug]; ok {
 		return id, true, nil
 	}
+	return "", false, nil
+}
+func (m *stubMirror) TitleBySlug(context.Context, string, string) (string, bool, error) {
 	return "", false, nil
 }
 func (m *stubMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {

@@ -133,7 +133,17 @@ func (s *AuthService) RoleBySlugUID(ctx context.Context, slug, uid string) (role
 	if s.docMembers == nil || uid == "" {
 		return 0, false, false, nil
 	}
-	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug)
+	// Space-scope the slug lookup: a slug is unique only within a space, so an
+	// unfiltered resolve could return ANOTHER space's doc_id ⇒ wrong capability.
+	// Space priority: request context (bot-auth) → the slug's own persisted
+	// provenance → "" (legacy unfiltered for degraded paths).
+	spaceID := SpaceIDFromContext(ctx)
+	if spaceID == "" {
+		if meta, merr := s.meta.GetMeta(ctx, slug); merr == nil {
+			spaceID = spaceIDForDoc(ctx, meta)
+		}
+	}
+	docID, ok, err := s.docMembers.DocIDBySlug(ctx, slug, spaceID)
 	if err != nil {
 		return 0, false, false, err
 	}

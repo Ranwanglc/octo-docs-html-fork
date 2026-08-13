@@ -33,8 +33,11 @@ func setupDocMemberMirrorTables(t *testing.T, db *sql.DB) {
 		`CREATE TABLE doc_meta (
 			doc_id VARCHAR(64) PRIMARY KEY,
 			octo_doc_slug VARCHAR(255),
+			space_id VARCHAR(64) NOT NULL DEFAULT '',
+			title VARCHAR(512) NOT NULL DEFAULT '',
 			permission_epoch BIGINT NOT NULL DEFAULT 0,
-			status INT NOT NULL DEFAULT 1
+			status INT NOT NULL DEFAULT 1,
+			UNIQUE KEY uk_octo_doc_slug (space_id, octo_doc_slug)
 		)`,
 		`CREATE TABLE doc_member (
 			doc_id VARCHAR(64),
@@ -268,5 +271,119 @@ func TestRequireAppendRoleEncoding(t *testing.T) {
 	}
 	if err := service.RequireAppendRoleEncoding(ctx, nil); !errors.Is(err, service.ErrDocRoleEncodingUnverified) {
 		t.Fatalf("nil db error = %v; want ErrDocRoleEncodingUnverified", err)
+	}
+}
+
+// seedSlugDoc inserts a registered doc_meta row (slug + space + title) for the
+// space-scoped slug resolution tests.
+func seedSlugDoc(t *testing.T, db *sql.DB, docID, slug, spaceID, title string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(),
+		"INSERT INTO doc_meta (doc_id, octo_doc_slug, space_id, title, status) VALUES (?, ?, ?, ?, 1)",
+		docID, slug, spaceID, title); err != nil {
+		t.Fatalf("seed slug doc: %v", err)
+	}
+}
+
+// A slug is unique only WITHIN a space (uk_octo_doc_slug(space_id,
+// octo_doc_slug)): the same slug registered in two spaces must resolve to the
+// matching row when the caller supplies the space, and the legacy empty-space
+// lookup must still return one of them (degraded paths must not regress).
+func TestDocIDBySlugIsSpaceScoped(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	ctx := context.Background()
+
+	seedSlugDoc(t, db, "docSpaceA", "shared-slug", "space-a", "Title A")
+	seedSlugDoc(t, db, "docSpaceB", "shared-slug", "space-b", "Title B")
+
+	docID, ok, err := mirror.DocIDBySlug(ctx, "shared-slug", "space-a")
+	if err != nil || !ok || docID != "docSpaceA" {
+		t.Fatalf("DocIDBySlug(space-a) = (%q,%v,%v); want (docSpaceA,true,nil)", docID, ok, err)
+	}
+	docID, ok, err = mirror.DocIDBySlug(ctx, "shared-slug", "space-b")
+	if err != nil || !ok || docID != "docSpaceB" {
+		t.Fatalf("DocIDBySlug(space-b) = (%q,%v,%v); want (docSpaceB,true,nil)", docID, ok, err)
+	}
+	// Legacy empty space: unfiltered lookup still resolves (one of the rows).
+	docID, ok, err = mirror.DocIDBySlug(ctx, "shared-slug", "")
+	if err != nil || !ok || (docID != "docSpaceA" && docID != "docSpaceB") {
+		t.Fatalf("DocIDBySlug(legacy empty space) = (%q,%v,%v); want one of the rows", docID, ok, err)
+	}
+	// A space with no registration of the slug must NOT see another space's row.
+	_, ok, err = mirror.DocIDBySlug(ctx, "shared-slug", "space-c")
+	if err != nil || ok {
+		t.Fatalf("DocIDBySlug(space-c) = (%v,%v); want (false,nil)", ok, err)
+	}
+}
+
+// TitleBySlug returns the registered display title, space-scoped, with the same
+// status<>0 guard as DocIDBySlug.
+func TestTitleBySlugSpaceScoped(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	ctx := context.Background()
+
+	seedSlugDoc(t, db, "docTitleA", "titled-slug", "space-a", "Real Title A")
+	seedSlugDoc(t, db, "docTitleB", "titled-slug", "space-b", "Real Title B")
+
+	title, ok, err := mirror.TitleBySlug(ctx, "titled-slug", "space-a")
+	if err != nil || !ok || title != "Real Title A" {
+		t.Fatalf("TitleBySlug(space-a) = (%q,%v,%v); want (Real Title A,true,nil)", title, ok, err)
+	}
+	title, ok, err = mirror.TitleBySlug(ctx, "titled-slug", "space-b")
+	if err != nil || !ok || title != "Real Title B" {
+		t.Fatalf("TitleBySlug(space-b) = (%q,%v,%v); want (Real Title B,true,nil)", title, ok, err)
+	}
+	// Legacy empty space still resolves one of the rows' titles.
+	title, ok, err = mirror.TitleBySlug(ctx, "titled-slug", "")
+	if err != nil || !ok || (title != "Real Title A" && title != "Real Title B") {
+		t.Fatalf("TitleBySlug(legacy empty space) = (%q,%v,%v); want one of the titles", title, ok, err)
+	}
+	_, ok, err = mirror.TitleBySlug(ctx, "titled-slug", "space-c")
+	if err != nil || ok {
+		t.Fatalf("TitleBySlug(space-c) = (%v,%v); want (false,nil)", ok, err)
+	}
+}
+
+// status=0 rows (soft-deleted/unmounted) must never resolve — for either the
+// doc_id or the title — regardless of space scoping.
+func TestSlugResolutionSkipsStatusZeroRows(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO doc_meta (doc_id, octo_doc_slug, space_id, title, status) VALUES (?, ?, ?, ?, 0)",
+		"docDead", "dead-slug", "space-a", "Dead Title"); err != nil {
+		t.Fatalf("seed status=0 row: %v", err)
+	}
+	for _, space := range []string{"space-a", ""} {
+		_, ok, err := mirror.DocIDBySlug(ctx, "dead-slug", space)
+		if err != nil || ok {
+			t.Fatalf("DocIDBySlug(dead, space=%q) = (%v,%v); want (false,nil)", space, ok, err)
+		}
+		_, ok, err = mirror.TitleBySlug(ctx, "dead-slug", space)
+		if err != nil || ok {
+			t.Fatalf("TitleBySlug(dead, space=%q) = (%v,%v); want (false,nil)", space, ok, err)
+		}
+	}
+}
+
+// Unregistered slugs resolve to ok=false for both lookups (mirror skips).
+func TestSlugResolutionUnregisteredSlug(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	ctx := context.Background()
+
+	for _, space := range []string{"space-a", ""} {
+		_, ok, err := mirror.DocIDBySlug(ctx, "ghost-slug", space)
+		if err != nil || ok {
+			t.Fatalf("DocIDBySlug(ghost, space=%q) = (%v,%v); want (false,nil)", space, ok, err)
+		}
+		_, ok, err = mirror.TitleBySlug(ctx, "ghost-slug", space)
+		if err != nil || ok {
+			t.Fatalf("TitleBySlug(ghost, space=%q) = (%v,%v); want (false,nil)", space, ok, err)
+		}
 	}
 }
