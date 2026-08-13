@@ -30,6 +30,19 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// CanonicalDocIDExtraKey marks a document identity allocated by docs-backend.
+// Its presence is the routing discriminator for d_-prefixed slugs; storage
+// existence alone is deliberately never used as an identity test.
+const CanonicalDocIDExtraKey = "canonical_doc_id"
+
+// CanonicalShareURLExtraKey stores the canonical read URL for idempotent
+// create replays.
+const CanonicalShareURLExtraKey = "canonical_share_url"
+
+// CanonicalDraftCreateExtraKey records completion of one-shot canonical draft
+// creation, preventing stale draft replays after promotion.
+const CanonicalDraftCreateExtraKey = "canonical_draft_create"
+
 // Publish provenance keys persist registration identity and mount details.
 const (
 	UserPublishExtraKey               = "user_publish"
@@ -87,6 +100,26 @@ func (m *DocMeta) DocsBackendRegistration() (state, docID string, version int) {
 	docID, _ = m.Extra[DocsBackendDocIDExtraKey].(string)
 	version = extraInt(m.Extra[DocsBackendRegistrationVersionKey])
 	return strings.TrimSpace(state), strings.TrimSpace(docID), version
+}
+
+// CanonicalIdentity returns the docs-backend identity and URL, if this is a
+// canonical document. The marker must be present as well as the id so d_-like
+// legacy slugs retain legacy routing.
+func (m *DocMeta) CanonicalIdentity() (docID, shareURL string, ok bool) {
+	if m == nil || m.Extra == nil {
+		return "", "", false
+	}
+	docID, _ = m.Extra[CanonicalDocIDExtraKey].(string)
+	shareURL, _ = m.Extra[CanonicalShareURLExtraKey].(string)
+	docID = strings.TrimSpace(docID)
+	return docID, strings.TrimSpace(shareURL), docID != ""
+}
+
+// LegacyRegistration exposes the existing registration state without treating
+// it as a canonical identity.
+func (m *DocMeta) LegacyRegistration() (docID string, ok bool) {
+	state, docID, _ := m.DocsBackendRegistration()
+	return docID, state == DocsBackendRegistrationRegistered && docID != ""
 }
 
 func extraInt(v any) int {
