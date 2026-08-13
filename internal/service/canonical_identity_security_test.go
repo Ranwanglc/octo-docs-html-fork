@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
@@ -205,6 +206,81 @@ func TestCanonicalMarkerWriteIsAtomicAndReplaySelfHeals(t *testing.T) {
 	if result.Version != 1 || result.DocID != "d_atomic" {
 		t.Fatalf("self-heal result=%+v, want canonical v1", result)
 	}
+	if _, deletes, _ := registrar.counts(); deletes != 1 {
+		t.Fatalf("rollback deletes=%d, want 1", deletes)
+	}
+}
+
+type headFailCanonicalBlobStore struct{ *memory.Store }
+
+func (*headFailCanonicalBlobStore) HeadDoc(context.Context, string, int) (int64, bool, error) {
+	return 0, false, errors.New("simulated head failure")
+}
+
+func TestCanonicalHeadFailureCleansBlobAndRollsBackIdentity(t *testing.T) {
+	store := memory.New()
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_head_fail", OctoDocSlug: "d_head_fail", ShareURL: "https://docs/d_head_fail", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(&headFailCanonicalBlobStore{Store: store}, store, NewCommentService(store, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("publish succeeded")
+	}
+	if versions, err := store.ListVersions(context.Background(), "d_head_fail"); err != nil || len(versions) != 0 {
+		t.Fatalf("stranded versions=%v err=%v", versions, err)
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 1 {
+		t.Fatalf("rollback deletes=%d, want 1", deletes)
+	}
+}
+
+type failCommentMergeMetaStore struct{ *memory.Store }
+
+func (*failCommentMergeMetaStore) PutComments(context.Context, string, []core.Comment) error {
+	return errors.New("simulated comment merge failure")
+}
+
+func TestCanonicalCommentMergeFailureKeepsDurableIdentity(t *testing.T) {
+	store := memory.New()
+	meta := &failCommentMergeMetaStore{Store: store}
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_merge_fail", OctoDocSlug: "d_merge_fail", ShareURL: "https://docs/d_merge_fail", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(store, meta, NewCommentService(meta, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("publish succeeded")
+	}
+	if meta, err := store.GetMeta(context.Background(), "d_merge_fail"); err != nil || meta == nil {
+		t.Fatalf("durable metadata=%+v err=%v", meta, err)
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 0 {
+		t.Fatalf("rollback deletes=%d, want 0", deletes)
+	}
+}
+
+func TestCanonicalDraftMarkerFailureRollsBackAndRetrySelfHeals(t *testing.T) {
+	store := memory.New()
+	meta := &failCanonicalMarkerMetaStore{Store: store, fail: true}
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_atomic", OctoDocSlug: "d_draft_atomic", ShareURL: "https://docs/d_draft_atomic", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(store, meta, NewCommentService(meta, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.CreateCanonicalDraft(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("draft creation succeeded despite marker failure")
+	}
+	if prev, err := store.GetMeta(context.Background(), "d_draft_atomic"); err != nil || prev != nil {
+		t.Fatalf("partial draft metadata=%+v err=%v", prev, err)
+	}
+	if _, deletes, _ := registrar.counts(); deletes != 1 {
+		t.Fatalf("rollback deletes=%d, want 1", deletes)
+	}
+	registrar.mu.Lock()
+	registrar.result.Created = false
+	registrar.mu.Unlock()
+	result, err := docs.CreateCanonicalDraft(context.Background(), canonicalInput())
+	if err != nil {
+		t.Fatalf("self-heal retry: %v", err)
+	}
+	if result.DocID != "d_draft_atomic" || result.Size == 0 {
+		t.Fatalf("retry result=%+v", result)
+	}
 }
 
 type probeRegistrar struct {
@@ -383,8 +459,8 @@ func TestCanonicalCreateSameIdempotencyKeyIsSerialized(t *testing.T) {
 	if len(versions) != 1 || versions[0] != 1 {
 		t.Fatalf("versions=%v, want [1]", versions)
 	}
-	if _, _, published := registrar.counts(); published != 1 {
-		t.Fatalf("published notifications=%d, want one first-content signal", published)
+	if _, deletes, published := registrar.counts(); deletes != 0 || published != 1 {
+		t.Fatalf("rollback deletes=%d, published notifications=%d; want 0 and one first-content signal", deletes, published)
 	}
 }
 
@@ -392,23 +468,27 @@ type gateFirstSlugLock struct {
 	sluglock.Locker
 	entered chan struct{}
 	release chan struct{}
+	slug    string
 	once    sync.Once
 }
 
 func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() error) error {
-	return l.Locker.With(ctx, slug, func() error {
-		wait := false
-		l.once.Do(func() {
-			close(l.entered)
-			wait = true
-		})
-		if wait {
-			select {
-			case <-l.release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+	if l.slug != "" && slug != l.slug {
+		return l.Locker.With(ctx, slug, fn)
+	}
+	wait := false
+	l.once.Do(func() {
+		close(l.entered)
+		wait = true
+	})
+	if wait {
+		select {
+		case <-l.release:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
+	}
+	return l.Locker.With(ctx, slug, func() error {
 		return fn()
 	})
 }
@@ -416,7 +496,7 @@ func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() err
 func TestCanonicalCreateRacingLegacyPublishKeepsCanonicalIdentity(t *testing.T) {
 	store := memory.New()
 	baseLock := sluglock.NewMemory()
-	lock := &gateFirstSlugLock{Locker: baseLock, entered: make(chan struct{}), release: make(chan struct{})}
+	lock := &gateFirstSlugLock{Locker: baseLock, entered: make(chan struct{}), release: make(chan struct{}), slug: "d_collision"}
 	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_collision", OctoDocSlug: "d_collision", ShareURL: "https://docs/d_collision", PublisherUID: "publisher", SpaceID: "space"}}
 	docs := NewDocService(store, store, NewCommentService(store, baseLock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
 
@@ -433,23 +513,25 @@ func TestCanonicalCreateRacingLegacyPublishKeepsCanonicalIdentity(t *testing.T) 
 		legacyDone <- result
 		legacyErr <- err
 	}()
-	close(lock.release)
-	if err := <-canonicalDone; err != nil {
-		t.Fatalf("canonical publish: %v", err)
-	}
 	if err := <-legacyErr; err != nil {
 		t.Fatalf("legacy publish: %v", err)
 	}
 	legacy := <-legacyDone
-	if legacy.DocID != "d_collision" || !legacy.Registered {
-		t.Fatalf("legacy result=%+v, want canonical routing", legacy)
+	if legacy.DocID != "" || legacy.Registered {
+		t.Fatalf("legacy result=%+v, want legacy publication", legacy)
+	}
+	close(lock.release)
+	err := <-canonicalDone
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "canonical_identity_conflict" {
+		t.Fatalf("canonical publish=%v, want collision conflict", err)
 	}
 	meta, err := store.GetMeta(context.Background(), "d_collision")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if docID, _, ok := meta.CanonicalIdentity(); !ok || docID != "d_collision" {
-		t.Fatalf("canonical identity lost after racing legacy publish: %+v", meta)
+	if _, _, ok := meta.CanonicalIdentity(); ok || meta == nil {
+		t.Fatalf("legacy metadata overwritten by canonical cleanup: %+v", meta)
 	}
 }
 
