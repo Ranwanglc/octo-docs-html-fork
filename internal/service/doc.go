@@ -252,7 +252,25 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	// atomic, or two concurrent publishes of the same slug can resolve to the same
 	// version and clobber each other (and drift meta vs blobs).
 	var result *PublishResult
+	canonicalUpdate := false
 	err = s.lock.With(ctx, in.Slug, func() error {
+		// A canonical marker, not a d_ prefix, selects the canonical update path.
+		// Preserve the legacy path unchanged for old slugs that merely look alike.
+		meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+		if metaErr != nil {
+			return metaErr
+		}
+		if docID, shareURL, ok := meta.CanonicalIdentity(); ok {
+			if docID != in.Slug {
+				return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+			}
+			canonicalUpdate = true
+			defer func() {
+				if result != nil {
+					result.DocID, result.URL, result.ShareURL, result.Registered = docID, shareURL, shareURL, true
+				}
+			}()
+		}
 		if in.UserPublish {
 			meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
 			if metaErr != nil {
@@ -283,6 +301,9 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 	})
 	if err != nil {
 		return nil, err
+	}
+	if canonicalUpdate {
+		return result, nil
 	}
 	s.afterPublished(ctx, result)
 	return result, nil
