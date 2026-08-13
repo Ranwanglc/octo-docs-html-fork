@@ -15,26 +15,49 @@ import (
 )
 
 // advisoryLocker is a sluglock.Locker backed by PostgreSQL advisory locks, so
-// per-slug serialization holds ACROSS app instances.
+// per-slug serialization holds ACROSS app instances (the in-process
+// sluglock.Memory only serializes within one process). Publishing the same slug
+// from two instances can otherwise resolve to the same version and clobber each
+// other's blob/meta; the advisory lock closes that window.
+//
+// Advisory locks are session-scoped: pg_advisory_lock(key) is held by the
+// connection until pg_advisory_unlock or the session ends. So each With acquires
+// a DEDICATED pooled connection for the lock alone — separate from whatever
+// connection fn uses for its own queries — locks, runs fn, then unlocks and
+// releases in a defer. The pool must therefore allow at least 2 connections
+// (PG_POOL_MAX default 10).
 type advisoryLocker struct {
 	pool *pgxpool.Pool
 }
 
 const advisoryUnlockTimeout = 2 * time.Second
 
-var _ sluglock.Locker = (*advisoryLocker)(nil)
+var (
+	_              sluglock.Locker = (*advisoryLocker)(nil)
+	advisoryLogger                 = slog.Default()
+)
 
-// advisoryKey maps an arbitrary lock key to a stable PostgreSQL int64 key.
-// This is a hash, so a collision is theoretically possible; SHA-256's 64-bit
-// prefix makes it sufficiently remote while preserving PostgreSQL's int64 API.
+// SetAdvisoryLockLogger injects the logger used for advisory-lock recovery.
+func SetAdvisoryLockLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	advisoryLogger = logger
+}
+
+// advisoryKey maps an arbitrary lock key (slug or a sentinel) to the int64 that
+// pg_advisory_lock takes. sha256's first 8 bytes give a stable, well-distributed
+// value. A collision only makes two unrelated keys occasionally serialize against
+// each other — a negligible perf cost, never a correctness problem.
 func advisoryKey(key string) int64 {
 	sum := sha256.Sum256([]byte(key))
 	return int64(binary.BigEndian.Uint64(sum[:8]))
 }
 
 // With runs fn while holding the slug's advisory lock, releasing it afterward.
-// ctx controls acquisition and fn; unlock deliberately uses a fresh bounded
-// context so cancellation cannot strand a session-scoped lock.
+// The context is honored before acquiring and while waiting for the lock, so a
+// cancelled request doesn't block forever. ctx controls fn; unlock deliberately
+// uses a fresh bounded context so cancellation cannot strand a session-scoped lock.
 func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -54,9 +77,9 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", id); err != nil {
 		return fmt.Errorf("pg_advisory_lock: %w", err)
 	}
-	// Unlock on the same connection with an independent bounded context. On any
-	// failure, hijack and close the physical connection so a locked session can
-	// never return to the pool.
+	// Unlock on the same connection with an independent bounded context. On an
+	// unlock failure, hijack and close the physical connection so the locked
+	// session can never return to the pool.
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
 		defer cancel()
@@ -82,7 +105,7 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		// locked section and mints a duplicate version (the exact failure mode
 		// Promote refuses to create). The session is destroyed anyway, so the
 		// lock dies with the connection.
-		slog.Default().Warn("pg_advisory_unlock failed after commit; connection destroyed", "key", key, "err", unlockErr, "close_err", closeErr)
+		advisoryLogger.Warn("pg_advisory_unlock failed after commit; connection destroyed", "key", key, "err", unlockErr, "close_err", closeErr)
 	}()
 
 	return fn()

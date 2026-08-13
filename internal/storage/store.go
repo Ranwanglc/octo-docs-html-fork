@@ -119,13 +119,6 @@ func (m *DocMeta) CanonicalIdentity() (docID, shareURL string, ok bool) {
 	return docID, strings.TrimSpace(shareURL), docID != ""
 }
 
-// LegacyRegistration exposes the existing registration state without treating
-// it as a canonical identity.
-func (m *DocMeta) LegacyRegistration() (docID string, ok bool) {
-	state, docID, _ := m.DocsBackendRegistration()
-	return docID, state == DocsBackendRegistrationRegistered && docID != ""
-}
-
 func extraInt(v any) int {
 	switch n := v.(type) {
 	case int:

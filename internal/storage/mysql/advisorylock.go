@@ -20,7 +20,18 @@ type advisoryLocker struct {
 
 const advisoryUnlockTimeout = 2 * time.Second
 
-var _ sluglock.Locker = (*advisoryLocker)(nil)
+var (
+	_              sluglock.Locker = (*advisoryLocker)(nil)
+	advisoryLogger                 = slog.Default()
+)
+
+// SetAdvisoryLockLogger injects the logger used for advisory-lock recovery.
+func SetAdvisoryLockLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	advisoryLogger = logger
+}
 
 func advisoryName(key string) string {
 	// Hash rather than truncate the user key: MySQL named locks are bounded and
@@ -83,7 +94,7 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		// The critical section already committed durably: an unlock failure here
 		// must not masquerade as a publish error and invite a retry that mints a
 		// duplicate version. The session is discarded, so the lock dies with it.
-		slog.Default().Warn("release_lock failed after commit; connection discarded", "name", name, "err", unlockErr, "discard_err", discardErr)
+		advisoryLogger.Warn("release_lock failed after commit; connection discarded", "name", name, "err", unlockErr, "discard_err", discardErr)
 	}()
 
 	return fn()
