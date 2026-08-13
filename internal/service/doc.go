@@ -356,6 +356,22 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 			}
 		}
 		r, e := s.publishLocked(ctx, in, stamped)
+		if e == nil {
+			// Store the marker and URL atomically with the canonical guard so later
+			// d_-prefixed republishes can dispatch by identity type.
+			meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+			if metaErr != nil {
+				return metaErr
+			}
+			if meta == nil {
+				return apperr.Upstream("canonical metadata missing", "metadata_recovery_failed", nil)
+			}
+			extra := map[string]any{}
+			maps.Copy(extra, meta.Extra)
+			extra[storage.CanonicalDocIDExtraKey] = identity.docID
+			extra[storage.CanonicalShareURLExtraKey] = identity.shareURL
+			e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra})
+		}
 		result = r
 		return e
 	})
