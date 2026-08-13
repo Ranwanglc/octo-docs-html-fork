@@ -23,12 +23,16 @@ const advisoryUnlockTimeout = 2 * time.Second
 var _ sluglock.Locker = (*advisoryLocker)(nil)
 
 func advisoryName(key string) string {
+	// Hash rather than truncate the user key: MySQL named locks are bounded and
+	// a collision only serializes unrelated work, never aliases document data.
 	sum := sha256.Sum256([]byte(key))
 	return "octodoc:" + hex.EncodeToString(sum[:])[:56]
 }
 
 // With runs fn while holding a MySQL named lock. GET_LOCK is connection-scoped,
 // so acquire, fn, and release are bound to the same dedicated *sql.Conn.
+// ctx controls acquisition and fn; release uses a fresh bounded context so a
+// canceled caller cannot leave a lock held by a pooled connection.
 func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err

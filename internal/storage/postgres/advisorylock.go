@@ -25,12 +25,16 @@ const advisoryUnlockTimeout = 2 * time.Second
 var _ sluglock.Locker = (*advisoryLocker)(nil)
 
 // advisoryKey maps an arbitrary lock key to a stable PostgreSQL int64 key.
+// This is a hash, so a collision is theoretically possible; SHA-256's 64-bit
+// prefix makes it sufficiently remote while preserving PostgreSQL's int64 API.
 func advisoryKey(key string) int64 {
 	sum := sha256.Sum256([]byte(key))
 	return int64(binary.BigEndian.Uint64(sum[:8]))
 }
 
 // With runs fn while holding the slug's advisory lock, releasing it afterward.
+// ctx controls acquisition and fn; unlock deliberately uses a fresh bounded
+// context so cancellation cannot strand a session-scoped lock.
 func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
