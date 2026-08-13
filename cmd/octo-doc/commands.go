@@ -35,7 +35,9 @@ type metadataBackend interface {
 // buildServices opens the storage backends and constructs the service layer. The
 // returned health func pings both stores (readiness probe); closeStore releases
 // the pool.
-func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, closeStore func() error, err error) {
+func buildServices(ctx context.Context, cfg *config.Config, logger *slog.Logger) (deps *httpx.Deps, closeStore func() error, err error) {
+	mysql.SetAdvisoryLockLogger(logger)
+	postgres.SetAdvisoryLockLogger(logger)
 	meta, err := openMetadata(ctx, cfg)
 	if err != nil {
 		return nil, nil, err
@@ -117,7 +119,7 @@ func serve(cfg *config.Config, logger *slog.Logger) error {
 	}
 	startCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	deps, closeStore, err := buildServices(startCtx, cfg)
+	deps, closeStore, err := buildServices(startCtx, cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -250,7 +252,7 @@ func gcAssets(cfg *config.Config, logger *slog.Logger, args []string) error {
 	}
 	startCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	deps, closeStore, err := buildServices(startCtx, cfg)
+	deps, closeStore, err := buildServices(startCtx, cfg, logger)
 	if err != nil {
 		return err
 	}

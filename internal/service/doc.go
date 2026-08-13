@@ -140,6 +140,10 @@ type PublishInput struct {
 	pinnedAID         string
 	pinnedTag         string
 	anchorMigrations  map[string]string
+	// canonical is set only by the identity-first create path. It makes the
+	// identity marker part of the publish metadata commit, rather than a second
+	// best-effort write after content has been committed.
+	canonical *canonicalIdentity
 }
 
 // PublishProvenance is the durable ownership context effective for a write.
@@ -340,49 +344,47 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	}
 	in.MountType = mountType
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
-	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
-	if err != nil {
-		if docsbackend.IsCanonicalDocumentDeleted(err) {
-			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
-		}
-		if docsbackend.IsRegistrationContractIncomplete(err) {
-			return nil, apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
-		}
-		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
-	}
-	registered := reg.Created
-	defer func() {
-		if registered {
-			rollbackCtx, cancel := detachedSideEffectContext(ctx)
-			_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
-			cancel()
-		}
-	}()
-	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
-		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
-	}
-	if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
-		return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
-	}
-	in.Slug = reg.DocID
-	identity := &canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
 	if s.lock == nil {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
 	stamped := core.StampAids(in.HTML)
 	var result *PublishResult
-	err = s.lock.With(ctx, in.Slug, func() error {
-		// A local failure must compensate before releasing this identity's lock.
-		// Otherwise a replay can commit between unlock and DeleteCanonical, and
-		// the first attempt would delete the replay's durable identity.
+	err = s.lock.With(ctx, "idem:"+in.IdempotencyKey, func() error {
+		reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
+		if err != nil {
+			if docsbackend.IsCanonicalDocumentDeleted(err) {
+				return apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
+			}
+			if docsbackend.IsRegistrationContractIncomplete(err) {
+				return apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
+			}
+			return apperr.Upstream("docs-backend registration failed", "registration_failed", err)
+		}
+		registered := reg.Created
 		defer func() {
 			if registered {
 				rollbackCtx, cancel := detachedSideEffectContext(ctx)
-				_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+				if rollbackErr := s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken); rollbackErr != nil {
+					s.log().Error("canonical_rollback_failed", "key", in.IdempotencyKey, "doc_id", reg.DocID, "err", rollbackErr.Error())
+				}
 				cancel()
-				registered = false
 			}
 		}()
+		if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
+			return apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+		}
+		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
+			return apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
+		}
+		in.Slug = reg.DocID
+		identity := &canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
+		if registered {
+			if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
+				return stateErr
+			} else if exists {
+				return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+			}
+		}
 		// An idempotency replay must return the original write, never mint v2.
 		if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
 			return e
@@ -412,23 +414,8 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 				return e
 			}
 		}
+		in.canonical = identity
 		r, e := s.publishLocked(ctx, in, stamped)
-		if e == nil {
-			// Store the marker and URL atomically with the canonical guard so later
-			// d_-prefixed republishes can dispatch by identity type.
-			meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
-			if metaErr != nil {
-				return metaErr
-			}
-			if meta == nil {
-				return apperr.Upstream("canonical metadata missing", "metadata_recovery_failed", nil)
-			}
-			extra := map[string]any{}
-			maps.Copy(extra, meta.Extra)
-			extra[storage.CanonicalDocIDExtraKey] = identity.docID
-			extra[storage.CanonicalShareURLExtraKey] = identity.shareURL
-			e = s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra})
-		}
 		result = r
 		if e == nil {
 			registered = false
@@ -438,7 +425,11 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	if err != nil {
 		return nil, err
 	}
-	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
+	result.DocID, result.ShareURL, result.URL, result.Registered = result.Slug, "", "", true
+	if meta, metaErr := s.meta.GetMeta(ctx, result.Slug); metaErr == nil {
+		_, result.ShareURL, _ = meta.CanonicalIdentity()
+		result.URL = result.ShareURL
+	}
 	s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
 	return result, nil
 }
@@ -491,6 +482,15 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 
 	metaResult, err := s.upsertMeta(ctx, in, version)
 	if err != nil {
+		// Canonical creation has no prior local state (checked under its
+		// idempotency-key lock). Do not leave an unmarked blob behind when the
+		// single identity-and-content metadata commit fails: a replay can then
+		// safely self-heal as v1.
+		if in.canonical != nil {
+			if cleanupErr := s.blobs.DeleteDoc(ctx, in.Slug); cleanupErr != nil {
+				s.log().Error("canonical_content_rollback_failed", "doc_id", in.canonical.docID, "err", cleanupErr.Error())
+			}
+		}
 		return nil, err
 	}
 
@@ -870,53 +870,67 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	}
 	in.MountType = mountType
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
-	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
-	if err != nil {
-		if docsbackend.IsCanonicalDocumentDeleted(err) {
-			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
-		}
-		if docsbackend.IsRegistrationContractIncomplete(err) {
-			return nil, apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
-		}
-		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
-	}
-	registered := reg.Created
-	defer func() {
-		if registered {
-			rollbackCtx, cancel := detachedSideEffectContext(ctx)
-			_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
-			cancel()
-		}
-	}()
-	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
-		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
-	}
-	if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
-		return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
-	}
 	if s.lock == nil {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
-	in.Slug = reg.DocID
 	stamped := core.StampAids(in.HTML)
 	var result *DraftResult
-	err = s.lock.With(ctx, in.Slug, func() error {
-		// See publishCanonicalAuthorized: compensation belongs inside the lock so
-		// a replay cannot commit this identity before a failed attempt deletes it.
+	err = s.lock.With(ctx, "idem:"+in.IdempotencyKey, func() error {
+		reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
+		if err != nil {
+			if docsbackend.IsCanonicalDocumentDeleted(err) {
+				return apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
+			}
+			if docsbackend.IsRegistrationContractIncomplete(err) {
+				return apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
+			}
+			return apperr.Upstream("docs-backend registration failed", "registration_failed", err)
+		}
+		registered := reg.Created
 		defer func() {
 			if registered {
 				rollbackCtx, cancel := detachedSideEffectContext(ctx)
-				_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+				if rollbackErr := s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken); rollbackErr != nil {
+					s.log().Error("canonical_rollback_failed", "key", in.IdempotencyKey, "doc_id", reg.DocID, "err", rollbackErr.Error())
+				}
 				cancel()
-				registered = false
 			}
 		}()
+		if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
+			return apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+		}
+		if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
+			return apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
+		}
+		in.Slug = reg.DocID
+		if registered {
+			if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
+				return stateErr
+			} else if exists {
+				return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+			}
+		}
 		prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
 		if e != nil {
 			return e
 		}
 		if prev != nil {
 			if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
+				// A promoted canonical draft has durable published content. Check it
+				// before the mutable draft slot so a failed DeleteDraft can never
+				// make a replay return a stale draft URL.
+				versions, versionErr := s.blobs.ListVersions(ctx, in.Slug)
+				if versionErr != nil {
+					return versionErr
+				}
+				if len(versions) > 0 || len(prev.Versions) > 0 {
+					if docID, shareURL, canonical := prev.CanonicalIdentity(); canonical {
+						result = &DraftResult{Slug: in.Slug, DocID: docID, URL: shareURL}
+						registered = false
+						return nil
+					}
+					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+				}
 				draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug)
 				if derr != nil {
 					return derr
@@ -926,13 +940,7 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 					registered = false
 					return nil
 				}
-				// Promotion clears the draft but retains the canonical marker. A
-				// create replay must return its durable identity, never a stale URL.
-				if docID, shareURL, canonical := prev.CanonicalIdentity(); canonical && len(prev.Versions) > 0 {
-					result = &DraftResult{Slug: in.Slug, DocID: docID, URL: shareURL}
-				} else {
-					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
-				}
+				result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
 				registered = false
 				return nil
 			}
@@ -1363,8 +1371,34 @@ func (s *DocService) Remove(ctx context.Context, slug string) error {
 // delete retryable: the next request repeats the remote delete then completes
 // the remaining local work.
 func (s *DocService) RemoveCanonical(ctx context.Context, slug, token string) (bool, error) {
+	// Resolve and delete the remote identity before waiting on local cleanup.
+	// The backend delete is idempotent, while holding the slug lock across a
+	// network call unnecessarily blocks local publishers and retry cleanup.
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return false, err
+	}
+	if meta == nil {
+		return false, nil
+	}
+	docID, _, isCanonical := meta.CanonicalIdentity()
+	if !isCanonical {
+		return false, nil
+	}
+	if docID != slug {
+		return true, apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
+	}
+	if s.register == nil {
+		return true, apperr.Upstream("docs-backend deletion unavailable", "delete_failed", nil)
+	}
+	if strings.TrimSpace(token) == "" {
+		return true, apperr.Unauthorized("canonical delete requires bot authentication", "publisher_bot_required")
+	}
+	if err := s.register.DeleteCanonical(ctx, docID, token); err != nil {
+		return true, apperr.Upstream("docs-backend deletion failed", "delete_failed", err)
+	}
 	canonical := false
-	err := s.lock.With(ctx, slug, func() error {
+	err = s.lock.With(ctx, slug, func() error {
 		meta, err := s.meta.GetMeta(ctx, slug)
 		if err != nil {
 			return err
@@ -1379,15 +1413,6 @@ func (s *DocService) RemoveCanonical(ctx context.Context, slug, token string) (b
 		canonical = true
 		if docID != slug {
 			return apperr.Conflict("canonical document identity mismatch", "canonical_identity_mismatch")
-		}
-		if s.register == nil {
-			return apperr.Upstream("docs-backend deletion unavailable", "delete_failed", nil)
-		}
-		if strings.TrimSpace(token) == "" {
-			return apperr.Unauthorized("canonical delete requires bot authentication", "publisher_bot_required")
-		}
-		if err := s.register.DeleteCanonical(ctx, docID, token); err != nil {
-			return apperr.Upstream("docs-backend deletion failed", "delete_failed", err)
 		}
 		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
 			return err
@@ -1579,6 +1604,9 @@ type canonicalPublishedNotifier interface {
 	Published(ctx context.Context, docID, title, token string) error
 }
 
+// notifyCanonicalPublished sends /published as the ONE-SHOT "first durable
+// content" signal. Allocation waits on this backend signal; republishes
+// intentionally do not notify again.
 func (s *DocService) notifyCanonicalPublished(parent context.Context, result *PublishResult, token string) {
 	if result == nil {
 		return
@@ -1587,7 +1615,11 @@ func (s *DocService) notifyCanonicalPublished(parent context.Context, result *Pu
 	if !ok {
 		return
 	}
-	parent, cancel := detachedSideEffectContext(parent)
+	if parent == nil {
+		parent = context.Background()
+	}
+	budget := time.Duration(docsBackendRegisterAttempts)*docsBackendAttemptTimeout + time.Duration(docsBackendRegisterAttempts-1)*docsBackendRegisterDelay
+	parent, cancel := context.WithTimeout(context.WithoutCancel(parent), budget)
 	defer cancel()
 	var err error
 	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
@@ -1811,7 +1843,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || in.UserPublish || (in.CreatorUID != "" && prev.CreatorUID() == "") {
+	if in.mountContextKnown || in.UserPublish || (in.CreatorUID != "" && prev.CreatorUID() == "") || in.canonical != nil {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
@@ -1828,6 +1860,10 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
+	}
+	if in.canonical != nil {
+		extra[storage.CanonicalDocIDExtraKey] = in.canonical.docID
+		extra[storage.CanonicalShareURLExtraKey] = in.canonical.shareURL
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,
