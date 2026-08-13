@@ -4,8 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 )
@@ -13,6 +17,8 @@ import (
 type advisoryLocker struct {
 	db *sql.DB
 }
+
+const advisoryUnlockTimeout = 2 * time.Second
 
 var _ sluglock.Locker = (*advisoryLocker)(nil)
 
@@ -23,7 +29,7 @@ func advisoryName(key string) string {
 
 // With runs fn while holding a MySQL named lock. GET_LOCK is connection-scoped,
 // so acquire, fn, and release are bound to the same dedicated *sql.Conn.
-func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) error {
+func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -50,7 +56,30 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		}
 	}
 	defer func() {
-		_, _ = conn.ExecContext(context.Background(), "SELECT RELEASE_LOCK(?)", name)
+		unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
+		defer cancel()
+		var unlocked sql.NullInt64
+		unlockErr := conn.QueryRowContext(unlockCtx, "SELECT RELEASE_LOCK(?)", name).Scan(&unlocked)
+		if unlockErr == nil && unlocked.Valid && unlocked.Int64 == 1 {
+			return
+		}
+		if unlockErr == nil {
+			unlockErr = fmt.Errorf("release_lock returned %v", unlocked)
+		}
+		// database/sql has no public Conn.Hijack. ErrBadConn from Raw tells the
+		// pool to destroy the underlying connection rather than reuse the session.
+		discardErr := conn.Raw(func(any) error { return driver.ErrBadConn })
+		if errors.Is(discardErr, driver.ErrBadConn) {
+			discardErr = nil
+		}
+		if retErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release_lock: %w", unlockErr), discardErr)
+			return
+		}
+		// The critical section already committed durably: an unlock failure here
+		// must not masquerade as a publish error and invite a retry that mints a
+		// duplicate version. The session is discarded, so the lock dies with it.
+		slog.Default().Warn("release_lock failed after commit; connection discarded", "name", name, "err", unlockErr, "discard_err", discardErr)
 	}()
 
 	return fn()
