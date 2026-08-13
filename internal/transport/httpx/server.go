@@ -92,6 +92,10 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs", s.cors(s.wrap(s.handleListDocs)))
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
 		r.Get("/docs/{slug}/versions", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersions))))
+		r.Get("/docs/{slug}/versions/{version}/source", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersionSource))))
+		// Diff parses two documents per call, so it is rate-limited like a write
+		// even though it only reads.
+		r.Get("/docs/{slug}/diff", s.cors(s.requireDocReadJSON(slugFromPath, s.limit(writeLimiter, false, s.wrap(s.handleVersionDiff)))))
 		r.With(s.requireDocManage).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
 		// Draft slot. Draft-first creation must work before any version exists, so
 		// these use requireDocAuthorOrFirstCreate: any authenticated session may

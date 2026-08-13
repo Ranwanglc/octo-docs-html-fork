@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -658,6 +659,44 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 		title = meta.Title
 	}
 	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+}
+
+// Source returns the immutable published bytes exactly as stored, before the
+// render path signs assets or injects the overlay. Version 0 resolves to latest.
+func (s *DocService) Source(ctx context.Context, slug string, version int) (string, int, bool, error) {
+	resolved, err := s.resolveReadVersion(ctx, slug, version)
+	if err != nil {
+		return "", 0, false, err
+	}
+	html, ok, err := s.blobs.GetDoc(ctx, slug, resolved)
+	if err != nil {
+		return "", 0, false, err
+	}
+	return html, resolved, ok, nil
+}
+
+// Diff compares two published versions under fixed parse and output limits. It
+// never echoes either document back in full.
+func (s *DocService) Diff(ctx context.Context, slug string, from, to int) (*VersionDiff, error) {
+	before, fromVersion, ok, err := s.Source(ctx, slug, from)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, apperr.NotFound("document version not found")
+	}
+	after, toVersion, ok, err := s.Source(ctx, slug, to)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, apperr.NotFound("document version not found")
+	}
+	result, err := buildVersionDiff(fromVersion, toVersion, before, after)
+	if errors.Is(err, errDiffLimit) {
+		return nil, apperr.PayloadTooLarge("diff complexity limit exceeded", "diff_too_complex")
+	}
+	return result, err
 }
 
 // VersionList is the response of ListVersions.

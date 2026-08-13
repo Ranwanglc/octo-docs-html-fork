@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"strconv"
@@ -389,6 +390,120 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeData(w, 200, toVersionListDTO(res))
 	return nil
+}
+
+// handleVersionSource serves the stored bytes of one version as inert text.
+//
+// This is user-authored HTML on the app's own origin, so it must never be
+// served as an active document: text/plain + nosniff keeps the browser from
+// sniffing it into an HTML context, and the CSP/frame/referrer trio mirrors the
+// asset route's raw-byte lockdown (this handler sets headers itself and so does
+// not go through secHeaders).
+func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) error {
+	slug, err := requireSlug(chi.URLParam(r, "slug"))
+	if err != nil {
+		return err
+	}
+	raw := chi.URLParam(r, "version")
+	version := 0
+	immutable := false
+	if !strings.EqualFold(raw, "latest") {
+		var ok bool
+		version, ok = parsePublishedVersion(raw)
+		if !ok {
+			return apperr.Validation("version must be a positive integer or latest", "invalid_version")
+		}
+		immutable = true
+	}
+	source, resolved, ok, err := s.docs.Source(r.Context(), slug, version)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return apperr.NotFound("document version not found")
+	}
+	etag := `"` + strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(source))), 16) + "-" + strconv.Itoa(len(source)) + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("X-Document-Version", strconv.Itoa(resolved))
+	// Reads answer Access-Control-Allow-Origin: *, so a cross-origin viewer
+	// cannot read these two without an explicit expose list.
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Document-Version")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if immutable {
+		// A numbered version is immutable; latest is not.
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "private, no-cache")
+	}
+	if matchETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
+	_, _ = io.WriteString(w, source)
+	return nil
+}
+
+func (s *Server) handleVersionDiff(w http.ResponseWriter, r *http.Request) error {
+	slug, err := requireSlug(chi.URLParam(r, "slug"))
+	if err != nil {
+		return err
+	}
+	query := r.URL.Query()
+	if len(query["from"]) != 1 || len(query["to"]) != 1 {
+		return apperr.Validation("exactly one from and one to parameter are required", "invalid_diff_query")
+	}
+	// Share links carry ?code= and clients append a cache buster; everything
+	// else is rejected so a typo cannot silently diff the wrong pair.
+	for name := range query {
+		switch name {
+		case "from", "to", "code", "_":
+		default:
+			return apperr.Validation("unexpected query parameter", "invalid_diff_query")
+		}
+	}
+	from, ok := parsePublishedVersion(query.Get("from"))
+	if !ok {
+		return apperr.Validation("from must be a positive integer", "invalid_from_version")
+	}
+	to, ok := parsePublishedVersion(query.Get("to"))
+	if !ok {
+		return apperr.Validation("to must be a positive integer", "invalid_to_version")
+	}
+	result, err := s.docs.Diff(r.Context(), slug, from, to)
+	if err != nil {
+		return err
+	}
+	writeData(w, 200, result)
+	return nil
+}
+
+// parsePublishedVersion accepts only a plain positive decimal: no sign, no
+// whitespace, no "latest", so a published version is never confused with one.
+func parsePublishedVersion(raw string) (int, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, char := range raw {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+	version, ok := parseVersionParam(raw)
+	return version, ok && version > 0
+}
+
+func matchETag(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == etag || strings.TrimPrefix(candidate, "W/") == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) error {
