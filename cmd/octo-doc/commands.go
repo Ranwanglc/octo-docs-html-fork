@@ -70,9 +70,17 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 	}
 	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(mirror)
 	docs := service.NewDocService(blobs, meta, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes)
+	// DOCS_BACKEND_REGISTER_URL is the master switch for the whole registration
+	// feature; DOCS_BACKEND_INTERNAL_REGISTER_URL only overrides the user-publish
+	// endpoint. Configuring the latter without the former leaves registration
+	// entirely off (New returns nil below) — warn so a mistyped/half-done setup is
+	// diagnosable at boot instead of looking like a silent no-op.
+	if cfg.DocsBackendInternalRegisterURL != "" && cfg.DocsBackendRegisterURL == "" {
+		slog.Warn("docs-backend registration disabled: DOCS_BACKEND_INTERNAL_REGISTER_URL is set but DOCS_BACKEND_REGISTER_URL is empty; both must be configured")
+	}
 	if cfg.DocsBackendRegisterURL != "" {
 		docs = docs.WithDocsBackendRegistration(
-			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken, nil),
+			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendInternalRegisterURL, cfg.DocsBackendRegisterToken, cfg.DocsBackendInternalRegisterToken, nil),
 			nil,
 		)
 		// Drain legacy meta.grants into doc_member after each registration so

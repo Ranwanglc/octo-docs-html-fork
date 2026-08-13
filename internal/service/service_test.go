@@ -228,7 +228,7 @@ func newDocWithDocsBackend(t *testing.T, registerURL string) *service.DocService
 	locker := sluglock.NewMemory()
 	cs := service.NewCommentService(store, locker)
 	return service.NewDocService(store, store, cs, locker, "", 5<<20).
-		WithDocsBackendRegistration(docsbackend.New(registerURL, "bot-token", "internal-token", nil), nil)
+		WithDocsBackendRegistration(docsbackend.New(registerURL, "", "bot-token", "internal-token", nil), nil)
 }
 
 func TestPublishRegistersGroupMountedDoc(t *testing.T) {
@@ -390,7 +390,7 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	defer ts.CloseClientConnections()
 	defer close(unblock)
 
-	client := docsbackend.New(ts.URL+"/v1/bot/docs", "bot-token", "internal-token", nil)
+	client := docsbackend.New(ts.URL+"/v1/bot/docs", "", "bot-token", "internal-token", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})

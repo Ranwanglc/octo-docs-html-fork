@@ -47,20 +47,29 @@ type Rename struct {
 // Client posts registration mutations. Empty URL returns nil from New; all
 // methods are nil-safe and never return errors to callers.
 type Client struct {
-	registerURL   string
-	botToken      string
-	internalToken string
-	http          *http.Client
-	logger        *slog.Logger
+	registerURL string
+	// internalRegisterURL, when non-empty, is the explicit user-publish
+	// /internal/html/register endpoint used verbatim. It lets the internal
+	// register endpoint live on a different origin/port than the bot-facing
+	// registerURL (docs-backend INTERNAL_HTTP_PORT split, PR #181). Empty ⇒
+	// derive from registerURL, preserving today's single-origin behavior
+	// byte-for-byte.
+	internalRegisterURL string
+	botToken            string
+	internalToken       string
+	http                *http.Client
+	logger              *slog.Logger
 }
 
 // New wires the registrar. registerURL is the full POST endpoint, usually
 // <docs-backend>/v1/bot/docs. token is sent as a bot Bearer token.
-func New(registerURL, botToken, internalToken string, logger *slog.Logger) *Client {
-	return newWithTimeout(registerURL, botToken, internalToken, defaultTimeout, logger)
+// internalRegisterURL is the optional explicit user-publish endpoint; empty
+// falls back to deriving it from registerURL.
+func New(registerURL, internalRegisterURL, botToken, internalToken string, logger *slog.Logger) *Client {
+	return newWithTimeout(registerURL, internalRegisterURL, botToken, internalToken, defaultTimeout, logger)
 }
 
-func newWithTimeout(registerURL, botToken, internalToken string, timeout time.Duration, logger *slog.Logger) *Client {
+func newWithTimeout(registerURL, internalRegisterURL, botToken, internalToken string, timeout time.Duration, logger *slog.Logger) *Client {
 	registerURL = strings.TrimRight(strings.TrimSpace(registerURL), "/")
 	if registerURL == "" {
 		return nil
@@ -72,9 +81,10 @@ func newWithTimeout(registerURL, botToken, internalToken string, timeout time.Du
 		logger = slog.Default()
 	}
 	return &Client{
-		registerURL:   registerURL,
-		botToken:      strings.TrimSpace(botToken),
-		internalToken: strings.TrimSpace(internalToken),
+		registerURL:         registerURL,
+		internalRegisterURL: strings.TrimRight(strings.TrimSpace(internalRegisterURL), "/"),
+		botToken:            strings.TrimSpace(botToken),
+		internalToken:       strings.TrimSpace(internalToken),
 		http: &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}},
@@ -89,7 +99,13 @@ func (c *Client) Register(ctx context.Context, reg Registration, token string) (
 	}
 	endpoint := c.registerURL
 	if reg.Internal {
-		endpoint = internalRegisterURL(endpoint)
+		// Explicit config wins and is used verbatim (no suffix derivation);
+		// empty falls back to deriving from the bot-facing registerURL.
+		if c.internalRegisterURL != "" {
+			endpoint = c.internalRegisterURL
+		} else {
+			endpoint = internalRegisterURL(endpoint)
+		}
 		if c.internalToken == "" {
 			return nil, fmt.Errorf("docs-backend internal register token is not configured")
 		}

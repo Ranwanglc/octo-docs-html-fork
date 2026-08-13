@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -97,6 +98,14 @@ type Config struct {
 	// DocsBackendInternalRegisterToken authenticates user HTML upserts with
 	// X-Internal-Token. It is intentionally separate from the bot Bearer token.
 	DocsBackendInternalRegisterToken string
+	// DocsBackendInternalRegisterURL is the explicit user-publish
+	// /internal/html/register endpoint. Empty ⇒ derive it from
+	// DocsBackendRegisterURL (strip the /v1/bot/docs suffix, append
+	// /internal/html/register) — today's single-origin behavior. Set it only when
+	// docs-backend enables its internal/external port split (INTERNAL_HTTP_PORT,
+	// PR #181) so the internal endpoint lives on a different origin/port than the
+	// bot-facing base URL. Not a secret (an internal address).
+	DocsBackendInternalRegisterURL string
 	// TrustProxyHeaders enables honoring X-Forwarded-For / X-Real-IP for the client
 	// IP (rate limiting). Enable ONLY when the server sits behind a trusted reverse
 	// proxy that sets these; otherwise a client can spoof them to evade limits.
@@ -170,6 +179,7 @@ func Load() (*Config, error) {
 		DocsBackendRegisterURL:           strings.TrimRight(strings.TrimSpace(env("DOCS_BACKEND_REGISTER_URL", "")), "/"),
 		DocsBackendRegisterToken:         env("DOCS_BACKEND_REGISTER_TOKEN", ""),
 		DocsBackendInternalRegisterToken: env("DOCS_BACKEND_INTERNAL_REGISTER_TOKEN", ""),
+		DocsBackendInternalRegisterURL:   strings.TrimRight(strings.TrimSpace(env("DOCS_BACKEND_INTERNAL_REGISTER_URL", "")), "/"),
 
 		TrustProxyHeaders: envBool("TRUST_PROXY_HEADERS", false),
 		CORSOrigins:       splitList(env("CORS_ORIGINS", "")),
@@ -303,6 +313,15 @@ func (c *Config) Validate() error {
 	// requiring them when an endpoint is set.
 	if c.S3Endpoint != "" && (c.S3AccessKeyID == "" || c.S3SecretKey == "") {
 		problems = append(problems, "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required when S3_ENDPOINT is set")
+	}
+	// An explicit internal register URL is optional, but a typo'd internal
+	// address should fail at boot, not silently on every user publish. Require a
+	// parseable http(s) URL when set; empty stays inert (derives from
+	// DOCS_BACKEND_REGISTER_URL).
+	if c.DocsBackendInternalRegisterURL != "" {
+		if u, err := url.Parse(c.DocsBackendInternalRegisterURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, fmt.Sprintf("DOCS_BACKEND_INTERNAL_REGISTER_URL must be an http(s) URL, got %q", c.DocsBackendInternalRegisterURL))
+		}
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("invalid configuration:\n  - %s", strings.Join(problems, "\n  - "))

@@ -70,6 +70,7 @@ services:
       DOCS_BACKEND_REGISTER_URL: ${DOCS_BACKEND_REGISTER_URL:-}
       DOCS_BACKEND_REGISTER_TOKEN: ${DOCS_BACKEND_REGISTER_TOKEN:-}
       DOCS_BACKEND_INTERNAL_REGISTER_TOKEN: ${DOCS_BACKEND_INTERNAL_REGISTER_TOKEN:-}
+      DOCS_BACKEND_INTERNAL_REGISTER_URL: ${DOCS_BACKEND_INTERNAL_REGISTER_URL:-}
 
       # ── Production-safe auth default ────────────────────────────────────────
       # Base compose defaults ALLOW_BOOTSTRAP=true (dev convenience); force false.
