@@ -23,6 +23,7 @@ type CanonicalDocumentDeletedError struct{}
 
 func (*CanonicalDocumentDeletedError) Error() string { return "canonical document deleted" }
 
+// IsCanonicalDocumentDeleted reports the terminal canonical replay condition.
 func IsCanonicalDocumentDeleted(err error) bool {
 	_, ok := err.(*CanonicalDocumentDeletedError)
 	return ok
@@ -36,6 +37,7 @@ func (*RegistrationContractIncompleteError) Error() string {
 	return "docs-backend canonical registration response missing publisherUid/spaceId"
 }
 
+// IsRegistrationContractIncomplete reports a missing canonical identity contract.
 func IsRegistrationContractIncomplete(err error) bool {
 	_, ok := err.(*RegistrationContractIncompleteError)
 	return ok
@@ -191,6 +193,7 @@ func (c *Client) DeleteCanonical(ctx context.Context, slug, token string) error 
 	return err
 }
 
+// Published notifies docs-backend that canonical content is durable.
 func (c *Client) Published(ctx context.Context, docID, title, token string) error {
 	if c == nil {
 		return fmt.Errorf("docs-backend registrar is disabled")
