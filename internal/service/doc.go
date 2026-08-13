@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -47,6 +48,8 @@ type DocRegistrar interface {
 	Rename(ctx context.Context, slug, title, token string)
 	Delete(ctx context.Context, slug, token string)
 }
+
+type lockerProvider interface{ Locker() sluglock.Locker }
 
 // NewDocService constructs a DocService. The locker MUST be the same instance the
 // CommentService uses, so that a publish (which holds the slug lock across the
@@ -124,7 +127,12 @@ type PublishInput struct {
 	// PublisherToken is the publishing bot's own bearer token, forwarded to the
 	// docs-backend registration so the doc is attributed to whoever published it.
 	// Empty ⇒ the registrar falls back to its process-configured token.
-	PublisherToken      string
+	PublisherToken string
+	// IdempotencyKey selects canonical creation. It is intentionally separate
+	// from legacy slug publishing so the old path remains unchanged.
+	IdempotencyKey      string
+	PublisherUID        string
+	PublisherSpaceID    string
 	SpaceID             string
 	UserPublish         bool
 	AuthorizeProvenance ProvenanceAuthorizer
@@ -173,6 +181,8 @@ type PublishResult struct {
 	userPublish    bool
 }
 
+type canonicalIdentity struct{ docID, shareURL string }
+
 // RenderData is the render payload for a document version.
 type RenderData struct {
 	HTML     string
@@ -205,6 +215,9 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 // PublishAuthorized publishes after authorize checks the slug's current
 // existence while the per-slug lock is held.
 func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(exists bool) error) (*PublishResult, error) {
+	if strings.TrimSpace(in.IdempotencyKey) != "" || strings.TrimSpace(in.Slug) == "" {
+		return s.publishCanonicalAuthorized(ctx, in, authorize)
+	}
 	if in.HTML == "" {
 		return nil, apperr.Validation("html (file) required", "html_required")
 	}
@@ -273,6 +286,83 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 		return nil, err
 	}
 	s.afterPublished(ctx, result)
+	return result, nil
+}
+
+// publishCanonicalAuthorized is an additive identity-first create path. Backend
+// registration allocates the durable d_* key before the one local critical
+// section begins; legacy publishes above retain their existing lock and flow.
+func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishInput, authorize func(bool) error) (*PublishResult, error) {
+	if in.HTML == "" {
+		return nil, apperr.Validation("html (file) required", "html_required")
+	}
+	if int64(len(in.HTML)) > s.maxBytes {
+		return nil, apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
+	}
+	if strings.TrimSpace(in.IdempotencyKey) == "" {
+		return nil, apperr.Validation("idempotency_key required for canonical create", "idempotency_key_required")
+	}
+	if strings.TrimSpace(in.Slug) != "" {
+		return nil, apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if strings.TrimSpace(in.PublisherToken) == "" {
+		return nil, apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
+	}
+	if s.register == nil {
+		return nil, apperr.Upstream("docs-backend registrar is disabled", "registration_failed", nil)
+	}
+	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
+	if err != nil {
+		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
+	}
+	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
+		s.register.Delete(ctx, reg.DocID, in.PublisherToken)
+		return nil, apperr.Upstream("docs-backend returned invalid document identity", "registration_invalid", nil)
+	}
+	if (in.PublisherUID != "" || in.PublisherSpaceID != "") && (in.PublisherUID == "" || in.PublisherSpaceID == "" || reg.PublisherUID != in.PublisherUID || reg.SpaceID != in.PublisherSpaceID) {
+		return nil, apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
+	}
+	in.Slug = reg.DocID
+	identity := &canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
+	provider, ok := s.meta.(lockerProvider)
+	if !ok || provider.Locker() == nil {
+		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
+	}
+	stamped := core.StampAids(in.HTML)
+	var result *PublishResult
+	err = provider.Locker().With(ctx, in.Slug, func() error {
+		// An idempotency replay must return the original write, never mint v2.
+		if versions, e := s.blobs.ListVersions(ctx, in.Slug); e != nil {
+			return e
+		} else if len(versions) > 0 {
+			latest := versions[0]
+			for _, v := range versions[1:] {
+				if v > latest {
+					latest = v
+				}
+			}
+			meta, e := s.meta.GetMeta(ctx, in.Slug)
+			if e != nil {
+				return e
+			}
+			if meta != nil {
+				result = &PublishResult{Slug: in.Slug, Version: latest, URL: reg.ShareURL, DocID: in.Slug, ShareURL: reg.ShareURL, Registered: true, Status: publishStatusPublished, title: meta.Title}
+				return nil
+			}
+		}
+		if authorize != nil {
+			if e := authorize(false); e != nil {
+				return e
+			}
+		}
+		r, e := s.publishLocked(ctx, in, stamped)
+		result = r
+		return e
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
 	return result, nil
 }
 
@@ -1391,6 +1481,11 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
+	}
+	if strings.HasPrefix(in.Slug, "d_") && strings.TrimSpace(in.IdempotencyKey) != "" {
+		extra[storage.CanonicalDocIDExtraKey] = in.Slug
+		// The URL is supplied by the registration result after the write; the
+		// marker alone is sufficient for type routing during this request.
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,
