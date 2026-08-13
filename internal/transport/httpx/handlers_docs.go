@@ -34,6 +34,7 @@ type publishBody struct {
 	ThreadID         string
 	SpaceID          string
 	SpaceIDPresent   bool
+	IdempotencyKey   string
 }
 
 func (s *Server) readPublishBody(w http.ResponseWriter, r *http.Request) (publishBody, error) {
@@ -59,6 +60,7 @@ func (s *Server) readMultipart(r *http.Request) (publishBody, error) {
 	b.GroupNo = r.FormValue("group_no")
 	b.ThreadID = r.FormValue("thread_id")
 	b.SpaceID = r.FormValue("space_id")
+	b.IdempotencyKey = r.FormValue("idempotency_key")
 	_, b.SpaceIDPresent = r.MultipartForm.Value["space_id"]
 	if file, _, err := r.FormFile("file"); err == nil {
 		defer func() { _ = file.Close() }()
@@ -85,10 +87,11 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 		Comments []core.Comment `json:"comments"`
 		// Mount info forwarded to docs-backend registration. snake_case matches the
 		// rest of the publish contract; the bot supplies where it is publishing.
-		MountType *string `json:"mount_type"`
-		GroupNo   string  `json:"group_no"`
-		ThreadID  string  `json:"thread_id"`
-		SpaceID   *string `json:"space_id"`
+		MountType      *string `json:"mount_type"`
+		GroupNo        string  `json:"group_no"`
+		ThreadID       string  `json:"thread_id"`
+		SpaceID        *string `json:"space_id"`
+		IdempotencyKey string  `json:"idempotency_key"`
 	}
 	if r.Body != nil {
 		// Publish bodies carry the document HTML, so cap at the HTML limit plus JSON
@@ -113,7 +116,7 @@ func (s *Server) readJSONPublish(w http.ResponseWriter, r *http.Request) (publis
 	}
 	body := publishBody{
 		Slug: raw.Slug, HTML: raw.HTML, Version: raw.Version, Title: title, LocalComments: raw.Comments,
-		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID,
+		GroupNo: raw.GroupNo, ThreadID: raw.ThreadID, IdempotencyKey: raw.IdempotencyKey,
 	}
 	if raw.SpaceID != nil {
 		body.SpaceID = *raw.SpaceID
@@ -145,9 +148,22 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	slug, err := requireSlug(body.Slug)
-	if err != nil {
-		return err
+	slug := strings.TrimSpace(body.Slug)
+	if slug != "" {
+		var err error
+		slug, err = requireSlug(slug)
+		if err != nil {
+			return err
+		}
+	}
+	if body.IdempotencyKey != "" && slug != "" {
+		return apperr.Validation("canonical create must not include slug", "create_ref_forbidden")
+	}
+	if body.IdempotencyKey == "" && slug == "" {
+		return apperr.Validation("idempotency_key required for canonical create", "idempotency_key_required")
+	}
+	if body.IdempotencyKey != "" && botSessionFromCtx(r.Context()) == nil {
+		return apperr.Unauthorized("canonical create requires bot authentication", "publisher_bot_required")
 	}
 	if body.HTML == "" {
 		return apperr.Validation("html (file) required", "html_required")
@@ -178,6 +194,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:          creatorUID,
 		PublisherToken:      botTokenFromCtx(r.Context()),
+		IdempotencyKey:      body.IdempotencyKey,
 		SpaceID:             spaceID,
 		UserPublish:         userPublish,
 		AuthorizeProvenance: s.provenanceAuthorizer(r),
