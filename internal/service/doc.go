@@ -927,59 +927,63 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			return apperr.Forbidden("registration publisher identity mismatch", "registration_identity_mismatch")
 		}
 		in.Slug = reg.DocID
-		if registered {
-			if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
-				return stateErr
-			} else if exists {
-				return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
-			}
-		}
-		prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
-		if e != nil {
-			return e
-		}
-		if prev != nil {
-			if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
-				// A promoted canonical draft has durable published content. Check it
-				// before the mutable draft slot so a failed DeleteDraft can never
-				// make a replay return a stale draft URL.
-				versions, versionErr := s.blobs.ListVersions(ctx, in.Slug)
-				if versionErr != nil {
-					return versionErr
+		// Canonical creation takes idem then slug. Legacy publishing takes only
+		// the slug lock, so it can never wait on idem and this order has no cycle.
+		return s.lock.With(ctx, reg.DocID, func() error {
+			if registered {
+				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
+					return stateErr
+				} else if exists {
+					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
 				}
-				if len(versions) > 0 || len(prev.Versions) > 0 {
-					if docID, shareURL, canonical := prev.CanonicalIdentity(); canonical {
-						result = &DraftResult{Slug: in.Slug, DocID: docID, URL: shareURL}
+			}
+			prev, normalized, e := s.prepareDraftProvenance(ctx, in.Slug, in)
+			if e != nil {
+				return e
+			}
+			if prev != nil {
+				if marker, ok := prev.Extra[storage.CanonicalDraftCreateExtraKey]; ok && marker != nil {
+					// A promoted canonical draft has durable published content. Check it
+					// before the mutable draft slot so a failed DeleteDraft can never
+					// make a replay return a stale draft URL.
+					versions, versionErr := s.blobs.ListVersions(ctx, in.Slug)
+					if versionErr != nil {
+						return versionErr
+					}
+					if len(versions) > 0 || len(prev.Versions) > 0 {
+						if docID, shareURL, canonical := prev.CanonicalIdentity(); canonical {
+							result = &DraftResult{Slug: in.Slug, DocID: docID, URL: shareURL}
+							registered = false
+							return nil
+						}
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					}
+					draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug)
+					if derr != nil {
+						return derr
+					}
+					if exists {
+						result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: canonicalDraftAIDCount(prev.Extra[storage.CanonicalDraftAIDsExtraKey])}
 						registered = false
 						return nil
 					}
-					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
-				}
-				draft, exists, derr := s.blobs.GetDraft(ctx, in.Slug)
-				if derr != nil {
-					return derr
-				}
-				if exists {
-					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: int64(len(draft)), AIDs: canonicalDraftAIDCount(prev.Extra[storage.CanonicalDraftAIDsExtraKey])}
+					result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
 					registered = false
 					return nil
 				}
-				result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug)}
-				registered = false
-				return nil
 			}
-		}
-		size, e := s.blobs.PutDraft(ctx, in.Slug, stamped.HTML)
-		if e != nil {
-			return apperr.Upstream("draft write failed", "draft_write_failed", e)
-		}
-		canonicalDraft := &canonicalDraftIdentity{docID: reg.DocID, shareURL: reg.ShareURL, aids: len(stamped.AIDs)}
-		if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized, canonicalDraft); e != nil {
-			return e
-		}
-		result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
-		registered = false
-		return nil
+			size, e := s.blobs.PutDraft(ctx, in.Slug, stamped.HTML)
+			if e != nil {
+				return apperr.Upstream("draft write failed", "draft_write_failed", e)
+			}
+			canonicalDraft := &canonicalDraftIdentity{docID: reg.DocID, shareURL: reg.ShareURL, aids: len(stamped.AIDs)}
+			if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized, canonicalDraft); e != nil {
+				return e
+			}
+			result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
+			registered = false
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err

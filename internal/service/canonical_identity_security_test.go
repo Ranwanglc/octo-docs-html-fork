@@ -20,6 +20,7 @@ type canonicalTestRegistrar struct {
 	result    *docsbackend.RegistrationResult
 	registers int
 	deletes   int
+	deletedID []string
 	published int
 	renamed   int
 }
@@ -36,10 +37,11 @@ func (r *canonicalTestRegistrar) Rename(context.Context, string, string, string)
 	r.renamed++
 }
 func (*canonicalTestRegistrar) Delete(context.Context, string, string) {}
-func (r *canonicalTestRegistrar) DeleteCanonical(context.Context, string, string) error {
+func (r *canonicalTestRegistrar) DeleteCanonical(_ context.Context, docID string, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deletes++
+	r.deletedID = append(r.deletedID, docID)
 	return nil
 }
 func (r *canonicalTestRegistrar) Published(context.Context, string, string, string) error {
@@ -532,6 +534,53 @@ func TestCanonicalCreateRacingLegacyPublishKeepsCanonicalIdentity(t *testing.T) 
 	}
 	if _, _, ok := meta.CanonicalIdentity(); ok || meta == nil {
 		t.Fatalf("legacy metadata overwritten by canonical cleanup: %+v", meta)
+	}
+}
+
+func TestCanonicalDraftCreateRacingLegacyPublishRollsBackCanonicalIdentity(t *testing.T) {
+	store := memory.New()
+	baseLock := sluglock.NewMemory()
+	lock := &gateFirstSlugLock{Locker: baseLock, entered: make(chan struct{}), release: make(chan struct{}), slug: "d_draft_collision"}
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_collision", OctoDocSlug: "d_draft_collision", ShareURL: "https://docs/d_draft_collision", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(store, store, NewCommentService(store, baseLock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+
+	canonicalDone := make(chan error, 1)
+	go func() {
+		_, err := docs.CreateCanonicalDraft(context.Background(), canonicalInput())
+		canonicalDone <- err
+	}()
+	<-lock.entered
+	legacy, err := docs.Publish(context.Background(), PublishInput{Slug: "d_draft_collision", HTML: "<p>legacy racing write</p>"})
+	if err != nil {
+		t.Fatalf("legacy publish: %v", err)
+	}
+	if legacy.DocID != "" || legacy.Registered {
+		t.Fatalf("legacy result=%+v, want legacy publication", legacy)
+	}
+	close(lock.release)
+	err = <-canonicalDone
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "canonical_identity_conflict" {
+		t.Fatalf("canonical draft=%v, want collision conflict", err)
+	}
+	if html, ok, getErr := store.GetDoc(context.Background(), "d_draft_collision", 1); getErr != nil || !ok || html != "<p>legacy racing write</p>" {
+		t.Fatalf("legacy content html=%q ok=%t err=%v", html, ok, getErr)
+	}
+	meta, err := store.GetMeta(context.Background(), "d_draft_collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta == nil {
+		t.Fatal("legacy metadata missing")
+	}
+	if _, _, ok := meta.CanonicalIdentity(); ok {
+		t.Fatalf("legacy metadata overwritten by canonical cleanup: %+v", meta)
+	}
+	registrar.mu.Lock()
+	deletes, deletedID := registrar.deletes, append([]string(nil), registrar.deletedID...)
+	registrar.mu.Unlock()
+	if deletes != 1 || len(deletedID) != 1 || deletedID[0] != "d_draft_collision" {
+		t.Fatalf("rollback deletes=%d ids=%v, want d_draft_collision", deletes, deletedID)
 	}
 }
 
