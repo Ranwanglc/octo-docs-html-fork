@@ -20,6 +20,7 @@ type canonicalTestRegistrar struct {
 	registers int
 	deletes   int
 	published int
+	renamed   int
 }
 
 func (r *canonicalTestRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
@@ -28,8 +29,12 @@ func (r *canonicalTestRegistrar) Register(context.Context, docsbackend.Registrat
 	r.registers++
 	return r.result, nil
 }
-func (*canonicalTestRegistrar) Rename(context.Context, string, string, string) {}
-func (*canonicalTestRegistrar) Delete(context.Context, string, string)         {}
+func (r *canonicalTestRegistrar) Rename(context.Context, string, string, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.renamed++
+}
+func (*canonicalTestRegistrar) Delete(context.Context, string, string) {}
 func (r *canonicalTestRegistrar) DeleteCanonical(context.Context, string, string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -144,6 +149,24 @@ func TestCanonicalMarkedSlugRepublishesWithoutReregistration(t *testing.T) {
 	}
 	if result.Version != 2 || !result.Registered || result.DocID != "d_republish" {
 		t.Fatalf("republish result=%+v", result)
+	}
+}
+
+func TestCanonicalRepublishRenamesChangedTitle(t *testing.T) {
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_rename", OctoDocSlug: "d_rename", ShareURL: "https://docs/d_rename", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs, _ := canonicalTestDocs(t, registrar)
+	in := canonicalInput()
+	in.Title = "First"
+	if _, err := docs.Publish(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.PublishAuthorized(context.Background(), PublishInput{Slug: "d_rename", HTML: "<p>updated</p>", Title: "Second", PublisherToken: "bot-token"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	registrar.mu.Lock()
+	defer registrar.mu.Unlock()
+	if registrar.renamed != 1 {
+		t.Fatalf("renames=%d, want 1", registrar.renamed)
 	}
 }
 

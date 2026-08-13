@@ -303,6 +303,9 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 		return nil, err
 	}
 	if canonicalUpdate {
+		if result.titleChanged && s.register != nil {
+			s.renameCanonical(ctx, result.Slug, result.title, result.publisherToken)
+		}
 		return result, nil
 	}
 	s.afterPublished(ctx, result)
@@ -350,7 +353,9 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	registered := reg.Created
 	defer func() {
 		if registered {
-			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
+			rollbackCtx, cancel := detachedSideEffectContext(ctx)
+			_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+			cancel()
 		}
 	}()
 	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
@@ -372,7 +377,9 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 		// the first attempt would delete the replay's durable identity.
 		defer func() {
 			if registered {
-				_ = s.register.DeleteCanonical(context.Background(), reg.DocID, in.PublisherToken)
+				rollbackCtx, cancel := detachedSideEffectContext(ctx)
+				_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+				cancel()
 				registered = false
 			}
 		}()
@@ -876,7 +883,9 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	registered := reg.Created
 	defer func() {
 		if registered {
-			_ = s.register.DeleteCanonical(ctx, reg.DocID, in.PublisherToken)
+			rollbackCtx, cancel := detachedSideEffectContext(ctx)
+			_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+			cancel()
 		}
 	}()
 	if config.SafeSlug(reg.DocID) == "" || reg.OctoDocSlug != reg.DocID {
@@ -896,7 +905,9 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		// a replay cannot commit this identity before a failed attempt deletes it.
 		defer func() {
 			if registered {
-				_ = s.register.DeleteCanonical(context.Background(), reg.DocID, in.PublisherToken)
+				rollbackCtx, cancel := detachedSideEffectContext(ctx)
+				_ = s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken)
+				cancel()
 				registered = false
 			}
 		}()
@@ -1213,6 +1224,9 @@ func (s *DocService) promoteAuthorized(ctx context.Context, slug, title, publish
 	if canonical != nil {
 		result.DocID, result.URL, result.ShareURL, result.Registered = canonical.docID, canonical.shareURL, canonical.shareURL, true
 		result.Status = publishStatusPublished
+		if result.titleChanged && s.register != nil {
+			s.renameCanonical(ctx, result.Slug, result.title, publisherToken)
+		}
 		s.notifyCanonicalPublished(ctx, result, publisherToken)
 		return result, nil
 	}
@@ -1566,16 +1580,15 @@ type canonicalPublishedNotifier interface {
 }
 
 func (s *DocService) notifyCanonicalPublished(parent context.Context, result *PublishResult, token string) {
-	if result == nil || strings.TrimSpace(token) == "" {
+	if result == nil {
 		return
 	}
 	notifier, ok := s.register.(canonicalPublishedNotifier)
 	if !ok {
 		return
 	}
-	if parent == nil {
-		parent = context.Background()
-	}
+	parent, cancel := detachedSideEffectContext(parent)
+	defer cancel()
 	var err error
 	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(parent, docsBackendAttemptTimeout)
@@ -1589,6 +1602,19 @@ func (s *DocService) notifyCanonicalPublished(parent context.Context, result *Pu
 		}
 	}
 	s.log().Error("publish_notification_failed", "doc_id", result.DocID, "attempts", docsBackendRegisterAttempts, "err", err.Error())
+}
+
+func detachedSideEffectContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), docsBackendSideEffectTimeout)
+}
+
+func (s *DocService) renameCanonical(parent context.Context, slug, title, token string) {
+	ctx, cancel := detachedSideEffectContext(parent)
+	defer cancel()
+	s.register.Rename(ctx, slug, title, token)
 }
 
 func (s *DocService) afterLegacyPublished(parent context.Context, result *PublishResult) {

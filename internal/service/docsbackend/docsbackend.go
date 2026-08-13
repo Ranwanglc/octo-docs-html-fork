@@ -199,9 +199,6 @@ func (c *Client) Published(ctx context.Context, docID, title, token string) erro
 	if c == nil {
 		return fmt.Errorf("docs-backend registrar is disabled")
 	}
-	if strings.TrimSpace(token) == "" {
-		return fmt.Errorf("docs-backend publish notification requires publisher token")
-	}
 	_, err := c.doJSON(ctx, http.MethodPost, c.registerURL+"/"+url.PathEscape(docID)+"/published", Rename{Title: title}, docID, "published", token, false)
 	return err
 }
