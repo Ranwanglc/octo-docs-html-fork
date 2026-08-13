@@ -339,6 +339,12 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
 	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 	if err != nil {
+		if docsbackend.IsCanonicalDocumentDeleted(err) {
+			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
+		}
+		if docsbackend.IsRegistrationContractIncomplete(err) {
+			return nil, apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
+		}
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
 	registered := true
@@ -414,6 +420,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	}
 	registered = false
 	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
+	s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
 	return result, nil
 }
 
@@ -846,6 +853,12 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
 	reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 	if err != nil {
+		if docsbackend.IsCanonicalDocumentDeleted(err) {
+			return nil, apperr.Conflict("canonical document was deleted", "canonical_document_deleted")
+		}
+		if docsbackend.IsRegistrationContractIncomplete(err) {
+			return nil, apperr.Upstream("docs-backend registration response lacks publisher identity", "registration_contract_incomplete", err)
+		}
 		return nil, apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 	}
 	registered := true
@@ -1467,6 +1480,39 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 			s.log().Error("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
 		}
 	}
+}
+
+// canonicalPublishedNotifier is deliberately optional so existing legacy
+// registrars retain their historical contract. docsbackend.Client implements
+// it to learn when a canonical document's first durable version is committed.
+type canonicalPublishedNotifier interface {
+	Published(ctx context.Context, docID, title, token string) error
+}
+
+func (s *DocService) notifyCanonicalPublished(parent context.Context, result *PublishResult, token string) {
+	if result == nil || strings.TrimSpace(token) == "" {
+		return
+	}
+	notifier, ok := s.register.(canonicalPublishedNotifier)
+	if !ok {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	var err error
+	for attempt := 1; attempt <= docsBackendRegisterAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(parent, docsBackendAttemptTimeout)
+		err = notifier.Published(attemptCtx, result.DocID, result.title, token)
+		cancel()
+		if err == nil {
+			return
+		}
+		if attempt < docsBackendRegisterAttempts && !waitForRetry(parent, docsBackendRegisterDelay) {
+			break
+		}
+	}
+	s.log().Error("publish_notification_failed", "doc_id", result.DocID, "attempts", docsBackendRegisterAttempts, "err", err.Error())
 }
 
 func (s *DocService) afterLegacyPublished(parent context.Context, result *PublishResult) {
