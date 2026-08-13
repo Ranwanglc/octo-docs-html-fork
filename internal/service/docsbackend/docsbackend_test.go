@@ -2,6 +2,8 @@ package docsbackend
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +11,20 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCanonicalRegistrationTerminalErrorsAreClassifiedThroughWrapping(t *testing.T) {
+	deleted := fmt.Errorf("wrapped: %w", &CanonicalDocumentDeletedError{})
+	if !IsCanonicalDocumentDeleted(deleted) {
+		t.Fatal("wrapped deleted error was not classified")
+	}
+	incomplete := fmt.Errorf("wrapped: %w", &RegistrationContractIncompleteError{})
+	if !IsRegistrationContractIncomplete(incomplete) {
+		t.Fatal("wrapped contract error was not classified")
+	}
+	if IsCanonicalDocumentDeleted(errors.New("other")) || IsRegistrationContractIncomplete(errors.New("other")) {
+		t.Fatal("unrelated error was classified")
+	}
+}
 
 func TestInternalRegisterAndBotDeleteURLs(t *testing.T) {
 	requests := make(chan *http.Request, 2)
