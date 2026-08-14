@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -568,6 +569,107 @@ func TestDiffHunkLineNumbersAddressTheSource(t *testing.T) {
 				offset++
 			}
 		}
+	}
+}
+
+// Several separated edits must each address the real files. A single-hunk input
+// cannot catch counter drift, and checking only "-"/context lines against before
+// leaves the "+" side unverified — both gaps hid a +contextBefore per-hunk drift.
+func TestDiffMultipleHunkLineNumbersAddressBothSources(t *testing.T) {
+	const lines = 60
+	beforeLines := make([]string, 0, lines)
+	afterLines := make([]string, 0, lines)
+	edited := map[int]bool{8: true, 22: true, 36: true, 50: true}
+	for i := 1; i <= lines; i++ {
+		beforeLines = append(beforeLines, fmt.Sprintf("<p>line %d</p>", i))
+		if edited[i] {
+			afterLines = append(afterLines, fmt.Sprintf("<p>edited %d</p>", i))
+		} else {
+			afterLines = append(afterLines, fmt.Sprintf("<p>line %d</p>", i))
+		}
+	}
+	hunks, truncated, err := diffSourceLines(strings.Join(beforeLines, "\n"), strings.Join(afterLines, "\n"))
+	if err != nil {
+		t.Fatalf("diffSourceLines: %v", err)
+	}
+	if truncated {
+		t.Fatalf("input is far under budget but was truncated")
+	}
+	if len(hunks) < 3 {
+		t.Fatalf("got %d hunks; need at least 3 separated clusters to catch drift", len(hunks))
+	}
+	for h, hunk := range hunks {
+		oldOffset, newOffset := 0, 0
+		for _, line := range hunk.Lines {
+			prefix, text := line[0], line[1:]
+			if prefix != '+' {
+				at := hunk.OldStart - 1 + oldOffset
+				if at < 0 || at >= len(beforeLines) || beforeLines[at] != text {
+					t.Fatalf("hunk %d: %q claims before line %d, which holds %q", h, line, at+1, safeLine(beforeLines, at))
+				}
+				oldOffset++
+			}
+			if prefix != '-' {
+				at := hunk.NewStart - 1 + newOffset
+				if at < 0 || at >= len(afterLines) || afterLines[at] != text {
+					t.Fatalf("hunk %d: %q claims after line %d, which holds %q", h, line, at+1, safeLine(afterLines, at))
+				}
+				newOffset++
+			}
+		}
+	}
+}
+
+func safeLine(lines []string, index int) string {
+	if index < 0 || index >= len(lines) {
+		return "<out of range>"
+	}
+	return lines[index]
+}
+
+// The sequence tier must keep working across the whole range maxDiffNodes admits.
+// Its old BMP alphabet held 6400 symbols and silently fell through past that,
+// re-reporting every following sibling as modified after a single insertion.
+func TestDiffSequenceTierHoldsAcrossNodeCap(t *testing.T) {
+	for _, count := range []int{6300, 6400, 7000} {
+		var before, after strings.Builder
+		before.WriteString("<html><body>")
+		after.WriteString("<html><body><p>inserted head</p>")
+		for i := 0; i < count; i++ {
+			fragment := fmt.Sprintf("<p>paragraph %d</p>", i)
+			before.WriteString(fragment)
+			after.WriteString(fragment)
+		}
+		before.WriteString("</body></html>")
+		after.WriteString("</body></html>")
+		result := diffFor(t, before.String(), after.String())
+		if result.Summary.Added != 1 {
+			t.Fatalf("count=%d: Added = %d, want 1", count, result.Summary.Added)
+		}
+		// The inserted node shifts its parent's own signature, so one modification
+		// is expected; anything more means the tier stopped pairing siblings.
+		if result.Summary.Modified > 1 {
+			t.Fatalf("count=%d: Modified = %d, want <= 1 — sequence tier degraded", count, result.Summary.Modified)
+		}
+	}
+}
+
+// Line count must fail closed before DiffLinesToChars, which panics once distinct
+// lines run past the end of Unicode. Short lines reach that inside one document
+// the byte budget accepts, so the byte cap alone does not cover it.
+func TestDiffTooManySourceLinesFailsClosed(t *testing.T) {
+	var doc strings.Builder
+	lines := maxDiffSourceLines/2 + 1
+	doc.Grow(lines * 4)
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&doc, "%3d\n", i)
+	}
+	source := doc.String()
+	if len(source)*2 > maxDiffSourceBytes {
+		t.Fatalf("test input %d bytes/side would trip the byte budget instead", len(source))
+	}
+	if _, _, err := diffSourceLines(source, source); !errors.Is(err, errDiffLimit) {
+		t.Fatalf("err = %v, want errDiffLimit", err)
 	}
 }
 

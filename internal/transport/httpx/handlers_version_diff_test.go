@@ -202,6 +202,10 @@ func TestVersionDiffReturnsBothLayers(t *testing.T) {
 	if strings.Count(rec.Body.String(), "<html") > 2 {
 		t.Fatalf("diff response looks like it carries full documents: %s", rec.Body.String())
 	}
+	// before_html/after_html are raw user bytes, so the JSON must not be sniffable.
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q; want nosniff", got)
+	}
 }
 
 func TestVersionDiffRejectsBadQueries(t *testing.T) {

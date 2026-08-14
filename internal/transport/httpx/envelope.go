@@ -48,9 +48,12 @@ type errorEnvelope struct {
 	Error errorBody `json:"error"`
 }
 
-// writeJSON marshals v at the given status with a JSON content type.
+// writeJSON marshals v at the given status with a JSON content type. nosniff is
+// set because /v1 payloads can reflect user-authored HTML back to the caller
+// (the diff response carries raw document fragments).
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

@@ -24,6 +24,15 @@ const (
 	maxDiffOutputBytes  = 512 << 10
 	diffContextLines    = 3
 
+	// maxDiffSourceLines bounds the combined line count handed to
+	// DiffLinesToChars, which assigns one code point per distinct line and panics
+	// past 1112059 (sergi/go-diff intToRune runs off the end of Unicode). Total
+	// lines is an upper bound on distinct lines, so capping it below that keeps
+	// the encoder in range. 4-byte lines reach the panic inside a single 4.5 MB
+	// document, which the byte budget accepts, so this cap is load-bearing rather
+	// than redundant.
+	maxDiffSourceLines = 1 << 20
+
 	// diffTimeout bounds the line-level search. On expiry the library falls back
 	// to a whole-file replace, so the request still answers.
 	diffTimeout = 2 * time.Second
@@ -299,10 +308,14 @@ func matchDiffBySequence(before, after []diffElement, matched map[int]int, taken
 			key := elements[index].signature
 			symbol, ok := symbols[key]
 			if !ok {
-				// Stay inside the BMP and skip surrogates so every symbol is one rune.
-				next := rune(0xE000 + len(symbols))
-				if next > 0xF8FF {
-					// Signature alphabet exhausted; leave the rest to the positional tier.
+				// Private-use plane 15 holds 65534 code points, well past maxDiffNodes,
+				// so the alphabet cannot run out on input the node cap accepted. The
+				// old BMP range (0xE000-0xF8FF) held only 6400 and silently dropped
+				// this tier above that, restoring the amplification it exists to stop.
+				next := rune(0xF0000 + len(symbols))
+				if next > 0xFFFFD {
+					// Unreachable while maxDiffNodes stays under the alphabet size; the
+					// positional tier still produces a usable answer if it ever is not.
 					return b.String()
 				}
 				symbol = next
@@ -530,8 +543,24 @@ func diffSourceLines(before, after string) ([]CodeHunk, bool, error) {
 	if len(before)+len(after) > maxDiffSourceBytes {
 		return nil, false, errDiffLimit
 	}
+	if countSourceLines(before)+countSourceLines(after) > maxDiffSourceLines {
+		return nil, false, errDiffLimit
+	}
 	ops := sourceLineOps(before, after)
 	return groupSourceHunks(ops)
+}
+
+// countSourceLines counts lines the way DiffLinesToChars splits them: a trailing
+// newline does not open a further line.
+func countSourceLines(value string) int {
+	if value == "" {
+		return 0
+	}
+	count := strings.Count(value, "\n")
+	if !strings.HasSuffix(value, "\n") {
+		count++
+	}
+	return count
 }
 
 // sourceLineOp is one line tagged with its edit kind, in output order.
@@ -650,8 +679,10 @@ func groupSourceHunks(ops []sourceLineOp) ([]CodeHunk, bool, error) {
 			}
 			cursor++
 		}
-		// Advance the running line numbers across everything this hunk consumed.
-		for i := start; i < cursor; i++ {
+		// Advance from index, not start: the loop above already counted the ops in
+		// [start, index) as it walked them, and re-counting them here drifted every
+		// later hunk by its own leading-context width.
+		for i := index; i < cursor; i++ {
 			switch ops[i].kind {
 			case diffLineDelete:
 				oldLine++

@@ -661,8 +661,10 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
 }
 
-// Source returns the immutable published bytes exactly as stored, before the
+// Source returns a version's published bytes exactly as stored, before the
 // render path signs assets or injects the overlay. Version 0 resolves to latest.
+// The bytes are not write-once: publish accepts a caller-supplied version number
+// and overwrites, which is why the handler does not mark them immutable.
 func (s *DocService) Source(ctx context.Context, slug string, version int) (string, int, bool, error) {
 	resolved, err := s.resolveReadVersion(ctx, slug, version)
 	if err != nil {
