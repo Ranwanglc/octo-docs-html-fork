@@ -1124,6 +1124,70 @@ func (s *DocService) setDocsBackendRegistrationState(ctx context.Context, slug, 
 	return updated
 }
 
+// persistDocsBackendDocID durably records the backend-assigned doc id for slug
+// without touching the docs-backend registration state machine.
+//
+// It exists because the userPublish path drives a pending→registered transition
+// (setDocsBackendRegistrationState refuses to write unless the current state is
+// still pending at the same version) while the bot publish path has no pending
+// precondition at all. Reusing that function on the bot path would always fail
+// its optimistic check, so DocID persistence is split out here.
+//
+// Semantics:
+//   - idempotent: an already-recorded identical doc id short-circuits with no write
+//   - never overwrites: an existing *different* non-empty doc id is preserved and
+//     only warned about — a document's backend identity is never silently rewritten
+//   - non-fatal: failures are warned and reported as false; callers must NOT
+//     downgrade an otherwise successful publish, because the document and its
+//     backend registration are already committed and the next write self-heals
+//
+// Returns true when the meta now holds a doc id (written, already present, or
+// deliberately kept), false only when the update could not be applied.
+func (s *DocService) persistDocsBackendDocID(ctx context.Context, slug, docID string) bool {
+	docID = strings.TrimSpace(docID)
+	if slug == "" || docID == "" {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	persisted := false
+	err := s.lock.With(ctx, slug, func() error {
+		meta, err := s.meta.GetMeta(ctx, slug)
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("metadata missing")
+		}
+		if existing, _ := meta.Extra[storage.DocsBackendDocIDExtraKey].(string); strings.TrimSpace(existing) != "" {
+			if strings.TrimSpace(existing) == docID {
+				persisted = true
+				return nil
+			}
+			s.log().Warn("docs_backend_doc_id mismatch after publish; keeping stored identity",
+				"slug", slug, "stored_doc_id", existing, "incoming_doc_id", docID)
+			persisted = true
+			return nil
+		}
+		if meta.Extra == nil {
+			meta.Extra = map[string]any{}
+		}
+		meta.Extra[storage.DocsBackendDocIDExtraKey] = docID
+		if err = s.meta.PutMeta(ctx, slug, *meta); err != nil {
+			return err
+		}
+		persisted = true
+		return nil
+	})
+	if err != nil {
+		// Best-effort by design: the publish itself already succeeded.
+		s.log().Warn("docs_backend_doc_id persist failed after publish", "slug", slug, "doc_id", docID, "err", err.Error())
+		return false
+	}
+	return persisted
+}
+
 func (s *DocService) afterPublished(parent context.Context, result *PublishResult) {
 	if result == nil {
 		return
@@ -1184,6 +1248,12 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 			return
 		}
 	}
+	// Persist the backend-assigned doc id on EVERY registered path, not just
+	// userPublish. The bot path has no pending→registered state machine, so it
+	// previously only echoed the doc id into the response and lost it on restart.
+	// For userPublish this is a no-op: setDocsBackendRegistrationState just wrote
+	// the same value, and persistDocsBackendDocID is idempotent.
+	s.persistDocsBackendDocID(parent, result.Slug, registration.DocID)
 	result.DocID = registration.DocID
 	result.URL = registration.ShareURL
 	result.ShareURL = registration.ShareURL
