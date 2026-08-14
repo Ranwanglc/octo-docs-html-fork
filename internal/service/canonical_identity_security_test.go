@@ -31,8 +31,10 @@ type canonicalTestRegistrar struct {
 // its entire callback. The former nested With design needed two slots/request
 // and deadlocked this cap=2 scenario before a legacy publisher could run.
 type boundedLocker struct {
-	sem   chan struct{}
-	inner sluglock.Locker
+	sem      chan struct{}
+	inner    sluglock.Locker
+	mu       sync.Mutex
+	sessions int
 }
 
 func (l *boundedLocker) enter(ctx context.Context) error {
@@ -55,7 +57,16 @@ func (l *boundedLocker) Session(ctx context.Context, fn func(sluglock.LockSessio
 		return err
 	}
 	defer func() { <-l.sem }()
+	l.mu.Lock()
+	l.sessions++
+	l.mu.Unlock()
 	return l.inner.(sluglock.SessionLocker).Session(ctx, fn)
+}
+
+func (l *boundedLocker) sessionCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.sessions
 }
 
 type gatedRegistrar struct {
@@ -106,6 +117,9 @@ func TestCanonicalSessionLockDoesNotExhaustBoundedPool(t *testing.T) {
 		case <-deadline:
 			t.Fatal("bounded lock pool stalled")
 		}
+	}
+	if got := lock.sessionCount(); got != 3 {
+		t.Fatalf("canonical session calls=%d, want 3", got)
 	}
 }
 
@@ -599,9 +613,9 @@ type gateFirstSlugLock struct {
 	once    sync.Once
 }
 
-func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() error) error {
+func (l *gateFirstSlugLock) waitForSlug(ctx context.Context, slug string) error {
 	if l.slug != "" && slug != l.slug {
-		return l.Locker.With(ctx, slug, fn)
+		return nil
 	}
 	wait := false
 	l.once.Do(func() {
@@ -615,10 +629,41 @@ func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() err
 			return ctx.Err()
 		}
 	}
+	return nil
+}
+
+func (l *gateFirstSlugLock) With(ctx context.Context, slug string, fn func() error) error {
+	if err := l.waitForSlug(ctx, slug); err != nil {
+		return err
+	}
 	return l.Locker.With(ctx, slug, func() error {
 		return fn()
 	})
 }
+
+type gateFirstSlugSession struct {
+	sluglock.LockSession
+	lock *gateFirstSlugLock
+}
+
+func (s *gateFirstSlugSession) Acquire(ctx context.Context, key string) error {
+	if err := s.lock.waitForSlug(ctx, key); err != nil {
+		return err
+	}
+	return s.LockSession.Acquire(ctx, key)
+}
+
+func (l *gateFirstSlugLock) Session(ctx context.Context, fn func(sluglock.LockSession) error) error {
+	sessionLocker, ok := l.Locker.(sluglock.SessionLocker)
+	if !ok {
+		return errors.New("wrapped locker does not support sessions")
+	}
+	return sessionLocker.Session(ctx, func(session sluglock.LockSession) error {
+		return fn(&gateFirstSlugSession{LockSession: session, lock: l})
+	})
+}
+
+var _ sluglock.SessionLocker = (*gateFirstSlugLock)(nil)
 
 func TestCanonicalCreateRacingLegacyPublishKeepsCanonicalIdentity(t *testing.T) {
 	store := memory.New()

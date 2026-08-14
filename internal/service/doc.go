@@ -1727,18 +1727,7 @@ func (s *DocService) ensureCanonicalPublished(ctx context.Context, result *Publi
 	if result == nil || result.DocID == "" {
 		return
 	}
-	meta, err := s.meta.GetMeta(ctx, result.Slug)
-	if err != nil || meta == nil {
-		return
-	}
-	docID, _, canonical := meta.CanonicalIdentity()
-	if !canonical || docID != result.DocID {
-		return
-	}
-	if notified, _ := meta.Extra[storage.CanonicalPublishedNotifiedExtraKey].(bool); notified {
-		return
-	}
-	if !s.notifyCanonicalPublished(ctx, result, token) {
+	if s.lock == nil {
 		return
 	}
 	if err := s.lock.With(ctx, result.Slug, func() error {
@@ -1751,6 +1740,12 @@ func (s *DocService) ensureCanonicalPublished(ctx context.Context, result *Publi
 			return nil
 		}
 		if notified, _ := current.Extra[storage.CanonicalPublishedNotifiedExtraKey].(bool); notified {
+			return nil
+		}
+		// Keep notification and acknowledgement under the same slug lock. Two
+		// serialized idempotency replays otherwise can both observe an
+		// unacknowledged first version and send duplicate notifications.
+		if !s.notifyCanonicalPublished(ctx, result, token) {
 			return nil
 		}
 		extra := map[string]any{}
