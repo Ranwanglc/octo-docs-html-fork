@@ -93,8 +93,11 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
 		r.Get("/docs/{slug}/versions", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersions))))
 		r.Get("/docs/{slug}/versions/{version}/source", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersionSource))))
-		// Diff parses two documents per call, so it is rate-limited like a write
-		// even though it only reads.
+		// Diff parses two documents per call, so it is bucketed with the writes
+		// rather than the free reads. NOTE: this is not a load guarantee — the
+		// limiter keys on a caller-supplied Bearer, which an identity arriving by
+		// cookie, ?code= or trust header can rotate freely (tracked separately).
+		// The endpoint's own input and time budgets are the real bound.
 		r.Get("/docs/{slug}/diff", s.cors(s.requireDocReadJSON(slugFromPath, s.limit(writeLimiter, false, s.wrap(s.handleVersionDiff)))))
 		r.With(s.requireDocManage).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
 		// Draft slot. Draft-first creation must work before any version exists, so

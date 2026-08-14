@@ -10,8 +10,8 @@ require (
 	github.com/aws/smithy-go v1.27.2
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-sql-driver/mysql v1.10.0
-	github.com/hexops/gotextdiff v1.0.3
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/sergi/go-diff v1.4.0
 	golang.org/x/net v0.57.0
 )
 

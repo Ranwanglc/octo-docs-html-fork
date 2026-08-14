@@ -2,9 +2,10 @@ package httpx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"hash/crc32"
 	"io"
 	"net/http"
 	"strconv"
@@ -422,7 +423,11 @@ func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) err
 	if !ok {
 		return apperr.NotFound("document version not found")
 	}
-	etag := `"` + strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(source))), 16) + "-" + strconv.Itoa(len(source)) + `"`
+	// sha256, not a checksum: the bytes are attacker-authored, and CRC32 is
+	// linear enough that an equal-length collision is constructible. A colliding
+	// successor version would answer 304 and leave the client on stale bytes.
+	digest := sha256.Sum256([]byte(source))
+	etag := `"` + strconv.Itoa(resolved) + "-" + hex.EncodeToString(digest[:16]) + `"`
 	w.Header().Set("ETag", etag)
 	w.Header().Set("X-Document-Version", strconv.Itoa(resolved))
 	// Reads answer Access-Control-Allow-Origin: *, so a cross-origin viewer
@@ -433,9 +438,14 @@ func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) err
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	// Deliberately NOT `immutable`, even for a numbered version. Publish accepts a
+	// caller-supplied version number and PutDoc overwrites, so version N is not
+	// actually write-once; `immutable` would tell the browser to skip
+	// revalidation for a year, serving stale bytes and — because the entry
+	// outlives a share-code rotation or grant removal — bytes the caller may no
+	// longer be allowed to read. Always revalidate; the ETag makes that cheap.
 	if immutable {
-		// A numbered version is immutable; latest is not.
-		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+		w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")
 	} else {
 		w.Header().Set("Cache-Control", "private, no-cache")
 	}

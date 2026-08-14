@@ -5,10 +5,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/hexops/gotextdiff"
-	"github.com/hexops/gotextdiff/myers"
-	"github.com/hexops/gotextdiff/span"
+	"github.com/sergi/go-diff/diffmatchpatch"
 	xhtml "golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
@@ -18,12 +17,16 @@ var errDiffLimit = errors.New("diff complexity limit exceeded")
 const (
 	maxDiffNodes        = 8000
 	maxDiffChanges      = 1000
-	maxDiffSourceLines  = 20000
+	maxDiffSourceBytes  = 8 << 20
 	maxDiffHunkLines    = 2000
 	maxDiffSnippetBytes = 8 << 10
 	maxDiffPathBytes    = 1 << 10
 	maxDiffOutputBytes  = 512 << 10
 	diffContextLines    = 3
+
+	// diffTimeout bounds the line-level search. On expiry the library falls back
+	// to a whole-file replace, so the request still answers.
+	diffTimeout = 2 * time.Second
 
 	aidAttr = "data-odoc-aid"
 )
@@ -154,32 +157,35 @@ func parseDiffElements(source string) ([]diffElement, error) {
 func diffElements(before, after []diffElement) ([]ElementChange, DiffSummary, bool) {
 	matched := map[int]int{}
 	takenAfter := map[int]bool{}
+	// Tier 1: a unique AID is an exact identity that survives a move.
 	matchDiffBy(before, after, matched, takenAfter, func(e diffElement) string {
 		if e.aid == "" {
 			return ""
 		}
 		return "aid:" + e.aid
 	})
+	// Tier 2: an unchanged element in document order. Only stamped elements carry
+	// an AID (core.isStampableTag skips p, li, div, h*, span), so without this
+	// tier prose falls straight to position and a single insertion re-pairs every
+	// following sibling, reporting the whole tail as modified.
+	matchDiffBySequence(before, after, matched, takenAfter)
+	// Tier 3: position, for elements that genuinely changed content.
 	matchDiffBy(before, after, matched, takenAfter, func(e diffElement) string {
 		return "path:" + e.path
 	})
 
-	changes := make([]ElementChange, 0, 16)
+	// Structural changes are collected by kind, then merged under the cap with
+	// adds and removes first: an insertion or deletion is the highest-signal
+	// change, and a single positional shift can produce enough modifications to
+	// crowd it out of the response entirely.
+	var modifications, insertions, deletions []ElementChange
 	summary := DiffSummary{}
-	truncated := false
-	appendChange := func(change ElementChange) {
-		if len(changes) >= maxDiffChanges {
-			truncated = true
-			return
-		}
-		changes = append(changes, change)
-	}
 
 	for beforeIndex, element := range before {
 		afterIndex, ok := matched[beforeIndex]
 		if !ok {
 			summary.Removed++
-			appendChange(ElementChange{
+			deletions = append(deletions, ElementChange{
 				Kind:       "removed",
 				BeforeAID:  element.aid,
 				DOMPath:    element.path,
@@ -189,11 +195,18 @@ func diffElements(before, after []diffElement) ([]ElementChange, DiffSummary, bo
 			continue
 		}
 		counterpart := after[afterIndex]
-		if element.signature == counterpart.signature && element.path == counterpart.path {
+		// Only a signature change is a content change. A matched element whose
+		// signature is identical did not change; its DOM path may still differ
+		// because a sibling was inserted or removed earlier in the document, and
+		// reporting that as "modified" turns one insertion into a modification per
+		// following sibling. The insertion itself is already reported, and the
+		// shift is derivable from before_path/after_path on the changes that
+		// remain.
+		if element.signature == counterpart.signature {
 			continue
 		}
 		summary.Modified++
-		appendChange(ElementChange{
+		modifications = append(modifications, ElementChange{
 			Kind:       "modified",
 			BeforeAID:  element.aid,
 			AfterAID:   counterpart.aid,
@@ -209,7 +222,7 @@ func diffElements(before, after []diffElement) ([]ElementChange, DiffSummary, bo
 			continue
 		}
 		summary.Added++
-		appendChange(ElementChange{
+		insertions = append(insertions, ElementChange{
 			Kind:      "added",
 			AfterAID:  element.aid,
 			DOMPath:   element.path,
@@ -217,7 +230,41 @@ func diffElements(before, after []diffElement) ([]ElementChange, DiffSummary, bo
 			AfterHTML: diffOuterHTML(element.node),
 		})
 	}
+	changes, truncated := mergeDiffChanges(deletions, insertions, modifications)
 	return changes, summary, truncated
+}
+
+// mergeDiffChanges fills the change cap with adds and removes before
+// modifications, then restores document order so the response still reads
+// top-to-bottom.
+func mergeDiffChanges(deletions, insertions, modifications []ElementChange) ([]ElementChange, bool) {
+	capacity := maxDiffChanges
+	total := len(deletions) + len(insertions) + len(modifications)
+	changes := make([]ElementChange, 0, min(total, capacity))
+	take := func(source []ElementChange) {
+		for _, change := range source {
+			if len(changes) >= capacity {
+				return
+			}
+			changes = append(changes, change)
+		}
+	}
+	take(deletions)
+	take(insertions)
+	take(modifications)
+	slices.SortStableFunc(changes, func(a, b ElementChange) int {
+		return strings.Compare(diffChangeOrderKey(a), diffChangeOrderKey(b))
+	})
+	return changes, total > len(changes)
+}
+
+// diffChangeOrderKey sorts on the path the change is anchored at: the new
+// position when there is one, otherwise the old.
+func diffChangeOrderKey(change ElementChange) string {
+	if change.AfterPath != "" {
+		return change.AfterPath
+	}
+	return change.BeforePath
 }
 
 // matchDiffBy pairs still-unmatched elements whose key is unique on both sides.
@@ -233,6 +280,73 @@ func matchDiffBy(before, after []diffElement, matched map[int]int, takenAfter ma
 		matched[bi] = ai
 		takenAfter[ai] = true
 	}
+}
+
+// matchDiffBySequence pairs still-unmatched elements by an exact signature match
+// in document order, using the same hashed-line LCS the source layer uses. This
+// is deterministic — it is an order-preserving match on exact equality, not a
+// similarity score — so an insertion shifts nothing after it.
+func matchDiffBySequence(before, after []diffElement, matched map[int]int, takenAfter map[int]bool) {
+	beforeOpen := openDiffIndices(len(before), func(i int) bool { _, ok := matched[i]; return ok })
+	afterOpen := openDiffIndices(len(after), func(i int) bool { return takenAfter[i] })
+	if len(beforeOpen) == 0 || len(afterOpen) == 0 {
+		return
+	}
+	symbols := map[string]rune{}
+	encode := func(elements []diffElement, open []int) string {
+		var b strings.Builder
+		for _, index := range open {
+			key := elements[index].signature
+			symbol, ok := symbols[key]
+			if !ok {
+				// Stay inside the BMP and skip surrogates so every symbol is one rune.
+				next := rune(0xE000 + len(symbols))
+				if next > 0xF8FF {
+					// Signature alphabet exhausted; leave the rest to the positional tier.
+					return b.String()
+				}
+				symbol = next
+				symbols[key] = symbol
+			}
+			b.WriteRune(symbol)
+		}
+		return b.String()
+	}
+	beforeText := encode(before, beforeOpen)
+	afterText := encode(after, afterOpen)
+	matcher := diffmatchpatch.New()
+	matcher.DiffTimeout = diffTimeout
+	beforeCursor, afterCursor := 0, 0
+	for _, diff := range matcher.DiffMain(beforeText, afterText, false) {
+		count := len([]rune(diff.Text))
+		switch diff.Type {
+		case diffmatchpatch.DiffEqual:
+			for i := 0; i < count; i++ {
+				if beforeCursor >= len(beforeOpen) || afterCursor >= len(afterOpen) {
+					break
+				}
+				beforeIndex, afterIndex := beforeOpen[beforeCursor], afterOpen[afterCursor]
+				matched[beforeIndex] = afterIndex
+				takenAfter[afterIndex] = true
+				beforeCursor++
+				afterCursor++
+			}
+		case diffmatchpatch.DiffDelete:
+			beforeCursor += count
+		case diffmatchpatch.DiffInsert:
+			afterCursor += count
+		}
+	}
+}
+
+func openDiffIndices(length int, taken func(int) bool) []int {
+	open := make([]int, 0, length)
+	for i := 0; i < length; i++ {
+		if !taken(i) {
+			open = append(open, i)
+		}
+	}
+	return open
 }
 
 func uniqueDiffKeys(elements []diffElement, key func(diffElement) string, skip func(int) bool) map[string]int {
@@ -263,54 +377,66 @@ func uniqueDiffKeys(elements []diffElement, key func(diffElement) string, skip f
 // so one deep edit reports one change instead of one per ancestor.
 func diffSignature(node *xhtml.Node) string {
 	var builder strings.Builder
-	builder.WriteString(node.Namespace)
-	builder.WriteByte('|')
-	builder.WriteString(diffTagName(node))
+	// Every part is length-prefixed. Joining with plain delimiters let an
+	// attribute value containing the delimiters forge a different element's
+	// signature, which silently reported a real change as no change.
+	writeDiffPart(&builder, 'n', node.Namespace)
+	writeDiffPart(&builder, 't', diffTagName(node))
 	names := make([]string, 0, len(node.Attr))
 	values := map[string]string{}
 	for _, attr := range node.Attr {
-		name := attr.Namespace + ":" + attr.Key
 		if attr.Key == aidAttr {
 			// The AID is a content hash: it changes with the content it identifies,
 			// so including it would report every edited element twice.
 			continue
 		}
+		name := attr.Namespace + ":" + attr.Key
 		names = append(names, name)
 		values[name] = attr.Val
 	}
 	slices.Sort(names)
 	for _, name := range names {
-		builder.WriteByte('|')
-		builder.WriteString(name)
-		builder.WriteByte('=')
-		builder.WriteString(values[name])
+		writeDiffPart(&builder, 'a', name)
+		writeDiffPart(&builder, 'v', values[name])
 	}
 	literal := isLiteralTextTag(node)
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		switch child.Type {
 		case xhtml.ElementNode:
-			builder.WriteString("|<")
-			builder.WriteString(diffTagName(child))
+			writeDiffPart(&builder, 'e', diffTagName(child))
 		case xhtml.TextNode:
 			text := child.Data
 			if !literal {
-				// Markup indentation is not content. Collapsing it keeps a reflow
-				// of the source out of the structural layer; the source layer still
-				// reports it byte for byte.
+				// Two different things look alike here. A whitespace-ONLY node is
+				// markup indentation between block children and is dropped, so a
+				// reflow of the source stays out of this layer. A node with real
+				// text keeps its leading and trailing space, because that space
+				// separates it from an inline sibling: "Hello <em>x</em>" and
+				// "Hello<em>x</em>" render differently. Known limit of that rule:
+				// whitespace that is the node's ENTIRE content is dropped even
+				// between two inline siblings, because it is indistinguishable
+				// from indentation without resolving layout. The source layer
+				// reports it.
 				text = collapseASCIIWhitespace(text)
-				if text == "" {
+				if strings.TrimSpace(text) == "" {
 					continue
 				}
 			}
-			builder.WriteString("|#")
-			builder.WriteString(text)
+			writeDiffPart(&builder, '#', text)
 		case xhtml.CommentNode:
-			builder.WriteString("|!")
-			builder.WriteString(child.Data)
+			writeDiffPart(&builder, '!', child.Data)
 		case xhtml.DoctypeNode, xhtml.DocumentNode, xhtml.ErrorNode, xhtml.RawNode:
 		}
 	}
 	return builder.String()
+}
+
+// writeDiffPart appends one length-prefixed, kind-tagged field.
+func writeDiffPart(builder *strings.Builder, kind byte, value string) {
+	builder.WriteByte(kind)
+	builder.WriteString(strconv.Itoa(len(value)))
+	builder.WriteByte(':')
+	builder.WriteString(value)
 }
 
 // isLiteralTextTag reports whether the element's text children are source bytes
@@ -332,6 +458,14 @@ func isLiteralTextTag(node *xhtml.Node) bool {
 	}
 }
 
+// collapseASCIIWhitespace reduces every whitespace run to a single space and
+// keeps leading and trailing runs as one space each.
+//
+// The edges matter: this text node's neighbours may be inline elements, where
+// "Hello <em>x</em>" and "Hello<em>x</em>" render differently. Trimming the
+// edges made that edit invisible to the structural layer. A node that is
+// entirely whitespace collapses to a single space and its caller drops it only
+// when it has no siblings to separate.
 func collapseASCIIWhitespace(value string) string {
 	var builder strings.Builder
 	builder.Grow(len(value))
@@ -341,11 +475,14 @@ func collapseASCIIWhitespace(value string) string {
 			space = true
 			continue
 		}
-		if space && builder.Len() > 0 {
+		if space {
 			builder.WriteByte(' ')
 		}
 		space = false
 		builder.WriteByte(value[i])
+	}
+	if space {
+		builder.WriteByte(' ')
 	}
 	return builder.String()
 }
@@ -382,79 +519,279 @@ func diffOuterHTML(node *xhtml.Node) string {
 
 // diffSourceLines compares the published bytes line by line, with no
 // normalization at all: an indentation-only edit is a real edit here.
+//
+// The line-level compare runs on hashed lines (DiffLinesToChars), so the O(ND)
+// search sees one symbol per line instead of one per byte, and diffBisect keeps
+// only two rolling frontier arrays — memory is O(N+M) in lines regardless of how
+// different the two documents are. diffTimeout bounds the search itself: on
+// expiry the library returns a whole-file replace rather than running to
+// completion, so a pathological pair degrades in fidelity, not in liveness.
 func diffSourceLines(before, after string) ([]CodeHunk, bool, error) {
-	beforeLines := strings.Count(before, "\n") + 1
-	afterLines := strings.Count(after, "\n") + 1
-	if beforeLines > maxDiffSourceLines || afterLines > maxDiffSourceLines {
+	if len(before)+len(after) > maxDiffSourceBytes {
 		return nil, false, errDiffLimit
 	}
-	edits := myers.ComputeEdits(span.URIFromPath("before"), before, after)
-	unified := gotextdiff.ToUnified("before", "after", before, edits)
-	hunks := make([]CodeHunk, 0, len(unified.Hunks))
+	ops := sourceLineOps(before, after)
+	return groupSourceHunks(ops)
+}
+
+// sourceLineOp is one line tagged with its edit kind, in output order.
+type sourceLineOp struct {
+	kind    diffLineKind
+	content string
+}
+
+type diffLineKind int
+
+const (
+	diffLineEqual diffLineKind = iota
+	diffLineDelete
+	diffLineInsert
+)
+
+func sourceLineOps(before, after string) []sourceLineOp {
+	matcher := diffmatchpatch.New()
+	matcher.DiffTimeout = diffTimeout
+	beforeChars, afterChars, lines := matcher.DiffLinesToChars(before, after)
+	diffs := matcher.DiffCharsToLines(matcher.DiffMain(beforeChars, afterChars, false), lines)
+	ops := make([]sourceLineOp, 0, 64)
+	for _, diff := range diffs {
+		var kind diffLineKind
+		switch diff.Type {
+		case diffmatchpatch.DiffDelete:
+			kind = diffLineDelete
+		case diffmatchpatch.DiffInsert:
+			kind = diffLineInsert
+		case diffmatchpatch.DiffEqual:
+			kind = diffLineEqual
+		}
+		for _, line := range splitKeepingLines(diff.Text) {
+			ops = append(ops, sourceLineOp{kind: kind, content: line})
+		}
+	}
+	return ops
+}
+
+// splitKeepingLines splits on "\n" without inventing a trailing empty line for
+// text that ends in a newline, so line numbering matches the file.
+func splitKeepingLines(text string) []string {
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// groupSourceHunks turns the flat op list into unified hunks with at most
+// diffContextLines of context on each side, coalescing runs that would overlap.
+//
+// The hunk-line budget is applied while a hunk is being built, so an oversized
+// run is abandoned as it is found rather than after the whole hunk is
+// materialized.
+func groupSourceHunks(ops []sourceLineOp) ([]CodeHunk, bool, error) {
+	hunks := make([]CodeHunk, 0, 8)
 	truncated := false
-	for _, hunk := range unified.Hunks {
-		converted, ok := toCodeHunk(hunk)
-		if !ok {
-			truncated = true
+	oldLine, newLine := 1, 1
+	index := 0
+	for index < len(ops) {
+		if ops[index].kind == diffLineEqual {
+			oldLine++
+			newLine++
+			index++
 			continue
 		}
-		hunks = append(hunks, converted)
+		// Back up over the leading context, then emit until the trailing context
+		// of the last change in this cluster.
+		start := index
+		contextBefore := 0
+		for start > 0 && ops[start-1].kind == diffLineEqual && contextBefore < diffContextLines {
+			start--
+			contextBefore++
+		}
+		hunk := CodeHunk{OldStart: oldLine - contextBefore, NewStart: newLine - contextBefore}
+		if hunk.OldStart < 1 {
+			hunk.OldStart = 1
+		}
+		if hunk.NewStart < 1 {
+			hunk.NewStart = 1
+		}
+		cursor := start
+		trailing := 0
+		overflow := false
+		for cursor < len(ops) {
+			op := ops[cursor]
+			if op.kind == diffLineEqual {
+				trailing++
+				// Two changes closer than 2*context share one hunk; beyond that
+				// the run is over.
+				if trailing > diffContextLines && !changeWithin(ops, cursor, diffContextLines+1) {
+					break
+				}
+			} else {
+				trailing = 0
+			}
+			if len(hunk.Lines) >= maxDiffHunkLines {
+				overflow = true
+				break
+			}
+			switch op.kind {
+			case diffLineDelete:
+				hunk.OldLines++
+				hunk.Lines = append(hunk.Lines, "-"+op.content)
+			case diffLineInsert:
+				hunk.NewLines++
+				hunk.Lines = append(hunk.Lines, "+"+op.content)
+			case diffLineEqual:
+				hunk.OldLines++
+				hunk.NewLines++
+				hunk.Lines = append(hunk.Lines, " "+op.content)
+			}
+			cursor++
+		}
+		// Advance the running line numbers across everything this hunk consumed.
+		for i := start; i < cursor; i++ {
+			switch ops[i].kind {
+			case diffLineDelete:
+				oldLine++
+			case diffLineInsert:
+				newLine++
+			case diffLineEqual:
+				oldLine++
+				newLine++
+			}
+		}
+		if overflow {
+			truncated = true
+			// Keep the capped prefix rather than dropping the hunk: a document
+			// rewritten end to end is one enormous run, and discarding it returned
+			// an empty code_hunks for the most drastic possible edit. The emitted
+			// lines are contiguous from OldStart/NewStart and OldLines/NewLines
+			// count only what was emitted, so this hunk is self-consistent; the
+			// running counters below skip the remainder, so later hunks stay
+			// correctly numbered.
+			if len(hunk.Lines) > 0 {
+				hunks = append(hunks, hunk)
+			}
+			for cursor < len(ops) && ops[cursor].kind != diffLineEqual {
+				switch ops[cursor].kind {
+				case diffLineDelete:
+					oldLine++
+				case diffLineInsert:
+					newLine++
+				case diffLineEqual:
+				}
+				cursor++
+			}
+		} else if len(hunk.Lines) > 0 {
+			hunks = append(hunks, hunk)
+		}
+		if cursor == index {
+			// Defensive: never fail to advance, a stalled loop would hang the request.
+			cursor++
+		}
+		index = cursor
 	}
 	return hunks, truncated, nil
 }
 
-func toCodeHunk(hunk *gotextdiff.Hunk) (CodeHunk, bool) {
-	if len(hunk.Lines) > maxDiffHunkLines {
-		return CodeHunk{}, false
-	}
-	result := CodeHunk{OldStart: hunk.FromLine, NewStart: hunk.ToLine, Lines: make([]string, 0, len(hunk.Lines))}
-	for _, line := range hunk.Lines {
-		content := strings.TrimSuffix(line.Content, "\n")
-		switch line.Kind {
-		case gotextdiff.Delete:
-			result.OldLines++
-			result.Lines = append(result.Lines, "-"+content)
-		case gotextdiff.Insert:
-			result.NewLines++
-			result.Lines = append(result.Lines, "+"+content)
-		default:
-			result.OldLines++
-			result.NewLines++
-			result.Lines = append(result.Lines, " "+content)
+// changeWithin reports whether a non-equal op occurs within limit ops of from.
+func changeWithin(ops []sourceLineOp, from, limit int) bool {
+	for i := from; i < len(ops) && i < from+limit; i++ {
+		if ops[i].kind != diffLineEqual {
+			return true
 		}
 	}
-	return result, true
+	return false
 }
 
 // trimDiffOutput drops trailing detail until the response fits the wire budget.
 // Snippets go first: a change without its HTML is still navigable by DOM path.
+//
+// Sizes are computed once into running totals and decremented as items are
+// dropped. Re-measuring the whole result after every single pop made this
+// quadratic on exactly the large payloads that reach it.
 func trimDiffOutput(result *VersionDiff) {
-	if diffOutputSize(result) <= maxDiffOutputBytes {
+	changeSizes := make([]int, len(result.Changes))
+	total := 0
+	for i, change := range result.Changes {
+		changeSizes[i] = diffChangeSize(change)
+		total += changeSizes[i]
+	}
+	hunkSizes := make([]int, len(result.CodeHunks))
+	for i, hunk := range result.CodeHunks {
+		hunkSizes[i] = diffHunkSize(hunk)
+		total += hunkSizes[i]
+	}
+	if total <= maxDiffOutputBytes {
 		return
 	}
+	result.Truncated = true
 	for i := range result.Changes {
+		total -= diffJSONSize(result.Changes[i].BeforeHTML) + diffJSONSize(result.Changes[i].AfterHTML)
+		changeSizes[i] = diffChangeSize(result.Changes[i]) -
+			diffJSONSize(result.Changes[i].BeforeHTML) - diffJSONSize(result.Changes[i].AfterHTML)
 		result.Changes[i].BeforeHTML = ""
 		result.Changes[i].AfterHTML = ""
 	}
-	result.Truncated = true
-	for diffOutputSize(result) > maxDiffOutputBytes && len(result.CodeHunks) > 0 {
-		result.CodeHunks = result.CodeHunks[:len(result.CodeHunks)-1]
+	for total > maxDiffOutputBytes && len(result.CodeHunks) > 0 {
+		last := len(result.CodeHunks) - 1
+		total -= hunkSizes[last]
+		result.CodeHunks = result.CodeHunks[:last]
+		hunkSizes = hunkSizes[:last]
 	}
-	for diffOutputSize(result) > maxDiffOutputBytes && len(result.Changes) > 0 {
-		result.Changes = result.Changes[:len(result.Changes)-1]
+	for total > maxDiffOutputBytes && len(result.Changes) > 0 {
+		last := len(result.Changes) - 1
+		total -= changeSizes[last]
+		result.Changes = result.Changes[:last]
+		changeSizes = changeSizes[:last]
 	}
 }
 
 func diffOutputSize(result *VersionDiff) int {
 	size := 0
 	for _, change := range result.Changes {
-		size += len(change.Kind) + len(change.BeforeAID) + len(change.AfterAID) +
-			len(change.DOMPath) + len(change.BeforePath) + len(change.AfterPath) +
-			len(change.BeforeHTML) + len(change.AfterHTML)
+		size += diffChangeSize(change)
 	}
 	for _, hunk := range result.CodeHunks {
-		for _, line := range hunk.Lines {
-			size += len(line)
+		size += diffHunkSize(hunk)
+	}
+	return size
+}
+
+func diffChangeSize(change ElementChange) int {
+	return diffJSONSize(change.Kind) + diffJSONSize(change.BeforeAID) + diffJSONSize(change.AfterAID) +
+		diffJSONSize(change.DOMPath) + diffJSONSize(change.BeforePath) + diffJSONSize(change.AfterPath) +
+		diffJSONSize(change.BeforeHTML) + diffJSONSize(change.AfterHTML)
+}
+
+func diffHunkSize(hunk CodeHunk) int {
+	size := 0
+	for _, line := range hunk.Lines {
+		size += diffJSONSize(line)
+	}
+	return size
+}
+
+// diffJSONSize is the encoded length of a string field, not its raw length.
+// The response encoder escapes HTML (`<` becomes `\u003c`), and this payload is
+// mostly HTML, so measuring raw bytes let the wire response run several times
+// past the budget.
+func diffJSONSize(value string) int {
+	size := 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '<', '>', '&':
+			size += 6
+		case '"', '\\', '\n', '\r', '	':
+			size += 2
+		default:
+			if value[i] < 0x20 {
+				size += 6
+			} else {
+				size++
+			}
 		}
 	}
 	return size

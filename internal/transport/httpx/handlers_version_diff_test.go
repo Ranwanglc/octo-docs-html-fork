@@ -65,8 +65,14 @@ func TestVersionSourceReturnsStoredBytesAsInertText(t *testing.T) {
 			t.Fatalf("%s = %q; want %q", header, got, want)
 		}
 	}
-	if !strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
-		t.Fatalf("Cache-Control = %q; a numbered version is immutable", rec.Header().Get("Cache-Control"))
+	// Publish accepts a caller-supplied version number and overwrites, so a
+	// numbered version is not write-once and must not be cached as immutable.
+	cacheControl := rec.Header().Get("Cache-Control")
+	if strings.Contains(cacheControl, "immutable") {
+		t.Fatalf("Cache-Control = %q; version N is overwritable and must revalidate", cacheControl)
+	}
+	if !strings.Contains(cacheControl, "private") || !strings.Contains(cacheControl, "no-cache") {
+		t.Fatalf("Cache-Control = %q; want private and revalidating", cacheControl)
 	}
 	if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Document-Version") {
 		t.Fatalf("version header is not exposed cross-origin")
@@ -87,6 +93,32 @@ func TestVersionSourceLatestIsNotCachedImmutable(t *testing.T) {
 	}
 	if strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
 		t.Fatalf("latest must not be cached as immutable: %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+// A republish over an existing version number changes the bytes, so the ETag
+// must change with them — this is why the route cannot advertise immutability.
+func TestVersionSourceETagTracksOverwrittenVersion(t *testing.T) {
+	h := newTestServer(t, nil)
+	publishVersion(t, h, "overwritten", `<html><body><p>original</p></body></html>`)
+	first := do(t, h, http.MethodGet, "/v1/docs/overwritten/versions/1/source", authorHdrNoCT(), "")
+
+	body, err := json.Marshal(map[string]any{"slug": "overwritten", "html": `<html><body><p>REPLACED</p></body></html>`, "version": 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(body)); rec.Code != 200 && rec.Code != 201 {
+		t.Fatalf("republish status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	headers := authorHdrNoCT()
+	headers["If-None-Match"] = first.Header().Get("ETag")
+	second := do(t, h, http.MethodGet, "/v1/docs/overwritten/versions/1/source", headers, "")
+	if second.Code == http.StatusNotModified {
+		t.Fatalf("stale ETag matched after the version was overwritten")
+	}
+	if !strings.Contains(second.Body.String(), "REPLACED") {
+		t.Fatalf("body = %q; want the new bytes", second.Body.String())
 	}
 }
 

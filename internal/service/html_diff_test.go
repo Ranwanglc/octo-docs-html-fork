@@ -1,8 +1,12 @@
 package service
 
 import (
+	"encoding/json"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // diffFor runs the real entry point so every test exercises both layers.
@@ -320,8 +324,8 @@ func TestDiffTooManyNodesFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDiffTooManySourceLinesFailsClosed(t *testing.T) {
-	doc := "<html><body>" + strings.Repeat("<p>x</p>\n", maxDiffSourceLines+1) + "</body></html>"
+func TestDiffTooManySourceBytesFailsClosed(t *testing.T) {
+	doc := "<html><body>" + strings.Repeat("<p>x</p>\n", maxDiffSourceBytes/8) + "</body></html>"
 	if _, _, err := diffSourceLines(doc, doc); err == nil {
 		t.Fatalf("oversized source was accepted")
 	}
@@ -354,6 +358,216 @@ func TestDiffCarriesRequestedVersions(t *testing.T) {
 	}
 	if result.From != 3 || result.To != 7 {
 		t.Fatalf("versions = %d/%d; want 3/7", result.From, result.To)
+	}
+}
+
+// The Myers layer must be bounded in memory, not just in line count. The
+// previous library retained one frontier array per iteration (O(D*(N+M))) and
+// allocated ~4 GB on two 8000-line documents with no line in common; this
+// bounds the same shape well under a gigabyte.
+func TestDiffSourceLayerIsMemoryBounded(t *testing.T) {
+	const lines = 8000
+	var before, after strings.Builder
+	before.WriteString("<html><body><pre>")
+	after.WriteString("<html><body><pre>")
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&before, "alpha line %d\n", i)
+		fmt.Fprintf(&after, "beta line %d\n", i)
+	}
+	before.WriteString("</pre></body></html>")
+	after.WriteString("</pre></body></html>")
+
+	var start, end runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&start)
+	result, err := buildVersionDiff(1, 2, before.String(), after.String())
+	runtime.ReadMemStats(&end)
+	if err != nil {
+		t.Fatalf("two 8000-line documents were rejected: %v", err)
+	}
+	allocated := end.TotalAlloc - start.TotalAlloc
+	if allocated > 1<<30 {
+		t.Fatalf("allocated %.2f GB for %d lines; the line diff is not bounded", float64(allocated)/(1<<30), lines)
+	}
+	// A fully rewritten document must still return usable hunks: burning the
+	// budget and answering with an empty code_hunks is the failure mode this
+	// layer was rebuilt to avoid.
+	if len(result.CodeHunks) == 0 {
+		t.Fatalf("no code hunks for a fully rewritten document")
+	}
+	if !result.Truncated {
+		t.Fatalf("an over-budget run was not flagged as truncated")
+	}
+}
+
+// A pathological pair must answer instead of running to completion: the library
+// deadline degrades fidelity, not liveness.
+func TestDiffSourceLayerHonoursDeadline(t *testing.T) {
+	var before, after strings.Builder
+	before.WriteString("<html><body><pre>")
+	after.WriteString("<html><body><pre>")
+	for i := 0; i < 40000; i++ {
+		before.WriteString("aaaa\n")
+		after.WriteString("bbbb\n")
+	}
+	before.WriteString("</pre></body></html>")
+	after.WriteString("</pre></body></html>")
+	start := time.Now()
+	if _, err := buildVersionDiff(1, 2, before.String(), after.String()); err != nil {
+		t.Fatalf("buildVersionDiff: %v", err)
+	}
+	// diffTimeout is 2s and applies to each of the two layers.
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("elapsed %v; the deadline did not bail", elapsed)
+	}
+}
+
+// An insertion must not re-pair every following sibling. Only stamped tags carry
+// an AID, so prose relies entirely on the sequence tier.
+func TestDiffInsertionDoesNotShiftFollowingSiblings(t *testing.T) {
+	for _, n := range []int{3, 1200} {
+		var before, after strings.Builder
+		before.WriteString("<html><body><ul>")
+		after.WriteString("<html><body><ul><li>NEW</li>")
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&before, "<li>item %d</li>", i)
+			fmt.Fprintf(&after, "<li>item %d</li>", i)
+		}
+		before.WriteString("</ul></body></html>")
+		after.WriteString("</ul></body></html>")
+		result := diffFor(t, before.String(), after.String())
+		if result.Summary.Added != 1 {
+			t.Fatalf("n=%d summary = %+v; want exactly one addition", n, result.Summary)
+		}
+		// The <ul> itself changes (its child tag list grows), nothing else should.
+		if result.Summary.Modified > 1 {
+			t.Fatalf("n=%d summary = %+v; an insertion amplified into modifications", n, result.Summary)
+		}
+		if result.Summary.Removed != 0 {
+			t.Fatalf("n=%d summary = %+v; an insertion removed nothing", n, result.Summary)
+		}
+	}
+}
+
+// Truncation must keep the highest-signal changes. Adds and removes are what a
+// reader is looking for; modifications are the ones a shift can mass-produce.
+func TestDiffTruncationKeepsAddsAndRemoves(t *testing.T) {
+	var before, after strings.Builder
+	before.WriteString("<html><body>")
+	after.WriteString("<html><body>")
+	for i := 0; i < maxDiffChanges+400; i++ {
+		fmt.Fprintf(&before, "<p>old %d</p>", i)
+		fmt.Fprintf(&after, "<p>new %d</p>", i)
+	}
+	after.WriteString("<section>added</section>")
+	before.WriteString("</body></html>")
+	after.WriteString("</body></html>")
+
+	result := diffFor(t, before.String(), after.String())
+	if !result.Truncated {
+		t.Fatalf("expected truncation with %d changes", len(result.Changes))
+	}
+	if len(result.Changes) > maxDiffChanges {
+		t.Fatalf("changes = %d; want at most %d", len(result.Changes), maxDiffChanges)
+	}
+	found := false
+	for _, change := range result.Changes {
+		if change.Kind == "added" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the only added element was truncated away in favour of modifications")
+	}
+}
+
+// Changes stay in document order after the by-kind merge, so a reader can walk
+// the response top to bottom.
+func TestDiffChangesAreInDocumentOrder(t *testing.T) {
+	before := `<html><body><p>a</p><p>b</p><p>c</p></body></html>`
+	after := `<html><body><p>a</p><span>x</span><p>C</p></body></html>`
+	result := diffFor(t, before, after)
+	previous := ""
+	for _, change := range result.Changes {
+		key := change.AfterPath
+		if key == "" {
+			key = change.BeforePath
+		}
+		if previous != "" && key < previous {
+			t.Fatalf("changes are out of document order: %q after %q", key, previous)
+		}
+		previous = key
+	}
+}
+
+// A signature is length-prefixed, so an attribute value cannot forge another
+// element's signature by embedding the delimiters.
+func TestDiffSignatureResistsDelimiterInjection(t *testing.T) {
+	before := `<html><body><div a="1|:b=2"></div></body></html>`
+	after := `<html><body><div a="1" b="2"></div></body></html>`
+	result := diffFor(t, before, after)
+	if result.Summary.Modified != 1 {
+		t.Fatalf("summary = %+v; a real attribute change was swallowed by a signature collision", result.Summary)
+	}
+}
+
+// Space next to an inline sibling is rendered content, not indentation.
+func TestDiffReportsWhitespaceNextToInlineSibling(t *testing.T) {
+	before := `<html><body><p>Hello <em>x</em></p></body></html>`
+	after := `<html><body><p>Hello<em>x</em></p></body></html>`
+	result := diffFor(t, before, after)
+	if result.Summary.Modified == 0 {
+		t.Fatalf("summary = %+v; a rendered space change was reported as no change", result.Summary)
+	}
+}
+
+// The output budget is measured on encoded JSON, since the encoder escapes HTML
+// and this payload is mostly HTML.
+func TestDiffOutputBudgetCountsJSONEscaping(t *testing.T) {
+	var before, after strings.Builder
+	before.WriteString("<html><body>")
+	after.WriteString("<html><body>")
+	// Markup-dense but well under the node cap, so the budget is what bites.
+	filler := strings.Repeat("<b>tag</b>", 12) + strings.Repeat("text ", 400)
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&before, "<p>%s a%d</p>", filler, i)
+		fmt.Fprintf(&after, "<p>%s b%d</p>", filler, i)
+	}
+	before.WriteString("</body></html>")
+	after.WriteString("</body></html>")
+	result := diffFor(t, before.String(), after.String())
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// The budget covers the change and hunk payload, not the whole envelope, so
+	// allow modest slack for field names and structure.
+	if len(encoded) > maxDiffOutputBytes*2 {
+		t.Fatalf("encoded response = %d bytes; budget is %d", len(encoded), maxDiffOutputBytes)
+	}
+}
+
+// Hunk line numbers must address the real files, including after a hunk is
+// dropped for exceeding the per-hunk budget.
+func TestDiffHunkLineNumbersAddressTheSource(t *testing.T) {
+	before := "<html>\n<body>\n<p>a</p>\n<p>keep</p>\n<p>b</p>\n</body>\n</html>\n"
+	after := "<html>\n<body>\n<p>A</p>\n<p>keep</p>\n<p>B</p>\n</body>\n</html>\n"
+	result := diffFor(t, before, after)
+	beforeLines := strings.Split(before, "\n")
+	for _, hunk := range result.CodeHunks {
+		if hunk.OldStart < 1 || hunk.OldStart > len(beforeLines) {
+			t.Fatalf("hunk OldStart = %d outside 1..%d", hunk.OldStart, len(beforeLines))
+		}
+		offset := 0
+		for _, line := range hunk.Lines {
+			if !strings.HasPrefix(line, "+") {
+				want := beforeLines[hunk.OldStart-1+offset]
+				if line[1:] != want {
+					t.Fatalf("hunk line %q does not match source line %d (%q)", line, hunk.OldStart+offset, want)
+				}
+				offset++
+			}
+		}
 	}
 }
 
