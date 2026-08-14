@@ -180,12 +180,16 @@ func (s *AssetService) allReferencedSHAs(ctx context.Context, assetSlugs []strin
 // scanSlugInto scans a slug's published versions and draft HTML, adding every bare
 // content address it finds to refs.
 func (s *AssetService) scanSlugInto(ctx context.Context, slug string, refs map[string]struct{}) error {
-	versions, err := s.blobs.ListVersions(ctx, slug)
+	key, err := resolveStorageKey(ctx, s.meta, slug)
+	if err != nil {
+		return err
+	}
+	versions, err := s.blobs.ListVersions(ctx, key)
 	if err != nil {
 		return err
 	}
 	for _, n := range versions {
-		html, ok, err := s.blobs.GetDoc(ctx, slug, n)
+		html, ok, err := s.blobs.GetDoc(ctx, key, n)
 		if err != nil {
 			return err
 		}
@@ -193,7 +197,7 @@ func (s *AssetService) scanSlugInto(ctx context.Context, slug string, refs map[s
 			scanInto(html, refs)
 		}
 	}
-	if html, ok, err := s.blobs.GetDraft(ctx, slug); err != nil {
+	if html, ok, err := s.blobs.GetDraft(ctx, key); err != nil {
 		return err
 	} else if ok {
 		scanInto(html, refs)

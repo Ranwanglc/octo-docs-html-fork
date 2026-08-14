@@ -71,7 +71,11 @@ func (s *AssetService) Put(ctx context.Context, slug string, r io.Reader, origin
 
 	res := AssetResult{SHA256: sha, MIME: mime, Size: int64(len(data))}
 	err = s.lock.With(ctx, slug, func() error {
-		if perr := s.blobs.PutAsset(ctx, slug, sha, data); perr != nil {
+		key, kerr := resolveStorageKey(ctx, s.meta, slug)
+		if kerr != nil {
+			return kerr
+		}
+		if perr := s.blobs.PutAsset(ctx, key, sha, data); perr != nil {
 			return apperr.Upstream("asset blob write failed", "asset_write_failed", perr)
 		}
 		return s.meta.PutAssetMeta(ctx, storage.AssetMeta{
@@ -94,7 +98,11 @@ func (s *AssetService) Get(ctx context.Context, slug, sha string) ([]byte, stora
 	if meta == nil {
 		return nil, storage.AssetMeta{}, apperr.NotFound("no such asset")
 	}
-	data, ok, err := s.blobs.GetAsset(ctx, slug, sha)
+	key, err := resolveStorageKey(ctx, s.meta, slug)
+	if err != nil {
+		return nil, storage.AssetMeta{}, err
+	}
+	data, ok, err := s.blobs.GetAsset(ctx, key, sha)
 	if err != nil {
 		return nil, storage.AssetMeta{}, apperr.Upstream("asset blob read failed", "asset_read_failed", err)
 	}
@@ -121,7 +129,11 @@ func (s *AssetService) Delete(ctx context.Context, slug, sha string) error {
 // The caller must already hold the per-slug lock (GC serializes its whole
 // scan→decide→delete sequence under it — see GCAssets).
 func (s *AssetService) deleteLocked(ctx context.Context, slug, sha string) error {
-	if err := s.blobs.DeleteAsset(ctx, slug, sha); err != nil {
+	key, err := resolveStorageKey(ctx, s.meta, slug)
+	if err != nil {
+		return err
+	}
+	if err := s.blobs.DeleteAsset(ctx, key, sha); err != nil {
 		return apperr.Upstream("asset blob delete failed", "asset_delete_failed", err)
 	}
 	return s.meta.DeleteAssetMeta(ctx, slug, sha)

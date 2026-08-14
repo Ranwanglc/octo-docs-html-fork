@@ -284,14 +284,17 @@ func (s *DocService) slugExists(ctx context.Context, slug string) (bool, error) 
 	if meta != nil {
 		return true, nil
 	}
-	versions, err := s.blobs.ListVersions(ctx, slug)
+	// No meta row ⇒ no persisted storage_key, so the storage key is the slug
+	// (identical to the pre-storage_key addressing for blob-only leftovers).
+	key := storageKeyOf(nil, slug)
+	versions, err := s.blobs.ListVersions(ctx, key)
 	if err != nil {
 		return false, err
 	}
 	if len(versions) > 0 {
 		return true, nil
 	}
-	_, hasDraft, err := s.blobs.GetDraft(ctx, slug)
+	_, hasDraft, err := s.blobs.GetDraft(ctx, key)
 	return hasDraft, err
 }
 
@@ -307,16 +310,20 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 			return nil, err
 		}
 	}
-	version, err := s.resolveVersion(ctx, in.Slug, in.Version)
+	key, err := resolveStorageKey(ctx, s.meta, in.Slug)
+	if err != nil {
+		return nil, err
+	}
+	version, err := s.resolveVersion(ctx, key, in.Version)
 	if err != nil {
 		return nil, err
 	}
 
-	size, err := s.blobs.PutDoc(ctx, in.Slug, version, stamped.HTML)
+	size, err := s.blobs.PutDoc(ctx, key, version, stamped.HTML)
 	if err != nil {
 		return nil, apperr.Upstream("blob write failed", "blob_write_failed", err)
 	}
-	if _, ok, herr := s.blobs.HeadDoc(ctx, in.Slug, version); herr != nil {
+	if _, ok, herr := s.blobs.HeadDoc(ctx, key, version); herr != nil {
 		return nil, apperr.Upstream("blob head failed", "blob_head_failed", herr)
 	} else if !ok {
 		return nil, apperr.Upstream("blob write did not persist", "blob_write_lost", nil)
@@ -484,7 +491,11 @@ func (s *DocService) GetElement(ctx context.Context, slug string, version int, a
 	if aid == "" {
 		return nil, apperr.Validation("aid required", "aid_required")
 	}
-	v, err := s.resolveReadVersion(ctx, slug, version)
+	key, err := resolveStorageKey(ctx, s.meta, slug)
+	if err != nil {
+		return nil, err
+	}
+	v, err := s.resolveReadVersion(ctx, key, version)
 	if err != nil {
 		return nil, err
 	}
@@ -556,7 +567,11 @@ func (s *DocService) ReplaceElementAuthorized(ctx context.Context, slug string, 
 		// Resolve→render→replace all inside the lock so the base we edit is the same
 		// latest publishLocked will increment from (baseVersion=0 ⇒ no race window;
 		// baseVersion>0 ⇒ edit that explicit base, publish as latest+1).
-		v, verr := s.resolveReadVersion(ctx, slug, baseVersion)
+		key, kerr := resolveStorageKey(ctx, s.meta, slug)
+		if kerr != nil {
+			return kerr
+		}
+		v, verr := s.resolveReadVersion(ctx, key, baseVersion)
 		if verr != nil {
 			return verr
 		}
@@ -618,11 +633,13 @@ func (s *DocService) ReplaceElementAuthorized(ctx context.Context, slug string, 
 
 // resolveReadVersion turns an explicit version (0 = latest) into a concrete
 // version number for reads, using the same monotonic-max rule as publish.
-func (s *DocService) resolveReadVersion(ctx context.Context, slug string, explicit int) (int, error) {
+//
+// key is a storage key (see storageKeyOf), not necessarily a slug.
+func (s *DocService) resolveReadVersion(ctx context.Context, key string, explicit int) (int, error) {
 	if explicit > 0 {
 		return explicit, nil
 	}
-	existing, err := s.blobs.ListVersions(ctx, slug)
+	existing, err := s.blobs.ListVersions(ctx, key)
 	if err != nil {
 		return 0, err
 	}
@@ -633,23 +650,23 @@ func (s *DocService) resolveReadVersion(ctx context.Context, slug string, explic
 		}
 	}
 	if maxV == 0 {
-		return 0, apperr.NotFound("no published version for " + slug)
+		return 0, apperr.NotFound("no published version for " + key)
 	}
 	return maxV, nil
 }
 
 // Render fetches stored HTML + the version list for rendering, or nil if absent.
 func (s *DocService) Render(ctx context.Context, slug string, version int) (*RenderData, error) {
-	html, ok, err := s.blobs.GetDoc(ctx, slug, version)
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	html, ok, err := s.blobs.GetDoc(ctx, storageKeyOf(meta, slug), version)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, nil
-	}
-	meta, err := s.meta.GetMeta(ctx, slug)
-	if err != nil {
-		return nil, err
 	}
 	var versions []storage.VersionRef
 	var title string
@@ -707,7 +724,7 @@ func (s *DocService) SaveDraftWithProvenance(ctx context.Context, slug, html, ti
 				return authErr
 			}
 		}
-		size, perr := s.blobs.PutDraft(ctx, slug, stamped.HTML)
+		size, perr := s.blobs.PutDraft(ctx, storageKeyOf(prev, slug), stamped.HTML)
 		if perr != nil {
 			return apperr.Upstream("draft write failed", "draft_write_failed", perr)
 		}
@@ -819,16 +836,16 @@ func (s *DocService) prepareDraftProvenance(ctx context.Context, slug string, in
 
 // GetDraft fetches the draft HTML + version list for rendering, or nil if absent.
 func (s *DocService) GetDraft(ctx context.Context, slug string) (*RenderData, error) {
-	html, ok, err := s.blobs.GetDraft(ctx, slug)
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	html, ok, err := s.blobs.GetDraft(ctx, storageKeyOf(meta, slug))
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, nil
-	}
-	meta, err := s.meta.GetMeta(ctx, slug)
-	if err != nil {
-		return nil, err
 	}
 	var versions []storage.VersionRef
 	var title string
@@ -857,7 +874,11 @@ func (s *DocService) Promote(ctx context.Context, slug, title string) (*PublishR
 func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, authorize ProvenanceAuthorizer) (*PublishResult, error) {
 	var result *PublishResult
 	err := s.lock.With(ctx, slug, func() error {
-		html, ok, gerr := s.blobs.GetDraft(ctx, slug)
+		key, kerr := resolveStorageKey(ctx, s.meta, slug)
+		if kerr != nil {
+			return kerr
+		}
+		html, ok, gerr := s.blobs.GetDraft(ctx, key)
 		if gerr != nil {
 			return gerr
 		}
@@ -876,7 +897,7 @@ func (s *DocService) PromoteAuthorized(ctx context.Context, slug, title string, 
 		}
 		result = r
 		// Best-effort cleanup past the commit point — never fail the promote here.
-		if derr := s.blobs.DeleteDraft(ctx, slug); derr != nil {
+		if derr := s.blobs.DeleteDraft(ctx, key); derr != nil {
 			slog.Default().Warn("promote: draft blob clear failed (harmless, will be overwritten)",
 				"slug", slug, "version", r.Version, "err", derr)
 		}
@@ -989,7 +1010,7 @@ func (s *DocService) ListVersions(ctx context.Context, slug string) (*VersionLis
 	if err != nil {
 		return nil, err
 	}
-	blobVersions, err := s.blobs.ListVersions(ctx, slug)
+	blobVersions, err := s.blobs.ListVersions(ctx, storageKeyOf(meta, slug))
 	if err != nil {
 		return nil, err
 	}
@@ -1041,7 +1062,7 @@ func (s *DocService) RemoveAuthorized(ctx context.Context, slug string, authoriz
 				return apperr.Conflict("registered or unconfirmed user documents must be deleted through docs-backend", "user_publish_delete_via_backend")
 			}
 		}
-		if err := s.blobs.DeleteDoc(ctx, slug); err != nil {
+		if err := s.blobs.DeleteDoc(ctx, storageKeyOf(meta, slug)); err != nil {
 			return err
 		}
 		// blobs.DeleteDoc purges asset bytes (they share the doc's key prefix), but
@@ -1305,7 +1326,7 @@ func (s *DocService) ListAllForOwner(ctx context.Context) ([]OwnerDoc, error) {
 			latest = e.Meta.Versions[n-1].N
 			created = e.Meta.Versions[n-1].Created
 		}
-		_, ok, herr := s.blobs.HeadDoc(ctx, e.Slug, latest)
+		_, ok, herr := s.blobs.HeadDoc(ctx, storageKeyOf(&e.Meta, e.Slug), latest)
 		if herr != nil || !ok {
 			continue
 		}
@@ -1318,11 +1339,13 @@ func (s *DocService) ListAllForOwner(ctx context.Context) ([]OwnerDoc, error) {
 	return out, nil
 }
 
-func (s *DocService) resolveVersion(ctx context.Context, slug string, explicit int) (int, error) {
+// resolveVersion returns the next version number to publish. key is a storage
+// key (see storageKeyOf), not necessarily a slug.
+func (s *DocService) resolveVersion(ctx context.Context, key string, explicit int) (int, error) {
 	if explicit > 0 {
 		return explicit, nil
 	}
-	existing, err := s.blobs.ListVersions(ctx, slug)
+	existing, err := s.blobs.ListVersions(ctx, key)
 	if err != nil {
 		return 0, err
 	}
