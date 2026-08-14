@@ -100,6 +100,27 @@ func TestCanonicalReplayRejectsLegacySlugCollision(t *testing.T) {
 	}
 }
 
+func TestCanonicalReplayRejectsDraftOnlyForeignIdentity(t *testing.T) {
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_replay_draft", OctoDocSlug: "d_replay_draft", ShareURL: "https://docs/d_replay_draft", PublisherUID: "publisher", SpaceID: "space"}}
+	docs, store := canonicalTestDocs(t, registrar)
+	if _, err := store.PutDraft(context.Background(), "d_replay_draft", "draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMeta(context.Background(), "d_replay_draft", storage.DocMeta{Slug: "d_replay_draft"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, create := range []func(context.Context, PublishInput) (any, error){
+		func(ctx context.Context, in PublishInput) (any, error) { return docs.Publish(ctx, in) },
+		func(ctx context.Context, in PublishInput) (any, error) { return docs.CreateCanonicalDraft(ctx, in) },
+	} {
+		_, err := create(context.Background(), canonicalInput())
+		var appErr *apperr.Error
+		if !errors.As(err, &appErr) || appErr.Status != http.StatusConflict || appErr.Code != "canonical_identity_conflict" {
+			t.Fatalf("error=%v, want canonical conflict", err)
+		}
+	}
+}
+
 func TestCanonicalCreateRejectsDraftOnlySlugCollision(t *testing.T) {
 	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_squat", OctoDocSlug: "d_draft_squat", ShareURL: "https://docs/d_draft_squat", PublisherUID: "publisher", SpaceID: "space", Created: true}}
 	docs, store := canonicalTestDocs(t, registrar)
@@ -255,6 +276,26 @@ func TestCanonicalCommentMergeFailureKeepsDurableIdentity(t *testing.T) {
 	}
 	if _, deletes, _ := registrar.counts(); deletes != 0 {
 		t.Fatalf("rollback deletes=%d, want 0", deletes)
+	}
+}
+
+func TestCanonicalCommentMergeFailureReplayRenotifies(t *testing.T) {
+	store := memory.New()
+	meta := &failCommentMergeMetaStore{Store: store}
+	lock := sluglock.NewMemory()
+	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_merge_retry", OctoDocSlug: "d_merge_retry", ShareURL: "https://docs/d_merge_retry", PublisherUID: "publisher", SpaceID: "space", Created: true}}
+	docs := NewDocService(store, meta, NewCommentService(meta, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err == nil {
+		t.Fatal("initial publish succeeded")
+	}
+	registrar.mu.Lock()
+	registrar.result.Created = false
+	registrar.mu.Unlock()
+	if _, err := docs.Publish(context.Background(), canonicalInput()); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, _, published := registrar.counts(); published != 1 {
+		t.Fatalf("published=%d, want 1", published)
 	}
 }
 
