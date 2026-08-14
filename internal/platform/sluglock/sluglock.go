@@ -17,6 +17,19 @@ type Locker interface {
 	With(ctx context.Context, key string, fn func() error) error
 }
 
+// LockSession holds one underlying locking session. Acquire adds keys in the
+// caller's order; Session releases all acquired keys when its callback returns.
+type LockSession interface {
+	Acquire(ctx context.Context, key string) error
+}
+
+// SessionLocker serializes a multi-key critical section on one underlying
+// session. Advisory implementations consequently use only one pooled
+// connection even when the callback acquires several keys.
+type SessionLocker interface {
+	Session(ctx context.Context, fn func(LockSession) error) error
+}
+
 // Memory is an in-process keyed mutex. Correct for the single-instance default.
 type Memory struct {
 	mu    sync.Mutex
@@ -73,3 +86,42 @@ func (m *Memory) With(ctx context.Context, key string, fn func() error) error {
 	defer e.mu.Unlock()
 	return fn()
 }
+
+type memorySession struct {
+	m    *Memory
+	held []memoryHeld
+}
+
+type memoryHeld struct {
+	key string
+	e   *entry
+}
+
+// Acquire locks keys in caller order. Canonical creation acquires idem then
+// slug, while legacy callers only acquire slug, so that order has no cycle.
+func (s *memorySession) Acquire(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e := s.m.acquire(key)
+	e.mu.Lock()
+	s.held = append(s.held, memoryHeld{key: key, e: e})
+	return nil
+}
+
+// Session runs fn and unlocks acquired keys in reverse order.
+func (m *Memory) Session(ctx context.Context, fn func(LockSession) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s := &memorySession{m: m}
+	defer func() {
+		for i := len(s.held) - 1; i >= 0; i-- {
+			s.held[i].e.mu.Unlock()
+			m.release(s.held[i].key, s.held[i].e)
+		}
+	}()
+	return fn(s)
+}
+
+var _ SessionLocker = (*Memory)(nil)

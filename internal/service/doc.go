@@ -353,14 +353,18 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 	}
 	in.MountType = mountType
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
-	if s.lock == nil {
+	sessionLocker, ok := s.lock.(sluglock.SessionLocker)
+	if !ok {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
 	stamped := core.StampAids(in.HTML)
 	var result *PublishResult
 	var identity canonicalIdentity
 	firstDurableContent := false
-	err = s.lock.With(ctx, "idem:"+in.IdempotencyKey, func() error {
+	err = sessionLocker.Session(ctx, func(session sluglock.LockSession) error {
+		if err := session.Acquire(ctx, "idem:"+in.IdempotencyKey); err != nil {
+			return err
+		}
 		reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 		if err != nil {
 			if docsbackend.IsCanonicalDocumentDeleted(err) {
@@ -391,7 +395,10 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 		identity = canonicalIdentity{docID: reg.DocID, shareURL: reg.ShareURL}
 		// Canonical creation takes idem then slug. Legacy publishing takes only
 		// the slug lock, so it can never wait on idem and this order has no cycle.
-		return s.lock.With(ctx, reg.DocID, func() error {
+		if err := session.Acquire(ctx, reg.DocID); err != nil {
+			return err
+		}
+		{
 			if registered {
 				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
 					return stateErr
@@ -436,7 +443,7 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 				firstDurableContent = true
 			}
 			return e
-		})
+		}
 	})
 	if err != nil {
 		return nil, err
@@ -894,12 +901,16 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 	}
 	in.MountType = mountType
 	in.mountContextKnown = in.MountTypePresent || mountType != ""
-	if s.lock == nil {
+	sessionLocker, ok := s.lock.(sluglock.SessionLocker)
+	if !ok {
 		return nil, apperr.Upstream("shared canonical initialization guard unavailable", "canonical_guard_unavailable", nil)
 	}
 	stamped := core.StampAids(in.HTML)
 	var result *DraftResult
-	err = s.lock.With(ctx, "idem:"+in.IdempotencyKey, func() error {
+	err = sessionLocker.Session(ctx, func(session sluglock.LockSession) error {
+		if err := session.Acquire(ctx, "idem:"+in.IdempotencyKey); err != nil {
+			return err
+		}
 		reg, err := s.register.Register(ctx, docsbackend.Registration{DocType: "html", IdempotencyKey: in.IdempotencyKey, MountType: in.MountType, Title: in.Title}, in.PublisherToken)
 		if err != nil {
 			if docsbackend.IsCanonicalDocumentDeleted(err) {
@@ -929,7 +940,10 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 		in.Slug = reg.DocID
 		// Canonical creation takes idem then slug. Legacy publishing takes only
 		// the slug lock, so it can never wait on idem and this order has no cycle.
-		return s.lock.With(ctx, reg.DocID, func() error {
+		if err := session.Acquire(ctx, reg.DocID); err != nil {
+			return err
+		}
+		{
 			if registered {
 				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
 					return stateErr
@@ -983,7 +997,7 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
 			registered = false
 			return nil
-		})
+		}
 	})
 	if err != nil {
 		return nil, err

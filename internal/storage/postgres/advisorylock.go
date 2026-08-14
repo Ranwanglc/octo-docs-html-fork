@@ -33,8 +33,9 @@ type advisoryLocker struct {
 const advisoryUnlockTimeout = 2 * time.Second
 
 var (
-	_              sluglock.Locker = (*advisoryLocker)(nil)
-	advisoryLogger                 = slog.Default()
+	_              sluglock.Locker        = (*advisoryLocker)(nil)
+	_              sluglock.SessionLocker = (*advisoryLocker)(nil)
+	advisoryLogger                        = slog.Default()
 )
 
 // SetAdvisoryLockLogger injects the logger used for advisory-lock recovery.
@@ -59,10 +60,35 @@ func advisoryKey(key string) int64 {
 // cancelled request doesn't block forever. ctx controls fn; unlock deliberately
 // uses a fresh bounded context so cancellation cannot strand a session-scoped lock.
 func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) (retErr error) {
+	return l.Session(ctx, func(session sluglock.LockSession) error {
+		if err := session.Acquire(ctx, key); err != nil {
+			return err
+		}
+		return fn()
+	})
+}
+
+type advisorySession struct {
+	conn *pgxpool.Conn
+	keys []string
+}
+
+func (s *advisorySession) Acquire(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	id := advisoryKey(key)
+	if _, err := s.conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryKey(key)); err != nil {
+		return fmt.Errorf("pg_advisory_lock: %w", err)
+	}
+	s.keys = append(s.keys, key)
+	return nil
+}
+
+// Session keeps every advisory lock on one pooled connection.
+func (l *advisoryLocker) Session(ctx context.Context, fn func(sluglock.LockSession) error) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	conn, err := l.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire lock conn: %w", err)
@@ -74,22 +100,27 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		}
 	}()
 
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", id); err != nil {
-		return fmt.Errorf("pg_advisory_lock: %w", err)
-	}
+	session := &advisorySession{conn: conn}
 	// Unlock on the same connection with an independent bounded context. On an
 	// unlock failure, hijack and close the physical connection so the locked
 	// session can never return to the pool.
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
 		defer cancel()
-		var unlocked bool
-		unlockErr := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", id).Scan(&unlocked)
-		if unlockErr == nil && unlocked {
-			return
+		var unlockErr error
+		for i := len(session.keys) - 1; i >= 0; i-- {
+			var unlocked bool
+			err := conn.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", advisoryKey(session.keys[i])).Scan(&unlocked)
+			if err == nil && unlocked {
+				continue
+			}
+			if err == nil {
+				err = fmt.Errorf("pg_advisory_unlock returned false")
+			}
+			unlockErr = errors.Join(unlockErr, err)
 		}
 		if unlockErr == nil {
-			unlockErr = fmt.Errorf("pg_advisory_unlock returned false")
+			return
 		}
 		release = false
 		physical := conn.Hijack()
@@ -105,8 +136,7 @@ func (l *advisoryLocker) With(ctx context.Context, key string, fn func() error) 
 		// locked section and mints a duplicate version (the exact failure mode
 		// Promote refuses to create). The session is destroyed anyway, so the
 		// lock dies with the connection.
-		advisoryLogger.Warn("pg_advisory_unlock failed after commit; connection destroyed", "key", key, "err", unlockErr, "close_err", closeErr)
+		advisoryLogger.Warn("pg_advisory_unlock failed after commit; connection destroyed", "keys", session.keys, "err", unlockErr, "close_err", closeErr)
 	}()
-
-	return fn()
+	return fn(session)
 }
