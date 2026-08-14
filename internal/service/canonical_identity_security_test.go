@@ -219,6 +219,40 @@ func TestCanonicalReplayRejectsDraftOnlyForeignIdentity(t *testing.T) {
 	}
 }
 
+func TestCanonicalReplayRejectsForeignBlobOnlySlug(t *testing.T) {
+	for _, create := range []struct {
+		name   string
+		create func(*DocService, context.Context, PublishInput) (any, error)
+	}{
+		{
+			name: "publish",
+			create: func(docs *DocService, ctx context.Context, in PublishInput) (any, error) {
+				return docs.Publish(ctx, in)
+			},
+		},
+		{
+			name: "draft",
+			create: func(docs *DocService, ctx context.Context, in PublishInput) (any, error) {
+				return docs.CreateCanonicalDraft(ctx, in)
+			},
+		},
+	} {
+		t.Run(create.name, func(t *testing.T) {
+			registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_foreign_blob", OctoDocSlug: "d_foreign_blob", ShareURL: "https://docs/d_foreign_blob", PublisherUID: "publisher", SpaceID: "space"}}
+			docs, store := canonicalTestDocs(t, registrar)
+			if _, err := store.PutDraft(context.Background(), "d_foreign_blob", "foreign draft"); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := create.create(docs, context.Background(), canonicalInput())
+			var appErr *apperr.Error
+			if !errors.As(err, &appErr) || appErr.Status != http.StatusConflict || appErr.Code != "canonical_identity_conflict" {
+				t.Fatalf("error=%v, want 409 canonical identity conflict", err)
+			}
+		})
+	}
+}
+
 func TestCanonicalCreateRejectsDraftOnlySlugCollision(t *testing.T) {
 	registrar := &canonicalTestRegistrar{result: &docsbackend.RegistrationResult{DocID: "d_draft_squat", OctoDocSlug: "d_draft_squat", ShareURL: "https://docs/d_draft_squat", PublisherUID: "publisher", SpaceID: "space", Created: true}}
 	docs, store := canonicalTestDocs(t, registrar)
@@ -408,6 +442,12 @@ func TestCanonicalDraftMarkerFailureRollsBackAndRetrySelfHeals(t *testing.T) {
 	}
 	if prev, err := store.GetMeta(context.Background(), "d_draft_atomic"); err != nil || prev != nil {
 		t.Fatalf("partial draft metadata=%+v err=%v", prev, err)
+	}
+	if _, exists, err := store.GetDraft(context.Background(), "d_draft_atomic"); err != nil || exists {
+		t.Fatalf("partial draft exists=%v err=%v", exists, err)
+	}
+	if versions, err := store.ListVersions(context.Background(), "d_draft_atomic"); err != nil || len(versions) != 0 {
+		t.Fatalf("partial draft versions=%v err=%v", versions, err)
 	}
 	if _, deletes, _ := registrar.counts(); deletes != 1 {
 		t.Fatalf("rollback deletes=%d, want 1", deletes)
