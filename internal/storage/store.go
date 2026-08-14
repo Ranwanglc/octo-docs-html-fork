@@ -30,6 +30,34 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// StorageKeyExtraKey is the DocMeta.Extra key holding the blob storage key: the
+// opaque string every BlobStore hashes into its per-doc object prefix. It is
+// deliberately decoupled from the client-supplied slug so the public identity
+// can later move to the backend-assigned doc id without rewriting S3 objects.
+//
+// Absent on every document written before this key existed; StorageKey falls
+// back to DocMeta.Slug there, which is exactly the value those documents were
+// addressed with, so their object keys stay byte-identical with zero migration.
+const StorageKeyExtraKey = "storage_key"
+
+// StorageKey returns the blob storage key for the document: Extra["storage_key"]
+// when present and non-blank, otherwise the slug. Callers must route every
+// BlobStore call through this method instead of passing a slug directly.
+//
+// The slug fallback is load-bearing: legacy metadata has no storage_key, and
+// returning the slug reproduces the pre-existing object prefix exactly.
+func (m *DocMeta) StorageKey() string {
+	if m == nil {
+		return ""
+	}
+	if m.Extra != nil {
+		if key, _ := m.Extra[StorageKeyExtraKey].(string); strings.TrimSpace(key) != "" {
+			return key
+		}
+	}
+	return m.Slug
+}
+
 // Publish provenance keys persist registration identity and mount details.
 const (
 	UserPublishExtraKey               = "user_publish"
@@ -236,29 +264,35 @@ type MetadataStore interface {
 	Close() error
 }
 
-// BlobStore persists immutable HTML documents keyed by (slug, version).
+// BlobStore persists immutable HTML documents keyed by (key, version).
+//
+// The leading string parameter is a *storage key*, not necessarily a slug:
+// callers must pass DocMeta.StorageKey(), which falls back to the slug for
+// legacy metadata. Backends hash it (see HashSlug) into a per-doc prefix, so the
+// same storage key always resolves to the same object layout regardless of what
+// the document's public identity is.
 type BlobStore interface {
 	// PutDoc writes a version atomically (no half-writes) and returns its size.
-	PutDoc(ctx context.Context, slug string, version int, html string) (size int64, err error)
-	GetDoc(ctx context.Context, slug string, version int) (string, bool, error)
-	HeadDoc(ctx context.Context, slug string, version int) (size int64, exists bool, err error)
-	// ListVersions returns the versions present for a slug, ascending.
-	ListVersions(ctx context.Context, slug string) ([]int, error)
-	DeleteDoc(ctx context.Context, slug string) error
+	PutDoc(ctx context.Context, key string, version int, html string) (size int64, err error)
+	GetDoc(ctx context.Context, key string, version int) (string, bool, error)
+	HeadDoc(ctx context.Context, key string, version int) (size int64, exists bool, err error)
+	// ListVersions returns the versions present for a storage key, ascending.
+	ListVersions(ctx context.Context, key string) ([]int, error)
+	DeleteDoc(ctx context.Context, key string) error
 
-	// Draft is a single mutable, overwritable slot per slug, stored outside the
-	// versioned key namespace so it never appears in ListVersions. It holds the
+	// Draft is a single mutable, overwritable slot per storage key, stored outside
+	// the versioned key namespace so it never appears in ListVersions. It holds the
 	// work-in-progress HTML before it is promoted to an immutable version.
-	PutDraft(ctx context.Context, slug string, html string) (size int64, err error)
-	GetDraft(ctx context.Context, slug string) (string, bool, error)
-	DeleteDraft(ctx context.Context, slug string) error
+	PutDraft(ctx context.Context, key string, html string) (size int64, err error)
+	GetDraft(ctx context.Context, key string) (string, bool, error)
+	DeleteDraft(ctx context.Context, key string) error
 
-	// Asset bytes are content-addressed at docs/<hashSlug>/assets/<sha256>. PutAsset
-	// is idempotent (same key = same bytes). Assets live under the same per-slug
+	// Asset bytes are content-addressed at docs/<hashKey>/assets/<sha256>. PutAsset
+	// is idempotent (same key = same bytes). Assets live under the same per-doc
 	// prefix as versions, so DeleteDoc removes them too. See docs/ASSETS.md.
-	PutAsset(ctx context.Context, slug, sha256 string, data []byte) error
-	GetAsset(ctx context.Context, slug, sha256 string) (data []byte, ok bool, err error)
-	DeleteAsset(ctx context.Context, slug, sha256 string) error
+	PutAsset(ctx context.Context, key, sha256 string, data []byte) error
+	GetAsset(ctx context.Context, key, sha256 string) (data []byte, ok bool, err error)
+	DeleteAsset(ctx context.Context, key, sha256 string) error
 
 	// Health verifies the backend is reachable (readiness probe).
 	Health(ctx context.Context) error
