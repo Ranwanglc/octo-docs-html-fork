@@ -144,6 +144,8 @@ type PublishInput struct {
 	// identity marker part of the publish metadata commit, rather than a second
 	// best-effort write after content has been committed.
 	canonical *canonicalIdentity
+	// canonicalNoPriorState permits cleanup only for the brand-new v1 write.
+	canonicalNoPriorState bool
 	// onDurableCommit runs once identity-bearing content metadata has committed.
 	// It is used only by canonical creation to retain the remote identity when a
 	// later, non-atomic side effect (such as comment merging) fails.
@@ -319,6 +321,7 @@ func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, aut
 		if result.titleChanged && s.register != nil {
 			s.renameCanonical(ctx, result.Slug, result.title, result.publisherToken)
 		}
+		s.ensureCanonicalPublished(ctx, result, result.publisherToken)
 		return result, nil
 	}
 	s.afterPublished(ctx, result)
@@ -399,11 +402,30 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 			return err
 		}
 		{
+			// A replay never adopts pre-existing local state: every present state
+			// must already carry this exact canonical identity.
+			if !registered {
+				exists, stateErr := s.slugExists(ctx, in.Slug)
+				if stateErr != nil {
+					return stateErr
+				}
+				if exists {
+					meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+					if metaErr != nil {
+						return metaErr
+					}
+					if docID, _, canonical := meta.CanonicalIdentity(); !canonical || docID != reg.DocID {
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					}
+				}
+			}
 			if registered {
 				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
 					return stateErr
 				} else if exists {
 					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+				} else {
+					in.canonicalNoPriorState = true
 				}
 			}
 			// An idempotency replay must return the original write, never mint v2.
@@ -449,8 +471,8 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 		return nil, err
 	}
 	result.DocID, result.ShareURL, result.URL, result.Registered = identity.docID, identity.shareURL, identity.shareURL, true
-	if firstDurableContent {
-		s.notifyCanonicalPublished(ctx, result, in.PublisherToken)
+	if firstDurableContent || result != nil {
+		s.ensureCanonicalPublished(ctx, result, in.PublisherToken)
 	}
 	return result, nil
 }
@@ -496,10 +518,10 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		return nil, apperr.Upstream("blob write failed", "blob_write_failed", err)
 	}
 	if _, ok, herr := s.blobs.HeadDoc(ctx, in.Slug, version); herr != nil {
-		s.cleanupCanonicalContent(ctx, in)
+		s.cleanupCanonicalContent(ctx, in, version)
 		return nil, apperr.Upstream("blob head failed", "blob_head_failed", herr)
 	} else if !ok {
-		s.cleanupCanonicalContent(ctx, in)
+		s.cleanupCanonicalContent(ctx, in, version)
 		return nil, apperr.Upstream("blob write did not persist", "blob_write_lost", nil)
 	}
 
@@ -509,7 +531,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		// idempotency-key lock). Do not leave an unmarked blob behind when the
 		// single identity-and-content metadata commit fails: a replay can then
 		// safely self-heal as v1.
-		s.cleanupCanonicalContent(ctx, in)
+		s.cleanupCanonicalContent(ctx, in, version)
 		return nil, err
 	}
 	if in.onDurableCommit != nil {
@@ -546,8 +568,10 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 	}, nil
 }
 
-func (s *DocService) cleanupCanonicalContent(ctx context.Context, in PublishInput) {
-	if in.canonical == nil {
+func (s *DocService) cleanupCanonicalContent(ctx context.Context, in PublishInput, version int) {
+	// Only the brand-new canonical v1 write has no prior local state. Never
+	// delete content on a replay or republish where this attempt inherited it.
+	if in.canonical == nil || !in.canonicalNoPriorState || version != 1 {
 		return
 	}
 	if cleanupErr := s.blobs.DeleteDoc(ctx, in.Slug); cleanupErr != nil {
@@ -944,6 +968,23 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			return err
 		}
 		{
+			// A replay never adopts pre-existing local state: every present state
+			// must already carry this exact canonical identity.
+			if !registered {
+				exists, stateErr := s.slugExists(ctx, in.Slug)
+				if stateErr != nil {
+					return stateErr
+				}
+				if exists {
+					meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+					if metaErr != nil {
+						return metaErr
+					}
+					if docID, _, canonical := meta.CanonicalIdentity(); !canonical || docID != reg.DocID {
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					}
+				}
+			}
 			if registered {
 				if exists, stateErr := s.slugExists(ctx, in.Slug); stateErr != nil {
 					return stateErr
@@ -1265,7 +1306,9 @@ func (s *DocService) promoteAuthorized(ctx context.Context, slug, title, publish
 		if result.titleChanged && s.register != nil {
 			s.renameCanonical(ctx, result.Slug, result.title, publisherToken)
 		}
-		s.notifyCanonicalPublished(ctx, result, publisherToken)
+		// Prefer the registering bot's credential when the caller supplied it;
+		// the process token remains the registrar's fallback for legacy callers.
+		s.ensureCanonicalPublished(ctx, result, publisherToken)
 		return result, nil
 	}
 	s.afterPublished(ctx, result)
@@ -1640,16 +1683,16 @@ type canonicalPublishedNotifier interface {
 	Published(ctx context.Context, docID, title, token string) error
 }
 
-// notifyCanonicalPublished sends /published as the ONE-SHOT "first durable
-// content" signal. Allocation waits on this backend signal; republishes
-// intentionally do not notify again.
-func (s *DocService) notifyCanonicalPublished(parent context.Context, result *PublishResult, token string) {
+// notifyCanonicalPublished sends /published until metadata records its
+// acknowledgement. A failed post-commit callback is therefore re-driven by a
+// replay, republish, or promote rather than being silently lost.
+func (s *DocService) notifyCanonicalPublished(parent context.Context, result *PublishResult, token string) bool {
 	if result == nil {
-		return
+		return false
 	}
 	notifier, ok := s.register.(canonicalPublishedNotifier)
 	if !ok {
-		return
+		return false
 	}
 	if parent == nil {
 		parent = context.Background()
@@ -1663,13 +1706,57 @@ func (s *DocService) notifyCanonicalPublished(parent context.Context, result *Pu
 		err = notifier.Published(attemptCtx, result.DocID, result.title, token)
 		cancel()
 		if err == nil {
-			return
+			return true
 		}
 		if attempt < docsBackendRegisterAttempts && !waitForRetry(parent, docsBackendRegisterDelay) {
 			break
 		}
 	}
 	s.log().Error("publish_notification_failed", "doc_id", result.DocID, "attempts", docsBackendRegisterAttempts, "err", err.Error())
+	return false
+}
+
+// ensureCanonicalPublished records only a successful notification. The marker
+// is a durable acknowledgement, so a metadata-write failure safely causes a
+// later retry to notify again.
+func (s *DocService) ensureCanonicalPublished(ctx context.Context, result *PublishResult, token string) {
+	if result == nil || result.DocID == "" {
+		return
+	}
+	meta, err := s.meta.GetMeta(ctx, result.Slug)
+	if err != nil || meta == nil {
+		return
+	}
+	docID, _, canonical := meta.CanonicalIdentity()
+	if !canonical || docID != result.DocID {
+		return
+	}
+	if notified, _ := meta.Extra[storage.CanonicalPublishedNotifiedExtraKey].(bool); notified {
+		return
+	}
+	if !s.notifyCanonicalPublished(ctx, result, token) {
+		return
+	}
+	if err := s.lock.With(ctx, result.Slug, func() error {
+		current, getErr := s.meta.GetMeta(ctx, result.Slug)
+		if getErr != nil || current == nil {
+			return getErr
+		}
+		currentID, _, ok := current.CanonicalIdentity()
+		if !ok || currentID != result.DocID {
+			return nil
+		}
+		if notified, _ := current.Extra[storage.CanonicalPublishedNotifiedExtraKey].(bool); notified {
+			return nil
+		}
+		extra := map[string]any{}
+		maps.Copy(extra, current.Extra)
+		extra[storage.CanonicalPublishedNotifiedExtraKey] = true
+		current.Extra = extra
+		return s.meta.PutMeta(ctx, result.Slug, *current)
+	}); err != nil {
+		s.log().Warn("publish_notification_ack_failed", "doc_id", result.DocID, "err", err)
+	}
 }
 
 func detachedSideEffectContext(parent context.Context) (context.Context, context.CancelFunc) {

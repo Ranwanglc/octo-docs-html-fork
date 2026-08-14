@@ -39,6 +39,10 @@ const CanonicalDocIDExtraKey = "canonical_doc_id"
 // create replays.
 const CanonicalShareURLExtraKey = "canonical_share_url"
 
+// CanonicalPublishedNotifiedExtraKey acknowledges docs-backend's /published
+// callback. Until it is true, canonical writes re-drive that callback.
+const CanonicalPublishedNotifiedExtraKey = "canonical_published_notified"
+
 // CanonicalDraftCreateExtraKey records completion of one-shot canonical draft
 // creation, preventing stale draft replays after promotion.
 const CanonicalDraftCreateExtraKey = "canonical_draft_create"
