@@ -402,24 +402,24 @@ func (s *DocService) publishCanonicalAuthorized(ctx context.Context, in PublishI
 			return err
 		}
 		{
-			// A replay never adopts metadata or versions owned by another document.
-			// A draft blob alone is different: a failed canonical draft creation
-			// writes its blob before its marker, then rolls the remote identity
-			// back. The next registration replay must be able to overwrite that
-			// otherwise-unreachable residue.
+			// A replay never adopts pre-existing local state: every present state
+			// must already carry this exact canonical identity.
 			if !registered {
-				meta, stateErr := s.meta.GetMeta(ctx, in.Slug)
+				exists, stateErr := s.slugExists(ctx, in.Slug)
 				if stateErr != nil {
 					return stateErr
 				}
-				if meta != nil {
+				if exists {
+					meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+					if metaErr != nil {
+						return metaErr
+					}
+					if meta == nil {
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					}
 					if docID, _, canonical := meta.CanonicalIdentity(); !canonical || docID != reg.DocID {
 						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
 					}
-				} else if versions, versionErr := s.blobs.ListVersions(ctx, in.Slug); versionErr != nil {
-					return versionErr
-				} else if len(versions) > 0 {
-					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
 				}
 			}
 			if registered {
@@ -949,9 +949,15 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			return apperr.Upstream("docs-backend registration failed", "registration_failed", err)
 		}
 		registered := reg.Created
+		draftWritten := false
 		defer func() {
 			if registered {
 				rollbackCtx, cancel := detachedSideEffectContext(ctx)
+				if draftWritten {
+					if rollbackErr := s.blobs.DeleteDraft(rollbackCtx, reg.DocID); rollbackErr != nil {
+						s.log().Error("canonical_draft_rollback_failed", "key", in.IdempotencyKey, "doc_id", reg.DocID, "err", rollbackErr.Error())
+					}
+				}
 				if rollbackErr := s.register.DeleteCanonical(rollbackCtx, reg.DocID, in.PublisherToken); rollbackErr != nil {
 					s.log().Error("canonical_rollback_failed", "key", in.IdempotencyKey, "doc_id", reg.DocID, "err", rollbackErr.Error())
 				}
@@ -971,22 +977,24 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			return err
 		}
 		{
-			// A draft blob without metadata or versions is residue from this
-			// identity's failed marker write and can be overwritten on replay.
-			// Metadata or versions without this identity remain a hard conflict.
+			// A replay never adopts pre-existing local state: every present state
+			// must already carry this exact canonical identity.
 			if !registered {
-				meta, stateErr := s.meta.GetMeta(ctx, in.Slug)
+				exists, stateErr := s.slugExists(ctx, in.Slug)
 				if stateErr != nil {
 					return stateErr
 				}
-				if meta != nil {
+				if exists {
+					meta, metaErr := s.meta.GetMeta(ctx, in.Slug)
+					if metaErr != nil {
+						return metaErr
+					}
+					if meta == nil {
+						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
+					}
 					if docID, _, canonical := meta.CanonicalIdentity(); !canonical || docID != reg.DocID {
 						return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
 					}
-				} else if versions, versionErr := s.blobs.ListVersions(ctx, in.Slug); versionErr != nil {
-					return versionErr
-				} else if len(versions) > 0 {
-					return apperr.Conflict("canonical identity conflicts with existing document", "canonical_identity_conflict")
 				}
 			}
 			if registered {
@@ -1035,12 +1043,14 @@ func (s *DocService) CreateCanonicalDraft(ctx context.Context, in PublishInput) 
 			if e != nil {
 				return apperr.Upstream("draft write failed", "draft_write_failed", e)
 			}
+			draftWritten = true
 			canonicalDraft := &canonicalDraftIdentity{docID: reg.DocID, shareURL: reg.ShareURL, aids: len(stamped.AIDs)}
 			if e = s.setDraftMeta(ctx, in.Slug, in.Title, prev, normalized, canonicalDraft); e != nil {
 				return e
 			}
 			result = &DraftResult{Slug: in.Slug, DocID: in.Slug, URL: fmt.Sprintf("%s/d/%s/draft", s.baseURL, in.Slug), Size: size, AIDs: len(stamped.AIDs)}
 			registered = false
+			draftWritten = false
 			return nil
 		}
 	})
