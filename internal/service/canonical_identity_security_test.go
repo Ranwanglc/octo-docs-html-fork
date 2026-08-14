@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -23,6 +25,88 @@ type canonicalTestRegistrar struct {
 	deletedID []string
 	published int
 	renamed   int
+}
+
+// boundedLocker models an advisory-lock pool: a Session consumes one slot for
+// its entire callback. The former nested With design needed two slots/request
+// and deadlocked this cap=2 scenario before a legacy publisher could run.
+type boundedLocker struct {
+	sem   chan struct{}
+	inner sluglock.Locker
+}
+
+func (l *boundedLocker) enter(ctx context.Context) error {
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (l *boundedLocker) With(ctx context.Context, key string, fn func() error) error {
+	if err := l.enter(ctx); err != nil {
+		return err
+	}
+	defer func() { <-l.sem }()
+	return l.inner.With(ctx, key, fn)
+}
+func (l *boundedLocker) Session(ctx context.Context, fn func(sluglock.LockSession) error) error {
+	if err := l.enter(ctx); err != nil {
+		return err
+	}
+	defer func() { <-l.sem }()
+	return l.inner.(sluglock.SessionLocker).Session(ctx, fn)
+}
+
+type gatedRegistrar struct {
+	started chan struct{}
+	gate    <-chan struct{}
+}
+
+func (r *gatedRegistrar) Register(_ context.Context, reg docsbackend.Registration, _ string) (*docsbackend.RegistrationResult, error) {
+	r.started <- struct{}{}
+	<-r.gate
+	return &docsbackend.RegistrationResult{DocID: "d_" + reg.IdempotencyKey, OctoDocSlug: "d_" + reg.IdempotencyKey, ShareURL: "https://docs/d_" + reg.IdempotencyKey, PublisherUID: "publisher", SpaceID: "space", Created: true}, nil
+}
+func (*gatedRegistrar) Rename(context.Context, string, string, string)        {}
+func (*gatedRegistrar) Delete(context.Context, string, string)                {}
+func (*gatedRegistrar) DeleteCanonical(context.Context, string, string) error { return nil }
+
+func TestCanonicalSessionLockDoesNotExhaustBoundedPool(t *testing.T) {
+	store := memory.New()
+	inner := sluglock.NewMemory()
+	lock := &boundedLocker{sem: make(chan struct{}, 2), inner: inner}
+	gate := make(chan struct{})
+	registrar := &gatedRegistrar{started: make(chan struct{}, 3), gate: gate}
+	docs := NewDocService(store, store, NewCommentService(store, lock), lock, "", 1<<20).WithDocsBackendRegistration(registrar, nil)
+	done := make(chan error, 4)
+	for i := 0; i < 3; i++ {
+		go func(i int) {
+			in := canonicalInput()
+			in.IdempotencyKey = fmt.Sprintf("pool-%d", i)
+			_, err := docs.Publish(context.Background(), in)
+			done <- err
+		}(i)
+	}
+	for i := 0; i < 2; i++ {
+		<-registrar.started
+	}
+	go func() {
+		_, err := docs.Publish(context.Background(), PublishInput{Slug: "legacy", HTML: "<p>x</p>"})
+		done <- err
+	}()
+	close(gate)
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+		case <-deadline:
+			t.Fatal("bounded lock pool stalled")
+		}
+	}
 }
 
 func (r *canonicalTestRegistrar) Register(context.Context, docsbackend.Registration, string) (*docsbackend.RegistrationResult, error) {
